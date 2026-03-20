@@ -479,6 +479,11 @@ def api_auto_select():
                 _finish_task("No scan data.")
                 return
 
+            # Inject current config so auto_select sees up-to-date categories
+            current_config = load_config()
+            if current_config:
+                db["config"] = current_config
+
             # Monkey-patch print to capture progress
             import builtins
             _orig_print = builtins.print
@@ -487,8 +492,9 @@ def api_auto_select():
                     raise InterruptedError("Cancelled by user")
                 line = " ".join(str(a) for a in args)
                 # Skip internal/traceback lines
-                if not line.startswith(("File ", "Traceback", "  ", "json.decoder")):
-                    _update_task(line)
+                skip = line.lstrip().startswith(("File \"", "Traceback (", "json.decoder"))
+                if not skip:
+                    _update_task(line.strip())
                 _orig_print(*args, **kwargs)
             builtins.print = _capture_print
 
@@ -513,6 +519,91 @@ def api_auto_select():
             _finish_task(str(e))
 
     threading.Thread(target=run_select, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/quick-fill", methods=["POST"])
+def api_quick_fill():
+    """Quick fill: select top images by quality score without vector diversity (fast)."""
+    if _task["running"]:
+        return jsonify({"error": "A task is already running"}), 409
+
+    def run_quick():
+        try:
+            _reset_task("auto-select")
+            db = load_scan_db()
+            if not db:
+                _finish_task("No scan data.")
+                return
+
+            current_config = load_config()
+            if current_config:
+                db["config"] = current_config
+
+            config = db.get("config", {})
+            images = db.get("images", [])
+            target_per_cat = config.get("target_per_category", 75)
+
+            # Get categories
+            from event_agent import get_categories_from_config, compute_quality_score, get_event_type, EVENT_KNOWLEDGE
+            categories = get_categories_from_config(config, images)
+            event_type = get_event_type(config)
+            knowledge = EVENT_KNOWLEDGE.get(event_type, EVENT_KNOWLEDGE.get("photo_book"))
+            weights = knowledge.get("quality_weights", {})
+
+            # Group by category
+            by_cat = {}
+            for img in images:
+                if img.get("status") == "rejected":
+                    continue
+                cat = img.get("category")
+                if cat:
+                    by_cat.setdefault(cat, []).append(img)
+
+            total_selected = 0
+            for cat in categories:
+                if _is_cancelled():
+                    _update_task("Stopped by user.")
+                    _finish_task("Cancelled")
+                    return
+
+                cid = cat["id"]
+                target = cat.get("target", target_per_cat)
+                pool = by_cat.get(cid, [])
+
+                # Count already selected
+                already = [i for i in pool if i.get("status") == "selected"]
+                remaining = target - len(already)
+                if remaining <= 0:
+                    _update_task(f"{cat.get('display', cid)}: already full ({len(already)}/{target})")
+                    total_selected += len(already)
+                    continue
+
+                # Score unselected candidates
+                candidates = [i for i in pool if i.get("status") != "selected"]
+                for img in candidates:
+                    img["_score"] = compute_quality_score(img, weights)
+                candidates.sort(key=lambda x: x["_score"], reverse=True)
+
+                picked = 0
+                for img in candidates[:remaining]:
+                    img["status"] = "selected"
+                    picked += 1
+
+                total_selected += len(already) + picked
+                _update_task(f"{cat.get('display', cid)}: selected {picked} new ({len(already) + picked}/{target})")
+
+            # Clean temp scores
+            for img in images:
+                img.pop("_score", None)
+
+            save_scan_db(db)
+            _update_task(f"Done! {total_selected} images selected.")
+            _finish_task()
+        except Exception as e:
+            _finish_task(str(e))
+
+    threading.Thread(target=run_quick, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -695,7 +786,9 @@ def api_export():
 
             images = [i for i in db["images"] if i.get("status") == status_filter]
             if not images:
-                images = [i for i in db["images"] if i.get("status") == "qualified"]
+                _update_task("No selected images found. Use the Select step first.")
+                _finish_task("No images to export")
+                return
 
             total = len(images)
             _update_task(f"Exporting {total} images...")
@@ -1487,16 +1580,14 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
     <!-- Auto-fill section -->
     <div style="margin-top:16px; padding-top:12px; border-top:1px solid #e2e8f0;">
-        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-            <label style="font-weight:600; color:#2d3748; margin:0;">Auto-fill remaining slots</label>
-            <select id="sel-strategy" style="max-width:220px; padding:4px 8px; border:1px solid #cbd5e0; border-radius:4px;">
-                <option value="balanced">Balanced</option>
-                <option value="quality">Quality</option>
-                <option value="diverse">Diverse</option>
-            </select>
-            <button class="btn btn-primary" id="btn-auto-select" onclick="runAutoSelect()">Auto-Fill</button>
+        <div style="font-weight:600; color:#2d3748; margin-bottom:8px;">Auto-fill remaining slots</div>
+        <div style="display:flex; gap:12px; flex-wrap:wrap;">
+            <button class="btn btn-primary" onclick="runQuickFill()">Quick Fill (fast)</button>
+            <button class="btn btn-secondary" onclick="runAutoSelect()">Smart Fill (slow, dedup)</button>
         </div>
-        <div class="progress-box" id="select-progress" style="display:none; margin-top:8px;"></div>
+        <div style="font-size:.8em; color:#718096; margin-top:6px;">
+            Quick Fill picks top-quality images instantly. Smart Fill also removes visual duplicates (takes several minutes).
+        </div>
     </div>
 
     <div class="btn-group">
@@ -1577,7 +1668,7 @@ function showTaskOverlay(taskType) {
             const st = await res.json();
             document.getElementById('task-overlay-status').textContent = st.progress || '';
             const linesEl = document.getElementById('task-overlay-lines');
-            const clean = st.lines.filter(l => !l.startsWith('File ') && !l.startsWith('Traceback') && !l.startsWith('  ') && !l.startsWith('json.'));
+            const clean = st.lines.filter(l => !l.trimStart().startsWith('File "') && !l.startsWith('Traceback') && !l.trimStart().startsWith('json.decoder'));
             linesEl.innerHTML = clean.map(l => '<div class="line">' + esc(l) + '</div>').join('');
             linesEl.scrollTop = linesEl.scrollHeight;
 
@@ -2385,12 +2476,29 @@ function showSelLightbox(img) {
     document.body.appendChild(overlay);
 }
 
-async function runAutoSelect() {
-    const strategy = document.getElementById('sel-strategy').value;
+async function runQuickFill() {
+    await fetch('/api/quick-fill', { method:'POST' });
+    showTaskOverlay('auto-select');
+    const check = setInterval(async () => {
+        try {
+            const res = await fetch('/api/scan/status');
+            const st = await res.json();
+            if (st.done || st.error || st.cancelled) {
+                clearInterval(check);
+                if (!st.error && !st.cancelled) {
+                    document.querySelectorAll('.step-dot')[6].classList.add('done');
+                }
+                await loadSelCategories();
+                if (selActiveCat) await loadSelImages();
+            }
+        } catch(e) {}
+    }, 1500);
+}
 
+async function runAutoSelect() {
     await fetch('/api/auto-select', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({ strategy, sim_threshold: 0.85 })
+        body:JSON.stringify({ strategy: 'balanced', sim_threshold: 0.85 })
     });
     showTaskOverlay('auto-select');
     const check = setInterval(async () => {
@@ -2420,12 +2528,14 @@ async function loadExportStats() {
     const st = await res.json();
     const el = document.getElementById('export-stats');
     if (st.has_scan) {
-        const selected = st.selected || st.qualified || 0;
+        const selected = st.selected || 0;
+        const qualified = st.qualified || 0;
         el.innerHTML = `
             <div class="export-summary">
                 <div class="big-num">${selected}</div>
-                <div>images ready to export</div>
-                <div style="color:#a0aec0; font-size:.85em; margin-top:5px;">${st.total_images} total scanned | ${st.sources?.length || 0} sources</div>
+                <div>images selected for export</div>
+                ${selected === 0 ? '<div style="color:#e53e3e; font-size:.9em; margin-top:8px;">No images selected yet. Go back to the Select step to pick images.</div>' : ''}
+                <div style="color:#718096; font-size:.85em; margin-top:5px;">${qualified} qualified | ${st.total_images} total scanned | ${st.sources?.length || 0} sources</div>
             </div>
         `;
     }
