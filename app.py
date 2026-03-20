@@ -29,6 +29,9 @@ CONFIG_PATH = os.path.join(PROJECT_DIR, "curate_config.json")
 
 app = Flask(__name__, static_folder=None)
 
+# Lock for scan_db.json reads/writes
+_db_lock = threading.Lock()
+
 # ── Background task state ─────────────────────────────────────────────────────
 
 _task = {"running": False, "type": None, "progress": "", "lines": [], "done": False, "error": None}
@@ -76,9 +79,19 @@ def save_config(config):
 
 def load_scan_db():
     if os.path.isfile(SCAN_DB_PATH):
-        with open(SCAN_DB_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with _db_lock:
+            try:
+                with open(SCAN_DB_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                return None
     return None
+
+
+def save_scan_db(db):
+    with _db_lock:
+        with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False)
 
 
 def auto_rotate_image(filepath):
@@ -241,10 +254,10 @@ def api_scan_start():
             # Existing DB for incremental
             existing_db = {}
             if os.path.isfile(SCAN_DB_PATH) and not full:
-                with open(SCAN_DB_PATH, "r", encoding="utf-8") as f:
-                    old = json.load(f)
-                for img in old.get("images", []):
-                    existing_db[img["hash"]] = img
+                old = load_scan_db()
+                if old:
+                    for img in old.get("images", []):
+                        existing_db[img["hash"]] = img
                 _update_task(f"Incremental mode: {len(existing_db)} cached images")
 
             all_images = []
@@ -383,8 +396,7 @@ def api_scan_start():
                 "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped)},
                 "images": all_images,
             }
-            with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
-                json.dump(db, f, ensure_ascii=False)
+            save_scan_db(db)
 
             _update_task(f"Done! {len(all_images)} images from {scanned} scanned.")
             _finish_task()
@@ -451,7 +463,9 @@ def api_auto_select():
             _orig_print = builtins.print
             def _capture_print(*args, **kwargs):
                 line = " ".join(str(a) for a in args)
-                _update_task(line)
+                # Skip internal/traceback lines
+                if not line.startswith(("File ", "Traceback", "  ", "json.decoder")):
+                    _update_task(line)
                 _orig_print(*args, **kwargs)
             builtins.print = _capture_print
 
@@ -460,8 +474,7 @@ def api_auto_select():
 
             builtins.print = _orig_print
 
-            with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
-                json.dump(db, f, ensure_ascii=False)
+            save_scan_db(db)
 
             _update_task(f"Done! Selected {report['total_selected']} images.")
             _finish_task()
@@ -529,9 +542,7 @@ def api_images_move():
                 img["reject_reason"] = None
             moved += 1
 
-    with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False)
-
+    save_scan_db(db)
     return jsonify({"ok": True, "moved": moved})
 
 
@@ -570,9 +581,7 @@ def api_images_select():
                 img["status"] = "qualified"
             changed += 1
 
-    with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False)
-
+    save_scan_db(db)
     return jsonify({"ok": True, "changed": changed})
 
 
@@ -2294,20 +2303,19 @@ async function runAutoSelect() {
         const res = await fetch('/api/scan/status');
         const st = await res.json();
         const box = document.getElementById('select-progress');
-        box.innerHTML = st.lines.map((l, i) =>
-            '<div class="line' + (i === st.lines.length - 1 ? ' current' : '') + '">' + esc(l) + '</div>'
+        const clean = st.lines.filter(l => !l.startsWith('File ') && !l.startsWith('Traceback') && !l.startsWith('  ') && !l.startsWith('json.'));
+        box.innerHTML = clean.map((l, i) =>
+            '<div class="line' + (i === clean.length - 1 ? ' current' : '') + '">' + esc(l) + '</div>'
         ).join('');
         box.scrollTop = box.scrollHeight;
 
         if (st.done || st.error) {
             clearInterval(selectPoll);
             document.getElementById('btn-auto-select').disabled = false;
-            if (!st.error) {
-                document.querySelectorAll('.step-dot')[6].classList.add('done');
-                // Reload categories and current grid
-                await loadSelCategories();
-                if (selActiveCat) await loadSelImages();
-            }
+            document.querySelectorAll('.step-dot')[6].classList.add('done');
+            // Reload categories and current grid
+            await loadSelCategories();
+            if (selActiveCat) await loadSelImages();
         }
     }, 2000);
 }
