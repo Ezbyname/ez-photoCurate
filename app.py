@@ -34,7 +34,7 @@ _db_lock = threading.Lock()
 
 # ── Background task state ─────────────────────────────────────────────────────
 
-_task = {"running": False, "type": None, "progress": "", "lines": [], "done": False, "error": None}
+_task = {"running": False, "type": None, "progress": "", "lines": [], "done": False, "error": None, "cancelled": False}
 _task_lock = threading.Lock()
 
 
@@ -46,6 +46,12 @@ def _reset_task(task_type):
         _task["lines"] = []
         _task["done"] = False
         _task["error"] = None
+        _task["cancelled"] = False
+
+
+def _is_cancelled():
+    with _task_lock:
+        return _task["cancelled"]
 
 
 def _update_task(line):
@@ -282,6 +288,11 @@ def api_scan_start():
                     rel_dir = os.path.relpath(dirpath, src_path)
 
                     for fname in filenames:
+                        if _is_cancelled():
+                            _update_task("Stopped by user.")
+                            _finish_task("Cancelled")
+                            return
+
                         ext = os.path.splitext(fname)[1].lower()
                         if ext not in IMAGE_EXTS:
                             continue
@@ -418,7 +429,17 @@ def api_scan_status():
             "lines": _task["lines"][-20:],
             "done": _task["done"],
             "error": _task["error"],
+            "cancelled": _task["cancelled"],
         })
+
+
+@app.route("/api/task/stop", methods=["POST"])
+def api_task_stop():
+    with _task_lock:
+        if _task["running"]:
+            _task["cancelled"] = True
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "msg": "No task running"})
 
 
 @app.route("/api/analyze")
@@ -462,6 +483,8 @@ def api_auto_select():
             import builtins
             _orig_print = builtins.print
             def _capture_print(*args, **kwargs):
+                if _is_cancelled():
+                    raise InterruptedError("Cancelled by user")
                 line = " ".join(str(a) for a in args)
                 # Skip internal/traceback lines
                 if not line.startswith(("File ", "Traceback", "  ", "json.decoder")):
@@ -478,7 +501,15 @@ def api_auto_select():
 
             _update_task(f"Done! Selected {report['total_selected']} images.")
             _finish_task()
+        except InterruptedError:
+            builtins.print = _orig_print
+            _update_task("Stopped by user.")
+            _finish_task("Cancelled")
         except Exception as e:
+            try:
+                builtins.print = _orig_print
+            except Exception:
+                pass
             _finish_task(str(e))
 
     threading.Thread(target=run_select, daemon=True).start()
@@ -670,6 +701,10 @@ def api_export():
             _update_task(f"Exporting {total} images...")
 
             for i, img in enumerate(images):
+                if _is_cancelled():
+                    _update_task("Stopped by user.")
+                    _finish_task("Cancelled")
+                    return
                 cat = img.get("category", "uncategorized")
                 dest_dir = os.path.join(output_dir, cat)
                 os.makedirs(dest_dir, exist_ok=True)
@@ -1199,9 +1234,36 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 .lightbox img { max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 4px 30px rgba(0,0,0,.4); }
 .lightbox .close-btn { position:absolute; top:20px; right:30px; font-size:2em; color:white; cursor:pointer; background:rgba(0,0,0,.5); border:none; border-radius:50%; width:44px; height:44px; display:flex; align-items:center; justify-content:center; }
 .lightbox .close-btn:hover { background:rgba(0,0,0,.8); }
+
+/* ── Task overlay ── */
+#task-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,.88); z-index:9990; align-items:center; justify-content:center; flex-direction:column; }
+#task-overlay.active { display:flex; }
+#task-overlay .task-box { background:#fff; border-radius:12px; box-shadow:0 4px 24px rgba(0,0,0,.12); padding:30px 40px; min-width:400px; max-width:600px; text-align:center; }
+#task-overlay .task-title { font-size:1.2em; font-weight:600; color:#2d3748; margin-bottom:12px; }
+#task-overlay .task-status { font-size:.9em; color:#718096; margin-bottom:16px; min-height:1.2em; }
+#task-overlay .task-bar-bg { height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden; margin-bottom:16px; }
+#task-overlay .task-bar { height:100%; background:linear-gradient(90deg, #3182ce, #63b3ed); border-radius:4px; transition:width .5s ease; }
+@keyframes taskPulse { 0%,100% { opacity:.6; } 50% { opacity:1; } }
+#task-overlay .task-bar.indeterminate { width:100% !important; animation: taskPulse 1.5s ease-in-out infinite; }
+#task-overlay .task-lines { text-align:left; max-height:120px; overflow-y:auto; font-size:.8em; color:#718096; background:#f7fafc; border-radius:6px; padding:8px 12px; margin-bottom:16px; }
+#task-overlay .task-lines .line { margin:2px 0; }
+#task-overlay .btn-stop { background:#e53e3e; color:#fff; border:none; padding:8px 24px; border-radius:6px; font-size:.9em; cursor:pointer; }
+#task-overlay .btn-stop:hover { background:#c53030; }
 </style>
 </head>
 <body>
+
+<!-- Task overlay -->
+<div id="task-overlay">
+    <div class="task-box">
+        <div class="task-title" id="task-overlay-title">Working...</div>
+        <div class="task-status" id="task-overlay-status"></div>
+        <div class="task-bar-bg"><div class="task-bar indeterminate" id="task-overlay-bar"></div></div>
+        <div class="task-lines" id="task-overlay-lines"></div>
+        <button class="btn-stop" onclick="stopTask()">Stop</button>
+    </div>
+</div>
+
 <div class="app">
 
 <div class="header">
@@ -1489,6 +1551,54 @@ let currentStep = 0;
 let selectedTemplate = null;
 let templates = [];
 let config = null;
+let taskPoll = null;
+
+// ── Task overlay ──
+const TASK_TITLES = {
+    'scan': 'Scanning Images...',
+    'auto-select': 'Auto-Selecting Photos...',
+    'export': 'Exporting Collection...',
+};
+
+function showTaskOverlay(taskType) {
+    const overlay = document.getElementById('task-overlay');
+    document.getElementById('task-overlay-title').textContent = TASK_TITLES[taskType] || 'Working...';
+    document.getElementById('task-overlay-status').textContent = 'Starting...';
+    document.getElementById('task-overlay-lines').innerHTML = '';
+    const bar = document.getElementById('task-overlay-bar');
+    bar.className = 'task-bar indeterminate';
+    bar.style.width = '100%';
+    overlay.classList.add('active');
+
+    if (taskPoll) clearInterval(taskPoll);
+    taskPoll = setInterval(async () => {
+        try {
+            const res = await fetch('/api/scan/status');
+            const st = await res.json();
+            document.getElementById('task-overlay-status').textContent = st.progress || '';
+            const linesEl = document.getElementById('task-overlay-lines');
+            const clean = st.lines.filter(l => !l.startsWith('File ') && !l.startsWith('Traceback') && !l.startsWith('  ') && !l.startsWith('json.'));
+            linesEl.innerHTML = clean.map(l => '<div class="line">' + esc(l) + '</div>').join('');
+            linesEl.scrollTop = linesEl.scrollHeight;
+
+            if (st.done || st.error || st.cancelled) {
+                clearInterval(taskPoll);
+                taskPoll = null;
+                overlay.classList.remove('active');
+                if (st.cancelled || st.error === 'Cancelled') {
+                    // User stopped — stay on current step
+                } else if (st.error) {
+                    alert('Error: ' + st.error);
+                }
+            }
+        } catch(e) {}
+    }, 1500);
+}
+
+async function stopTask() {
+    await fetch('/api/task/stop', { method: 'POST' });
+    document.getElementById('task-overlay-status').textContent = 'Stopping...';
+}
 
 // ── Step navigation ──
 function goStep(n) {
@@ -2022,35 +2132,24 @@ async function checkExistingScan() {
     }
 }
 
-let scanPoll = null;
-
 async function startScan(full) {
-    document.getElementById('btn-start-scan').disabled = true;
-    document.getElementById('scan-progress').style.display = 'block';
-    document.getElementById('scan-progress').innerHTML = '<div class="line current">Starting scan...</div>';
-
     await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full}) });
-
-    scanPoll = setInterval(async () => {
-        const res = await fetch('/api/scan/status');
-        const st = await res.json();
-        const box = document.getElementById('scan-progress');
-        box.innerHTML = st.lines.map((l, i) =>
-            '<div class="line' + (i === st.lines.length - 1 ? ' current' : '') + '">' + esc(l) + '</div>'
-        ).join('');
-        box.scrollTop = box.scrollHeight;
-
-        if (st.done || st.error) {
-            clearInterval(scanPoll);
-            document.getElementById('btn-start-scan').disabled = false;
-            if (st.error) {
-                box.innerHTML += '<div class="line" style="color:#f44336">Error: ' + esc(st.error) + '</div>';
-            } else {
-                document.getElementById('btn-next-4').disabled = false;
-                document.querySelectorAll('.step-dot')[4].classList.add('done');
+    showTaskOverlay('scan');
+    // Override completion handler
+    const origPoll = taskPoll;
+    const check = setInterval(async () => {
+        try {
+            const res = await fetch('/api/scan/status');
+            const st = await res.json();
+            if (st.done || st.error || st.cancelled) {
+                clearInterval(check);
+                if (!st.error && !st.cancelled) {
+                    document.getElementById('btn-next-4').disabled = false;
+                    document.querySelectorAll('.step-dot')[4].classList.add('done');
+                }
             }
-        }
-    }, 1500);
+        } catch(e) {}
+    }, 2000);
 }
 
 // ── Step 5: Analyze ──
@@ -2094,8 +2193,6 @@ let selActiveCat = null;
 let selImages = [];
 let selOffset = 0;
 const SEL_PAGE = 100;
-let selectPoll = null;
-
 async function loadSelCategories() {
     const res = await fetch('/api/categories/summary');
     selCats = await res.json();
@@ -2290,33 +2387,25 @@ function showSelLightbox(img) {
 
 async function runAutoSelect() {
     const strategy = document.getElementById('sel-strategy').value;
-    document.getElementById('btn-auto-select').disabled = true;
-    document.getElementById('select-progress').style.display = 'block';
-    document.getElementById('select-progress').innerHTML = '<div class="line current">Starting auto-fill...</div>';
 
     await fetch('/api/auto-select', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({ strategy, sim_threshold: 0.85 })
     });
-
-    selectPoll = setInterval(async () => {
-        const res = await fetch('/api/scan/status');
-        const st = await res.json();
-        const box = document.getElementById('select-progress');
-        const clean = st.lines.filter(l => !l.startsWith('File ') && !l.startsWith('Traceback') && !l.startsWith('  ') && !l.startsWith('json.'));
-        box.innerHTML = clean.map((l, i) =>
-            '<div class="line' + (i === clean.length - 1 ? ' current' : '') + '">' + esc(l) + '</div>'
-        ).join('');
-        box.scrollTop = box.scrollHeight;
-
-        if (st.done || st.error) {
-            clearInterval(selectPoll);
-            document.getElementById('btn-auto-select').disabled = false;
-            document.querySelectorAll('.step-dot')[6].classList.add('done');
-            // Reload categories and current grid
-            await loadSelCategories();
-            if (selActiveCat) await loadSelImages();
-        }
+    showTaskOverlay('auto-select');
+    const check = setInterval(async () => {
+        try {
+            const res = await fetch('/api/scan/status');
+            const st = await res.json();
+            if (st.done || st.error || st.cancelled) {
+                clearInterval(check);
+                if (!st.error && !st.cancelled) {
+                    document.querySelectorAll('.step-dot')[6].classList.add('done');
+                }
+                await loadSelCategories();
+                if (selActiveCat) await loadSelImages();
+            }
+        } catch(e) {}
     }, 2000);
 }
 
@@ -2342,36 +2431,26 @@ async function loadExportStats() {
     }
 }
 
-let exportPoll = null;
 async function runExport() {
     const outputDir = document.getElementById('inp-export-dir').value || 'final_collection';
-    document.getElementById('btn-export').disabled = true;
-    document.getElementById('export-progress').style.display = 'block';
-    document.getElementById('export-progress').innerHTML = '<div class="line current">Starting export...</div>';
 
     await fetch('/api/export', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({ output_dir: outputDir })
     });
-
-    exportPoll = setInterval(async () => {
-        const res = await fetch('/api/scan/status');
-        const st = await res.json();
-        const box = document.getElementById('export-progress');
-        box.innerHTML = st.lines.map((l, i) =>
-            '<div class="line' + (i === st.lines.length - 1 ? ' current' : '') + '">' + esc(l) + '</div>'
-        ).join('');
-        box.scrollTop = box.scrollHeight;
-
-        if (st.done || st.error) {
-            clearInterval(exportPoll);
-            document.getElementById('btn-export').disabled = false;
-            if (!st.error) {
-                document.querySelectorAll('.step-dot')[8].classList.add('done');
-                box.innerHTML += '<div class="line" style="color:#4caf50; font-weight:bold;">Your photos are ready!</div>';
+    showTaskOverlay('export');
+    const check = setInterval(async () => {
+        try {
+            const res = await fetch('/api/scan/status');
+            const st = await res.json();
+            if (st.done || st.error || st.cancelled) {
+                clearInterval(check);
+                if (!st.error && !st.cancelled) {
+                    document.querySelectorAll('.step-dot')[8].classList.add('done');
+                }
             }
-        }
-    }, 1500);
+        } catch(e) {}
+    }, 2000);
 }
 
 function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
