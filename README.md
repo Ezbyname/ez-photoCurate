@@ -1,4 +1,4 @@
-# PhotoCurate
+# E-z Photo Organizer
 
 An intelligent photo curation pipeline for building meaningful image collections for special events — bar/bat mitzvas, weddings, birthdays, photo books, and more.
 
