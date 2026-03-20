@@ -1481,6 +1481,17 @@ def main():
     s_report.add_argument("--output", type=str)
     s_report.add_argument("--no-open", action="store_true")
 
+    # analyze
+    sub.add_parser("analyze", help="Analyze collection and get recommendations")
+
+    # auto-select
+    s_auto = sub.add_parser("auto-select", help="Auto-select best images per category")
+    s_auto.add_argument("--strategy", choices=["balanced", "quality", "diverse"], default="balanced",
+                        help="Selection strategy (default: balanced)")
+    s_auto.add_argument("--sim-threshold", type=float, default=0.85,
+                        help="Diversity threshold (default: 0.85)")
+    s_auto.add_argument("--dry-run", action="store_true", help="Preview without saving")
+
     # apply
     s_apply = sub.add_parser("apply", help="Apply changes from exported JSON")
     s_apply.add_argument("changes_file", type=str)
@@ -1496,6 +1507,12 @@ def main():
         cmd_scan(args)
     elif args.command == "report":
         cmd_report(args)
+    elif args.command == "analyze":
+        from event_agent import cmd_analyze
+        cmd_analyze(args)
+    elif args.command == "auto-select":
+        from event_agent import cmd_auto_select
+        cmd_auto_select(args)
     elif args.command == "apply":
         cmd_apply(args)
     else:
