@@ -2036,7 +2036,7 @@ async function loadFaceThumbs(person) {
         const safePerson = esc(person).replace(/'/g, "\\\\'");
         let html = '<div style="display:inline-flex; flex-direction:column; align-items:center; gap:2px; margin-right:8px; margin-bottom:6px;">';
         if (isReplaced) {
-            html += '<button onclick="verifySinglePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\')" style="font-size:.6em; padding:1px 6px; cursor:pointer; background:#fff5f5; border:1px solid #fed7d7; border-radius:3px; color:#e53e3e; white-space:nowrap;">Verify</button>';
+            html += '<span onclick="verifySinglePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\')" style="font-size:.65em; color:#e53e3e; cursor:pointer; padding:1px 4px; background:#fff5f5; border:1px solid #fed7d7; border-radius:3px; white-space:nowrap;">Verify</span>';
         } else {
             html += '<label style="font-size:.65em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px; white-space:nowrap;" for="replace-' + person + '-' + p.filename + '">Replace</label>';
         }
