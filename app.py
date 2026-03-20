@@ -100,6 +100,37 @@ def save_scan_db(db):
             json.dump(db, f, ensure_ascii=False)
 
 
+def _verify_single_photo(fpath):
+    """Verify a single photo for face detection. Returns dict with status/message."""
+    try:
+        import face_recognition as fr
+        import numpy as np
+        from PIL import Image
+        pil_img = Image.open(fpath).convert("RGB")
+        w, h = pil_img.size
+        max_dim = 1600
+        if w > max_dim or h > max_dim:
+            pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        arr = np.array(pil_img)
+        locations = fr.face_locations(arr, model="hog")
+        if not locations:
+            return {"status": "no_face", "message": "No face detected", "dimensions": f"{w}x{h}"}
+        elif len(locations) > 1:
+            areas = [(b-t)*(r-l) for t, r, b, l in locations]
+            best = areas.index(max(areas))
+            enc = fr.face_encodings(arr, [locations[best]])
+            if enc:
+                return {"status": "ok_multi", "message": f"{len(locations)} faces, using largest", "dimensions": f"{w}x{h}"}
+            return {"status": "encode_fail", "message": "Face found but encoding failed", "dimensions": f"{w}x{h}"}
+        else:
+            enc = fr.face_encodings(arr, locations)
+            if enc:
+                return {"status": "ok", "message": "Face detected and encoded", "dimensions": f"{w}x{h}"}
+            return {"status": "encode_fail", "message": "Encoding failed", "dimensions": f"{w}x{h}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def auto_rotate_image(filepath):
     """Apply EXIF orientation and save back. Returns True if rotated."""
     from PIL import Image, ImageOps
@@ -944,6 +975,24 @@ def api_ref_faces_replace(person):
     return jsonify({"ok": True, "filename": old_name})
 
 
+@app.route("/api/ref-faces/<person>/verify-photos", methods=["POST"])
+def api_ref_faces_verify_photos(person):
+    """Verify specific photos only. Expects JSON {filenames: [...]}."""
+    data = request.json or {}
+    filenames = data.get("filenames", [])
+    pdir = os.path.join(PROJECT_DIR, "ref_faces", person)
+    if not os.path.isdir(pdir):
+        return jsonify({"error": "Person not found"}), 404
+    results = {}
+    for fn in filenames:
+        fpath = os.path.join(pdir, fn)
+        if os.path.isfile(fpath):
+            results[fn] = _verify_single_photo(fpath)
+        else:
+            results[fn] = {"status": "error", "message": "File not found"}
+    return jsonify({"ok": True, "results": results})
+
+
 @app.route("/api/ref-faces/<person>/rotate", methods=["POST"])
 def api_ref_faces_rotate(person):
     """Rotate a reference photo 90 degrees clockwise. Expects JSON {filename, direction}."""
@@ -1673,7 +1722,7 @@ let taskPoll = null;
 
 function showLoader(el, msg) {
     if (typeof el === 'string') el = document.getElementById(el);
-    el.innerHTML = '<div class="inline-loader"><div class="spin"></div><span>' + esc(msg || 'Loading...') + '</span></div>';
+    el.innerHTML = '<div class=inline-loader><div class=spin></div><span>' + esc(msg || 'Loading...') + '</span></div>';
     el.style.display = 'block';
 }
 
@@ -1968,6 +2017,7 @@ function renderFacePersons(faces) {
 }
 
 let faceVerifyCache = {};
+let replacedPhotos = {};  // {person: Set of filenames}
 
 async function loadFaceThumbs(person) {
     const res = await fetch('/api/ref-faces/' + encodeURIComponent(person) + '/photos');
@@ -1975,15 +2025,21 @@ async function loadFaceThumbs(person) {
     const container = document.getElementById('face-thumbs-' + person);
     if (!container) return;
     const statuses = faceVerifyCache[person] || {};
+    const replaced = replacedPhotos[person] || new Set();
     container.innerHTML = photos.map(p => {
         const st = statuses[p.filename];
-        const border = st === 'ok' || st === 'ok_multi' ? '3px solid #4caf50' : st === 'no_face' || st === 'encode_fail' || st === 'error' ? '3px solid #f44336' : '2px solid #cbd5e0';
+        const isReplaced = replaced.has(p.filename) && !st;
+        const border = st === 'ok' || st === 'ok_multi' ? '3px solid #4caf50' : st === 'no_face' || st === 'encode_fail' || st === 'error' ? '3px solid #f44336' : isReplaced ? '3px dashed #dd6b20' : '2px solid #cbd5e0';
         const label = st === 'no_face' ? '\\u2718' : st === 'ok' || st === 'ok_multi' ? '\\u2714' : '';
         const labelColor = st === 'ok' || st === 'ok_multi' ? '#4caf50' : '#f44336';
         const safeFn = esc(p.filename).replace(/'/g, "\\\\'");
         const safePerson = esc(person).replace(/'/g, "\\\\'");
         let html = '<div style="display:inline-flex; flex-direction:column; align-items:center; gap:2px; margin-right:8px; margin-bottom:6px;">';
-        html += '<label style="font-size:.65em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px; white-space:nowrap;" for="replace-' + person + '-' + p.filename + '">Replace</label>';
+        if (isReplaced) {
+            html += '<button onclick="verifySinglePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\')" style="font-size:.6em; padding:1px 6px; cursor:pointer; background:#fff5f5; border:1px solid #fed7d7; border-radius:3px; color:#e53e3e; white-space:nowrap;">Verify</button>';
+        } else {
+            html += '<label style="font-size:.65em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px; white-space:nowrap;" for="replace-' + person + '-' + p.filename + '">Replace</label>';
+        }
         html += '<input type="file" id="replace-' + person + '-' + p.filename + '" accept="image/*" style="display:none" onchange="replaceFacePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\', this.files)">';
         html += '<div style="position:relative;" id="face-img-' + person + '-' + p.filename.replace(/[^a-zA-Z0-9]/g,'-') + '">';
         if (p.thumb) {
@@ -2002,6 +2058,76 @@ async function loadFaceThumbs(person) {
         html += '</div>';
         return html;
     }).join('');
+
+    // Add "Verify All Replaced" button if multiple unverified replacements
+    const unverified = [...replaced].filter(fn => !statuses[fn]);
+    if (unverified.length > 1) {
+        var btn = document.createElement('div');
+        btn.style.marginTop = '6px';
+        var b = document.createElement('button');
+        b.className = 'btn btn-secondary';
+        b.style.cssText = 'font-size:.8em; padding:4px 12px; color:#e53e3e; border-color:#fed7d7;';
+        b.textContent = 'Verify ' + unverified.length + ' Replaced Photos';
+        b.onclick = function() { verifyReplacedPhotos(person); };
+        btn.appendChild(b);
+        container.appendChild(btn);
+    }
+}
+
+async function verifySinglePhoto(person, filename) {
+    // Show spinner on the image
+    showFaceLoader(person, filename);
+    const res = await fetch('/api/ref-faces/' + encodeURIComponent(person) + '/verify-photos', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ filenames: [filename] })
+    });
+    const data = await res.json();
+    if (data.results && data.results[filename]) {
+        if (!faceVerifyCache[person]) faceVerifyCache[person] = {};
+        faceVerifyCache[person][filename] = data.results[filename].status;
+    }
+    // Remove from replaced set since it's now verified
+    if (replacedPhotos[person]) replacedPhotos[person].delete(filename);
+    await loadFaceThumbs(person);
+    // Show result
+    const statusEl = document.getElementById('face-status-' + person);
+    if (statusEl && data.results && data.results[filename]) {
+        const v = data.results[filename];
+        const color = v.status === 'ok' ? '#38a169' : v.status === 'ok_multi' ? '#dd6b20' : '#e53e3e';
+        statusEl.innerHTML = '<span style="color:' + color + ';">' + esc(filename) + ': ' + esc(v.message) + '</span>';
+    }
+}
+
+async function verifyReplacedPhotos(person) {
+    const replaced = replacedPhotos[person];
+    if (!replaced || !replaced.size) return;
+    const filenames = [...replaced].filter(fn => !(faceVerifyCache[person] || {})[fn]);
+    if (!filenames.length) return;
+
+    const statusEl = document.getElementById('face-status-' + person);
+    showLoader(statusEl, 'Verifying ' + filenames.length + ' replaced photos...');
+
+    const res = await fetch('/api/ref-faces/' + encodeURIComponent(person) + '/verify-photos', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ filenames })
+    });
+    const data = await res.json();
+    if (data.results) {
+        if (!faceVerifyCache[person]) faceVerifyCache[person] = {};
+        for (const [fn, result] of Object.entries(data.results)) {
+            faceVerifyCache[person][fn] = result.status;
+            if (replacedPhotos[person]) replacedPhotos[person].delete(fn);
+        }
+    }
+    await loadFaceThumbs(person);
+
+    // Show summary
+    if (statusEl && data.results) {
+        const entries = Object.entries(data.results);
+        const ok = entries.filter(([,v]) => v.status === 'ok' || v.status === 'ok_multi').length;
+        const fail = entries.length - ok;
+        statusEl.innerHTML = '<span style="color:' + (fail ? '#e53e3e' : '#38a169') + ';">' + ok + '/' + entries.length + ' faces detected' + (fail ? ' (' + fail + ' failed)' : '') + '</span>';
+    }
 }
 
 async function addPerson() {
@@ -2066,11 +2192,13 @@ async function replaceFacePhoto(person, filename, files) {
 
     await fetch('/api/ref-faces/' + encodeURIComponent(person) + '/replace', {method: 'POST', body: formData});
 
+    // Track as replaced, clear old verify status
+    if (!replacedPhotos[person]) replacedPhotos[person] = new Set();
+    replacedPhotos[person].add(filename);
+    if (faceVerifyCache[person]) delete faceVerifyCache[person][filename];
+
     markFacesDirty();
     await loadFaceThumbs(person);
-
-    const statusEl = document.getElementById('face-status-' + person);
-    if (statusEl) statusEl.innerHTML = '<span style="color:#718096;">Image replaced. Click <strong>Verify All Faces</strong> to re-check.</span>';
 }
 
 async function uploadFacePhotos(person, files) {
