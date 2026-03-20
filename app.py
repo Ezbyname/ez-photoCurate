@@ -414,8 +414,18 @@ def api_analyze():
     db = load_scan_db()
     if not db:
         return jsonify({"error": "No scan data. Run scan first."}), 404
+    config = load_config()
+    # Sync scan_db config with current config categories
+    if config and config.get("categories"):
+        db["config"] = config
     from event_agent import analyze_collection
     analysis = analyze_collection(db)
+    # Filter to only categories in current config
+    if config and isinstance(config.get("categories"), list):
+        valid_ids = {c["id"] for c in config["categories"]}
+        analysis["categories"] = [c for c in analysis.get("categories", []) if c["id"] in valid_ids]
+        analysis["total_target"] = sum(c.get("target", 0) for c in analysis["categories"])
+        analysis["total_qualified"] = sum(c.get("count", 0) for c in analysis["categories"])
     return jsonify(analysis)
 
 
@@ -523,6 +533,102 @@ def api_images_move():
         json.dump(db, f, ensure_ascii=False)
 
     return jsonify({"ok": True, "moved": moved})
+
+
+@app.route("/api/images/serve/<img_hash>")
+def api_images_serve(img_hash):
+    """Serve a full-size image by hash."""
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+    for img in db["images"]:
+        if img["hash"] == img_hash:
+            fpath = img["path"].replace("/", os.sep)
+            if os.path.isfile(fpath):
+                return send_file(fpath)
+            break
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.route("/api/images/select", methods=["POST"])
+def api_images_select():
+    """Select or deselect individual images."""
+    data = request.json
+    hashes = set(data.get("hashes", []))
+    action = data.get("action", "select")  # "select" or "deselect"
+
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    changed = 0
+    for img in db["images"]:
+        if img["hash"] in hashes:
+            if action == "select":
+                img["status"] = "selected"
+            else:
+                img["status"] = "qualified"
+            changed += 1
+
+    with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False)
+
+    return jsonify({"ok": True, "changed": changed})
+
+
+@app.route("/api/categories/summary")
+def api_categories_summary():
+    """Get per-category counts for selection UI."""
+    db = load_scan_db()
+    config = load_config()
+    if not db:
+        return jsonify([])
+
+    images = db["images"]
+    config_cats = config.get("categories", []) if config else []
+    valid_ids = {c["id"] for c in config_cats} if config_cats else set()
+
+    cat_data = {}
+    for c in config_cats:
+        cat_data[c["id"]] = {
+            "id": c["id"],
+            "display": c.get("display", c["id"]),
+            "target": c.get("target", config.get("target_per_category", 75)),
+            "qualified": 0,
+            "selected": 0,
+            "total": 0,
+        }
+
+    for img in images:
+        cat = img.get("category")
+        if cat and cat in cat_data:
+            cat_data[cat]["total"] += 1
+            if img.get("status") == "selected":
+                cat_data[cat]["selected"] += 1
+            elif img.get("status") == "qualified":
+                cat_data[cat]["qualified"] += 1
+
+    return jsonify(list(cat_data.values()))
+
+
+@app.route("/api/categories/update-target", methods=["POST"])
+def api_categories_update_target():
+    """Update target for a specific category."""
+    data = request.json
+    cat_id = data.get("id")
+    new_target = data.get("target")
+
+    config = load_config()
+    if not config or not config.get("categories"):
+        return jsonify({"error": "No config"}), 400
+
+    for c in config["categories"]:
+        if c["id"] == cat_id:
+            c["target"] = new_target
+            break
+
+    save_config(config)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/export", methods=["POST"])
@@ -1266,31 +1372,65 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(4)">Back</button>
-        <button class="btn btn-primary" id="btn-next-5" onclick="goStep(6)">Next: Auto-Select</button>
+        <button class="btn btn-primary" id="btn-next-5" onclick="goStep(6)">Next: Select</button>
     </div>
 </div>
 
-<!-- ── STEP 6: Auto-Select ── -->
-<div class="panel" id="panel-6">
-    <h2>Auto-Select Best Photos</h2>
-    <p>The agent will pick the best images for each category — ranked by quality and filtered for visual diversity.</p>
+<!-- ── STEP 6: Select ── -->
+<div class="panel" id="panel-6" style="max-width:1200px">
+    <h2>Select Photos</h2>
+    <p>Pick images for each category manually, or auto-fill remaining slots.</p>
 
-    <label>Strategy</label>
-    <select id="sel-strategy" style="max-width:300px">
-        <option value="balanced">Balanced (recommended) — quality + diversity</option>
-        <option value="quality">Quality — best resolution/faces, less diversity</option>
-        <option value="diverse">Diverse — maximum variety, accept lower quality</option>
-    </select>
+    <div style="display:flex; gap:16px; margin-top:12px;">
+        <!-- Category sidebar -->
+        <div id="sel-cat-list" style="min-width:240px; max-width:280px; border-right:1px solid #e2e8f0; padding-right:12px; max-height:70vh; overflow-y:auto;">
+            <div style="font-weight:600; margin-bottom:8px; color:#2d3748;">Categories</div>
+        </div>
 
-    <div class="btn-group">
-        <button class="btn btn-primary" id="btn-auto-select" onclick="runAutoSelect()">Run Auto-Select</button>
+        <!-- Image grid area -->
+        <div style="flex:1; min-width:0;">
+            <div id="sel-cat-header" style="display:flex; align-items:center; gap:12px; margin-bottom:10px; flex-wrap:wrap;">
+                <span id="sel-cat-title" style="font-size:1.1em; font-weight:600; color:#2d3748;">Select a category</span>
+                <span id="sel-cat-counter" style="font-size:.9em; color:#718096;"></span>
+                <div id="sel-target-edit" style="display:none; margin-left:auto; align-items:center; gap:6px; font-size:.85em;">
+                    <label style="color:#4a5568; margin:0;">Target:</label>
+                    <input type="number" id="sel-target-input" style="width:60px; padding:2px 6px; border:1px solid #cbd5e0; border-radius:4px;" min="0" max="999">
+                    <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="saveTarget()">Set</button>
+                </div>
+            </div>
+            <div id="sel-filter-bar" style="display:none; margin-bottom:8px; font-size:.85em;">
+                <label style="margin-right:8px;">
+                    <input type="checkbox" id="sel-show-selected" checked onchange="renderSelGrid()"> Show selected
+                </label>
+                <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="selectAllVisible()">Select All</button>
+                <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="deselectAllVisible()">Deselect All</button>
+            </div>
+            <div id="sel-grid" style="display:flex; flex-wrap:wrap; gap:6px; max-height:55vh; overflow-y:auto; padding:4px;"></div>
+            <div id="sel-grid-paging" style="margin-top:8px; display:none; font-size:.85em; color:#718096;">
+                <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" id="sel-prev" onclick="selPage(-1)">Prev</button>
+                <span id="sel-page-info"></span>
+                <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" id="sel-next" onclick="selPage(1)">Next</button>
+            </div>
+        </div>
     </div>
 
-    <div class="progress-box" id="select-progress" style="display:none"></div>
+    <!-- Auto-fill section -->
+    <div style="margin-top:16px; padding-top:12px; border-top:1px solid #e2e8f0;">
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <label style="font-weight:600; color:#2d3748; margin:0;">Auto-fill remaining slots</label>
+            <select id="sel-strategy" style="max-width:220px; padding:4px 8px; border:1px solid #cbd5e0; border-radius:4px;">
+                <option value="balanced">Balanced</option>
+                <option value="quality">Quality</option>
+                <option value="diverse">Diverse</option>
+            </select>
+            <button class="btn btn-primary" id="btn-auto-select" onclick="runAutoSelect()">Auto-Fill</button>
+        </div>
+        <div class="progress-box" id="select-progress" style="display:none; margin-top:8px;"></div>
+    </div>
 
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(5)">Back</button>
-        <button class="btn btn-primary" id="btn-next-6" disabled onclick="goStep(7)">Next: Review</button>
+        <button class="btn btn-primary" id="btn-next-6" onclick="goStep(7)">Next: Review</button>
     </div>
 </div>
 
@@ -1351,7 +1491,9 @@ function goStep(n) {
 
     if (n === 1) loadCategoriesStep();
     if (n === 3) loadFaceStep();
+    if (n === 4) checkExistingScan();
     if (n === 5) runAnalysis();
+    if (n === 6) loadSelCategories();
     if (n === 8) loadExportStats();
 }
 
@@ -1861,6 +2003,16 @@ async function completeFacesStep() {
 }
 
 // ── Step 4: Scan ──
+async function checkExistingScan() {
+    const res = await fetch('/api/stats');
+    const st = await res.json();
+    if (st.has_scan && st.total_images > 0) {
+        document.getElementById('btn-next-4').disabled = false;
+        document.getElementById('scan-progress').style.display = 'block';
+        document.getElementById('scan-progress').innerHTML = '<div class="line" style="color:#38a169;">Existing scan found: ' + st.total_images + ' images from ' + (st.sources?.length || 0) + ' sources. You can proceed or rescan.</div>';
+    }
+}
+
 let scanPoll = null;
 
 async function startScan(full) {
@@ -1927,14 +2079,211 @@ async function runAnalysis() {
     document.querySelectorAll('.step-dot')[5].classList.add('done');
 }
 
-// ── Step 6: Auto-Select ──
+// ── Step 6: Select ──
+let selCats = [];
+let selActiveCat = null;
+let selImages = [];
+let selOffset = 0;
+const SEL_PAGE = 100;
 let selectPoll = null;
+
+async function loadSelCategories() {
+    const res = await fetch('/api/categories/summary');
+    selCats = await res.json();
+    renderSelCatList();
+}
+
+function renderSelCatList() {
+    const el = document.getElementById('sel-cat-list');
+    el.innerHTML = '<div style="font-weight:600; margin-bottom:8px; color:#2d3748;">Categories</div>';
+    let totalSel = 0, totalTarget = 0;
+    selCats.forEach(c => {
+        totalSel += c.selected;
+        totalTarget += c.target;
+        const pct = c.target > 0 ? Math.min(100, Math.round(c.selected / c.target * 100)) : 0;
+        const full = c.selected >= c.target;
+        const active = selActiveCat === c.id;
+        el.innerHTML += `
+            <div onclick="selectCategory('${c.id}')" style="padding:8px 10px; cursor:pointer; border-radius:6px; margin-bottom:4px;
+                background:${active ? '#ebf4ff' : '#fff'}; border:1px solid ${active ? '#3182ce' : '#e2e8f0'};
+                ${full ? 'border-left:3px solid #38a169;' : ''}">
+                <div style="font-size:.9em; font-weight:${active ? '600' : '500'}; color:#2d3748;">${esc(c.display)}</div>
+                <div style="font-size:.8em; color:#718096; margin-top:2px;">
+                    ${c.selected}/${c.target} selected
+                    <span style="color:${full ? '#38a169' : '#e53e3e'};">(${pct}%)</span>
+                </div>
+                <div style="height:3px; background:#e2e8f0; border-radius:2px; margin-top:4px;">
+                    <div style="height:100%; width:${pct}%; background:${full ? '#38a169' : '#3182ce'}; border-radius:2px;"></div>
+                </div>
+            </div>`;
+    });
+    el.innerHTML += `<div style="margin-top:8px; padding:8px 10px; font-size:.85em; font-weight:600; color:#4a5568; border-top:1px solid #e2e8f0;">
+        Total: ${totalSel}/${totalTarget}</div>`;
+}
+
+async function selectCategory(catId) {
+    selActiveCat = catId;
+    selOffset = 0;
+    renderSelCatList();
+    const cat = selCats.find(c => c.id === catId);
+    document.getElementById('sel-cat-title').textContent = cat ? cat.display : catId;
+    document.getElementById('sel-target-edit').style.display = 'flex';
+    document.getElementById('sel-target-input').value = cat ? cat.target : 75;
+    document.getElementById('sel-filter-bar').style.display = 'block';
+    await loadSelImages();
+}
+
+async function loadSelImages() {
+    const grid = document.getElementById('sel-grid');
+    grid.innerHTML = '<div style="color:#718096;">Loading...</div>';
+    // Load both selected and qualified for this category
+    const [rSel, rQual] = await Promise.all([
+        fetch(`/api/images?category=${selActiveCat}&status=selected&limit=500`),
+        fetch(`/api/images?category=${selActiveCat}&status=qualified&limit=500`)
+    ]);
+    const dSel = await rSel.json();
+    const dQual = await rQual.json();
+    // Mark them so we know which are selected
+    selImages = [
+        ...dSel.images.map(i => ({...i, _sel: true})),
+        ...dQual.images.map(i => ({...i, _sel: false}))
+    ];
+    renderSelGrid();
+    updateSelCounter();
+}
+
+function updateSelCounter() {
+    const cat = selCats.find(c => c.id === selActiveCat);
+    const nSel = selImages.filter(i => i._sel).length;
+    const target = cat ? cat.target : 0;
+    document.getElementById('sel-cat-counter').textContent =
+        `${nSel} selected / ${target} target / ${selImages.length} available`;
+}
+
+function renderSelGrid() {
+    const grid = document.getElementById('sel-grid');
+    const showSelected = document.getElementById('sel-show-selected').checked;
+    let visible = showSelected ? selImages : selImages.filter(i => !i._sel);
+    // Pagination
+    const total = visible.length;
+    const paged = visible.slice(selOffset, selOffset + SEL_PAGE);
+    const pagingEl = document.getElementById('sel-grid-paging');
+    if (total > SEL_PAGE) {
+        pagingEl.style.display = 'block';
+        document.getElementById('sel-page-info').textContent =
+            ` ${selOffset + 1}-${Math.min(selOffset + SEL_PAGE, total)} of ${total} `;
+        document.getElementById('sel-prev').disabled = selOffset === 0;
+        document.getElementById('sel-next').disabled = selOffset + SEL_PAGE >= total;
+    } else {
+        pagingEl.style.display = 'none';
+    }
+    grid.innerHTML = '';
+    paged.forEach(img => {
+        const div = document.createElement('div');
+        div.style.cssText = `width:100px; height:100px; border-radius:6px; overflow:hidden; cursor:pointer; position:relative;
+            border:3px solid ${img._sel ? '#3182ce' : '#e2e8f0'}; flex-shrink:0;`;
+        if (img._sel) div.style.boxShadow = '0 0 0 2px #bee3f8';
+        const thumbSrc = img.thumb ? 'data:image/jpeg;base64,' + img.thumb : '';
+        div.innerHTML = `<img src="${thumbSrc}" style="width:100%; height:100%; object-fit:cover;">
+            ${img._sel ? '<div style="position:absolute; top:2px; right:2px; background:#3182ce; color:#fff; border-radius:50%; width:18px; height:18px; font-size:12px; display:flex; align-items:center; justify-content:center;">&#10003;</div>' : ''}`;
+        div.onclick = () => toggleSelImage(img);
+        div.ondblclick = (e) => { e.stopPropagation(); showSelLightbox(img); };
+        grid.appendChild(div);
+    });
+    if (paged.length === 0) {
+        grid.innerHTML = '<div style="color:#718096; padding:20px;">No images in this category.</div>';
+    }
+}
+
+function selPage(dir) {
+    selOffset += dir * SEL_PAGE;
+    if (selOffset < 0) selOffset = 0;
+    renderSelGrid();
+}
+
+async function toggleSelImage(img) {
+    const action = img._sel ? 'deselect' : 'select';
+    img._sel = !img._sel;
+    renderSelGrid();
+    updateSelCounter();
+    // Update server
+    await fetch('/api/images/select', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ hashes: [img.hash], action })
+    });
+    // Update sidebar count
+    const cat = selCats.find(c => c.id === selActiveCat);
+    if (cat) {
+        cat.selected += (action === 'select' ? 1 : -1);
+        renderSelCatList();
+    }
+}
+
+async function selectAllVisible() {
+    const unsel = selImages.filter(i => !i._sel);
+    if (unsel.length === 0) return;
+    const hashes = unsel.map(i => i.hash);
+    unsel.forEach(i => i._sel = true);
+    renderSelGrid(); updateSelCounter();
+    await fetch('/api/images/select', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ hashes, action: 'select' })
+    });
+    const cat = selCats.find(c => c.id === selActiveCat);
+    if (cat) { cat.selected = selImages.filter(i => i._sel).length; renderSelCatList(); }
+}
+
+async function deselectAllVisible() {
+    const sel = selImages.filter(i => i._sel);
+    if (sel.length === 0) return;
+    const hashes = sel.map(i => i.hash);
+    sel.forEach(i => i._sel = false);
+    renderSelGrid(); updateSelCounter();
+    await fetch('/api/images/select', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ hashes, action: 'deselect' })
+    });
+    const cat = selCats.find(c => c.id === selActiveCat);
+    if (cat) { cat.selected = 0; renderSelCatList(); }
+}
+
+async function saveTarget() {
+    const val = parseInt(document.getElementById('sel-target-input').value) || 0;
+    await fetch('/api/categories/update-target', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id: selActiveCat, target: val })
+    });
+    const cat = selCats.find(c => c.id === selActiveCat);
+    if (cat) cat.target = val;
+    renderSelCatList();
+    updateSelCounter();
+}
+
+function showSelLightbox(img) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:9999;display:flex;align-items:center;justify-content:center;';
+    overlay.onclick = () => overlay.remove();
+    const imgEl = document.createElement('img');
+    imgEl.src = '/api/images/serve/' + img.hash;
+    imgEl.style.cssText = 'max-width:90vw;max-height:85vh;border-radius:8px;box-shadow:0 4px 30px rgba(0,0,0,.5);';
+    const close = document.createElement('div');
+    close.innerHTML = '&times;';
+    close.style.cssText = 'position:absolute;top:20px;right:30px;color:#fff;font-size:36px;cursor:pointer;';
+    close.onclick = () => overlay.remove();
+    const info = document.createElement('div');
+    info.style.cssText = 'position:absolute;bottom:20px;left:50%;transform:translateX(-50%);color:#fff;font-size:.85em;background:rgba(0,0,0,.6);padding:6px 16px;border-radius:6px;';
+    info.textContent = (img.filename || '') + (img.date_taken ? ' | ' + img.date_taken : '') + (img.source_label ? ' | ' + img.source_label : '');
+    overlay.appendChild(imgEl);
+    overlay.appendChild(close);
+    overlay.appendChild(info);
+    document.body.appendChild(overlay);
+}
 
 async function runAutoSelect() {
     const strategy = document.getElementById('sel-strategy').value;
     document.getElementById('btn-auto-select').disabled = true;
     document.getElementById('select-progress').style.display = 'block';
-    document.getElementById('select-progress').innerHTML = '<div class="line current">Starting auto-select...</div>';
+    document.getElementById('select-progress').innerHTML = '<div class="line current">Starting auto-fill...</div>';
 
     await fetch('/api/auto-select', {
         method:'POST', headers:{'Content-Type':'application/json'},
@@ -1954,8 +2303,10 @@ async function runAutoSelect() {
             clearInterval(selectPoll);
             document.getElementById('btn-auto-select').disabled = false;
             if (!st.error) {
-                document.getElementById('btn-next-6').disabled = false;
                 document.querySelectorAll('.step-dot')[6].classList.add('done');
+                // Reload categories and current grid
+                await loadSelCategories();
+                if (selActiveCat) await loadSelImages();
             }
         }
     }, 2000);
