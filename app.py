@@ -254,8 +254,17 @@ def api_scan_start():
             use_faces = False
             if face_names and face_dir and os.path.isdir(face_dir):
                 _update_task("Loading face references...")
+                if _is_cancelled():
+                    _update_task("Stopped by user.")
+                    _finish_task("Cancelled")
+                    return
                 ref_encodings = load_reference_faces(face_dir)
                 use_faces = bool(ref_encodings)
+
+            if _is_cancelled():
+                _update_task("Stopped by user.")
+                _finish_task("Cancelled")
+                return
 
             # Existing DB for incremental
             existing_db = {}
@@ -266,12 +275,21 @@ def api_scan_start():
                         existing_db[img["hash"]] = img
                 _update_task(f"Incremental mode: {len(existing_db)} cached images")
 
+            if _is_cancelled():
+                _update_task("Stopped by user.")
+                _finish_task("Cancelled")
+                return
+
             all_images = []
             seen_hashes = set()
             scanned = 0
             skipped = defaultdict(int)
 
             for source in sources:
+                if _is_cancelled():
+                    _update_task("Stopped by user.")
+                    _finish_task("Cancelled")
+                    return
                 src_path = source.get("path", "")
                 src_label = source.get("label", "Unknown")
 
@@ -705,6 +723,21 @@ def api_images_select():
 
     save_scan_db(db)
     return jsonify({"ok": True, "changed": changed})
+
+
+@app.route("/api/selections/reset", methods=["POST"])
+def api_selections_reset():
+    """Reset all selected images back to qualified."""
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+    count = 0
+    for img in db["images"]:
+        if img.get("status") == "selected":
+            img["status"] = "qualified"
+            count += 1
+    save_scan_db(db)
+    return jsonify({"ok": True, "reset": count})
 
 
 @app.route("/api/categories/summary")
@@ -1328,6 +1361,11 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 .lightbox .close-btn { position:absolute; top:20px; right:30px; font-size:2em; color:white; cursor:pointer; background:rgba(0,0,0,.5); border:none; border-radius:50%; width:44px; height:44px; display:flex; align-items:center; justify-content:center; }
 .lightbox .close-btn:hover { background:rgba(0,0,0,.8); }
 
+/* ── Inline spinner ── */
+.inline-loader { display:inline-flex; align-items:center; gap:10px; padding:12px 16px; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; color:#2b6cb0; font-size:.9em; }
+.inline-loader .spin { width:18px; height:18px; border:3px solid #bee3f8; border-top:3px solid #3182ce; border-radius:50%; animation:spinA .7s linear infinite; }
+@keyframes spinA { to { transform:rotate(360deg); } }
+
 /* ── Task overlay ── */
 #task-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,.88); z-index:9990; align-items:center; justify-content:center; flex-direction:column; }
 #task-overlay.active { display:flex; }
@@ -1512,27 +1550,16 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <div class="panel" id="panel-5">
     <h2>Collection Analysis</h2>
     <p>Understanding what you have and what's missing.</p>
-    <button class="btn btn-primary" onclick="runAnalysis()">Run Analysis</button>
 
-    <div id="analysis-results" style="display:none; margin-top:20px;">
-        <div class="row" style="margin-bottom:15px;">
-            <div style="text-align:center"><div class="export-summary"><div class="big-num" id="a-total">0</div>Total Images</div></div>
-            <div style="text-align:center"><div class="export-summary"><div class="big-num" id="a-qualified">0</div>Qualified</div></div>
-            <div style="text-align:center"><div class="export-summary"><div class="big-num" id="a-target">0</div>Target</div></div>
-        </div>
+    <!-- Quick stats (loads instantly) -->
+    <div id="a-quick" style="margin-top:12px;"></div>
 
-        <h3 style="color:#718096; margin:15px 0 8px;">Categories</h3>
-        <table class="analysis-table">
-            <thead><tr><th>Category</th><th>Count</th><th>Target</th><th>Status</th></tr></thead>
-            <tbody id="a-categories"></tbody>
-        </table>
-
-        <h3 style="color:#718096; margin:20px 0 8px;">Recommendations</h3>
-        <div id="a-recommendations"></div>
-
-        <h3 style="color:#718096; margin:20px 0 8px;">What makes a great collection</h3>
-        <div id="a-priorities"></div>
+    <!-- Actions -->
+    <div style="margin-top:16px; display:flex; gap:12px; flex-wrap:wrap;">
+        <button class="btn btn-secondary" onclick="runFullAnalysis()" id="btn-full-analysis">Run Full Analysis (recommendations)</button>
+        <button class="btn btn-secondary" style="color:#e53e3e; border-color:#fed7d7;" onclick="resetAllSelections()">Reset All Selections</button>
     </div>
+    <div id="a-full-results" style="display:none; margin-top:16px;"></div>
 
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(4)">Back</button>
@@ -1644,6 +1671,12 @@ let templates = [];
 let config = null;
 let taskPoll = null;
 
+function showLoader(el, msg) {
+    if (typeof el === 'string') el = document.getElementById(el);
+    el.innerHTML = '<div class="inline-loader"><div class="spin"></div><span>' + esc(msg || 'Loading...') + '</span></div>';
+    el.style.display = 'block';
+}
+
 // ── Task overlay ──
 const TASK_TITLES = {
     'scan': 'Scanning Images...',
@@ -1687,8 +1720,17 @@ function showTaskOverlay(taskType) {
 }
 
 async function stopTask() {
-    await fetch('/api/task/stop', { method: 'POST' });
     document.getElementById('task-overlay-status').textContent = 'Stopping...';
+    document.querySelector('#task-overlay .btn-stop').disabled = true;
+    try {
+        await fetch('/api/task/stop', { method: 'POST' });
+    } catch(e) {}
+    // Wait briefly for backend to acknowledge, then dismiss
+    setTimeout(() => {
+        if (taskPoll) { clearInterval(taskPoll); taskPoll = null; }
+        document.getElementById('task-overlay').classList.remove('active');
+        document.querySelector('#task-overlay .btn-stop').disabled = false;
+    }, 2000);
 }
 
 // ── Step navigation ──
@@ -2049,7 +2091,7 @@ async function uploadFacePhotos(person, files) {
 
 async function verifyPerson(person) {
     const statusEl = document.getElementById('face-status-' + person);
-    statusEl.innerHTML = '<span style="color:#3182ce;">Verifying face encodings... (this may take a moment)</span>';
+    showLoader(statusEl, 'Verifying face encodings...');
 
     const res = await fetch('/api/ref-faces/verify', {
         method: 'POST',
@@ -2109,8 +2151,7 @@ async function verifyPerson(person) {
 
 async function verifyAllFaces() {
     const resultsEl = document.getElementById('face-verify-results');
-    resultsEl.style.display = 'block';
-    resultsEl.innerHTML = '<span style="color:#3182ce;">Verifying all faces...</span>';
+    showLoader(resultsEl, 'Verifying all faces... this may take a moment');
 
     const res = await fetch('/api/ref-faces/verify', {
         method: 'POST',
@@ -2244,38 +2285,96 @@ async function startScan(full) {
 }
 
 // ── Step 5: Analyze ──
+function renderCategoryBars(container, cats, showSelected) {
+    let totalAvail = 0, totalTarget = 0, totalSel = 0;
+    const rows = cats.map(c => {
+        const avail = c.qualified + (c.selected || 0);
+        const sel = c.selected || 0;
+        const target = c.target || 75;
+        totalAvail += avail; totalTarget += target; totalSel += sel;
+        const count = showSelected ? sel : avail;
+        const pct = Math.min(100, Math.round(count / target * 100));
+        const full = count >= target;
+        const low = count < target * 0.5;
+        const barColor = full ? '#38a169' : low ? '#e53e3e' : '#dd6b20';
+        const statusText = full ? 'FULL' : (count === 0 ? 'EMPTY' : 'FILLING');
+        const statusColor = full ? '#38a169' : (count === 0 ? '#a0aec0' : '#dd6b20');
+        return `
+        <div style="display:flex; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid #f0f0f0;">
+            <div style="min-width:140px; font-weight:500; color:#2d3748; font-size:.9em;">${esc(c.display)}</div>
+            <div style="flex:1; height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden;">
+                <div style="height:100%; width:${pct}%; background:${barColor}; border-radius:4px; transition:width .5s;"></div>
+            </div>
+            <div style="min-width:80px; font-size:.85em; color:#4a5568; text-align:right; font-weight:500;">${count} / ${target}</div>
+            <div style="min-width:55px; font-size:.75em; font-weight:700; color:${statusColor}; text-align:center;">${statusText}</div>
+        </div>`;
+    }).join('');
+
+    const overallCount = showSelected ? totalSel : totalAvail;
+    const overallPct = Math.min(100, Math.round(overallCount / (totalTarget || 1) * 100));
+    const overallFull = overallCount >= totalTarget;
+
+    container.innerHTML = `
+        <div style="display:flex; gap:16px; margin-bottom:16px; flex-wrap:wrap;">
+            <div style="flex:1; min-width:100px; text-align:center; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; padding:12px;">
+                <div style="font-size:1.8em; font-weight:bold; color:#2b6cb0;">${totalAvail}</div>
+                <div style="font-size:.8em; color:#4a5568;">Available</div>
+            </div>
+            ${showSelected ? `<div style="flex:1; min-width:100px; text-align:center; background:#f0fff4; border:1px solid #c6f6d5; border-radius:8px; padding:12px;">
+                <div style="font-size:1.8em; font-weight:bold; color:#38a169;">${totalSel}</div>
+                <div style="font-size:.8em; color:#4a5568;">Selected</div>
+            </div>` : ''}
+            <div style="flex:1; min-width:100px; text-align:center; background:#fff5f5; border:1px solid #fed7d7; border-radius:8px; padding:12px;">
+                <div style="font-size:1.8em; font-weight:bold; color:#e53e3e;">${totalTarget}</div>
+                <div style="font-size:.8em; color:#4a5568;">Target</div>
+            </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+            <div style="font-weight:600; color:#2d3748; min-width:70px;">Overall:</div>
+            <div style="flex:1; height:12px; background:#e2e8f0; border-radius:6px; overflow:hidden;">
+                <div style="height:100%; width:${overallPct}%; background:${overallFull ? '#38a169' : '#3182ce'}; border-radius:6px;"></div>
+            </div>
+            <div style="font-weight:600; color:${overallFull ? '#38a169' : '#2d3748'}; min-width:110px; text-align:right;">${overallCount} / ${totalTarget} (${overallPct}%)</div>
+        </div>
+        <h3 style="color:#2d3748; margin:0 0 8px; font-size:1em;">Category Fill Status</h3>
+        ${rows}`;
+}
+
 async function runAnalysis() {
+    const el = document.getElementById('a-quick');
+    showLoader(el, 'Loading category stats...');
+    const res = await fetch('/api/categories/summary');
+    const cats = await res.json();
+    if (!cats.length) { el.innerHTML = '<div style="color:#e53e3e;">No scan data found. Run a scan first.</div>'; return; }
+    renderCategoryBars(el, cats, true);
+    document.querySelectorAll('.step-dot')[5].classList.add('done');
+}
+
+async function runFullAnalysis() {
+    const el = document.getElementById('a-full-results');
+    showLoader(el, 'Running full analysis (this may take a moment)...');
+    document.getElementById('btn-full-analysis').disabled = true;
     const res = await fetch('/api/analyze');
-    if (!res.ok) return;
+    document.getElementById('btn-full-analysis').disabled = false;
+    if (!res.ok) { el.innerHTML = '<div style="color:#e53e3e;">Analysis failed.</div>'; return; }
     const a = await res.json();
-
-    document.getElementById('analysis-results').style.display = 'block';
-    document.getElementById('a-total').textContent = a.total_images;
-    document.getElementById('a-qualified').textContent = a.total_qualified;
-    document.getElementById('a-target').textContent = a.total_target;
-
-    const tbody = document.getElementById('a-categories');
-    tbody.innerHTML = a.categories.map(c => `
-        <tr>
-            <td>${esc(c.display)}</td>
-            <td>${c.count}</td>
-            <td>${c.target}</td>
-            <td class="status-${c.status}">${c.status.toUpperCase()}</td>
-        </tr>
-    `).join('');
-
-    const recs = document.getElementById('a-recommendations');
-    recs.innerHTML = a.recommendations.map(r => `
+    el.style.display = 'block';
+    let html = '<h3 style="color:#718096; margin:0 0 8px;">Recommendations</h3>';
+    html += (a.recommendations || []).map(r => `
         <div class="rec-card ${r.type}">
             <div class="title">${esc(r.title)}</div>
             <div class="detail">${esc(r.detail)}</div>
-        </div>
-    `).join('');
+        </div>`).join('');
+    html += '<h3 style="color:#718096; margin:16px 0 8px;">What makes a great collection</h3>';
+    html += (a.priorities || []).map((p, i) => `<div style="color:#718096; padding:3px 0;">${i+1}. ${esc(p)}</div>`).join('');
+    el.innerHTML = html;
+}
 
-    const pris = document.getElementById('a-priorities');
-    pris.innerHTML = (a.priorities || []).map((p, i) => `<div style="color:#718096; padding:3px 0;">${i+1}. ${esc(p)}</div>`).join('');
-
-    document.querySelectorAll('.step-dot')[5].classList.add('done');
+async function resetAllSelections() {
+    if (!confirm('Reset all selections? All 900 selected images will go back to the available pool.')) return;
+    showLoader('a-quick', 'Resetting selections...');
+    await fetch('/api/selections/reset', { method: 'POST' });
+    await runAnalysis();
 }
 
 // ── Step 6: Select ──
@@ -2332,7 +2431,7 @@ async function selectCategory(catId) {
 
 async function loadSelImages() {
     const grid = document.getElementById('sel-grid');
-    grid.innerHTML = '<div style="color:#718096;">Loading...</div>';
+    showLoader(grid, 'Loading images...');
     // Load both selected and qualified for this category
     const [rSel, rQual] = await Promise.all([
         fetch(`/api/images?category=${selActiveCat}&status=selected&limit=500`),
@@ -2524,9 +2623,10 @@ function openGallery() {
 
 // ── Step 8: Export ──
 async function loadExportStats() {
+    const el = document.getElementById('export-stats');
+    showLoader(el, 'Loading stats...');
     const res = await fetch('/api/stats');
     const st = await res.json();
-    const el = document.getElementById('export-stats');
     if (st.has_scan) {
         const selected = st.selected || 0;
         const qualified = st.qualified || 0;
