@@ -1,0 +1,35 @@
+# Credentials / secrets
+credentials.json
+credntials.json
+token.json
+*.env
+
+# Generated data (large / personal)
+scan_db.json
+scan_all_db.json
+image_vectors.npz
+presentation_vectors.pkl
+image_grades.json
+manifest.json
+presentation_map.json
+dedup_log.json
+curate_config.json
+
+# Generated reports (large HTML with embedded thumbnails)
+*.html
+
+# Cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Output / working directories
+sorted/
+thumbnails/
+removed_from_presentation/
+ref_faces/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
