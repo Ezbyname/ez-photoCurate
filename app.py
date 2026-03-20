@@ -1,5 +1,5 @@
 """
-PhotoCurate Web UI — Step-by-step wizard for building photo collections.
+E-z Photo Organizer Web UI — Step-by-step wizard for building photo collections.
 Runs locally, opens in browser.
 
 Usage:
@@ -1079,7 +1079,7 @@ WIZARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PhotoCurate</title>
+<title>E-z Photo Organizer</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#f5f7fa; color:#2d3748; min-height:100vh; }
@@ -1205,7 +1205,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <div class="app">
 
 <div class="header">
-    <h1>PhotoCurate</h1>
+    <h1>E-z Photo Organizer</h1>
     <p>Build a meaningful photo collection for your special event</p>
 </div>
 
@@ -2396,13 +2396,13 @@ loadTemplates();
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PhotoCurate Web UI")
+    parser = argparse.ArgumentParser(description="E-z Photo Organizer Web UI")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
 
     url = f"http://localhost:{args.port}"
-    print(f"PhotoCurate running at {url}")
+    print(f"E-z Photo Organizer running at {url}")
 
     if not args.no_open:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
