@@ -1,0 +1,32 @@
+{
+  "event_type": "birthday",
+  "display_name": "Birthday Party",
+  "description": "A birthday party photo collection organized by the flow of the event. Works for kids and adults.",
+  "categorization": "date_time_ranges",
+  "required_fields": {
+    "event_date": "The party date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 20,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_setup",       "display": "Setup & Decorations",    "day_offset": 0, "time_from": "06:00", "time_to": "14:00", "target": 15, "keywords": ["setup", "decor", "balloons"]},
+    {"id": "02_arrivals",    "display": "Arrivals & Greetings",   "day_offset": 0, "time_from": "14:00", "time_to": "15:30", "target": 15, "keywords": ["arrival", "greeting"]},
+    {"id": "03_activities",  "display": "Games & Activities",     "day_offset": 0, "time_from": "15:00", "time_to": "17:00", "target": 25, "keywords": ["game", "activity", "play"]},
+    {"id": "04_cake",        "display": "Cake & Singing",         "day_offset": 0, "time_from": "16:00", "time_to": "18:00", "target": 20, "keywords": ["cake", "candle", "singing", "happy birthday"]},
+    {"id": "05_gifts",       "display": "Opening Gifts",          "day_offset": 0, "time_from": "17:00", "time_to": "19:00", "target": 15, "keywords": ["gift", "present", "unwrap"]},
+    {"id": "06_group_shots", "display": "Group Photos",           "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15, "keywords": ["group", "together", "friends"]},
+    {"id": "07_candids",     "display": "Candids & Fun Moments",  "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 25, "keywords": ["candid", "fun", "laugh"]},
+    {"id": "08_portrait",    "display": "Birthday Person Portraits", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15, "keywords": ["portrait"]}
+  ],
+  "tips": [
+    "Add a face reference for the birthday person to auto-find their best shots",
+    "Most birthday photos come from phones — expect varied quality",
+    "Ask guests to share their photos via a shared album or AirDrop",
+    "For a recap video or slideshow, 100-150 images is a good target"
+  ]
+}

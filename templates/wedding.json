@@ -1,0 +1,38 @@
+{
+  "event_type": "wedding",
+  "display_name": "Wedding",
+  "description": "A wedding day photo collection organized by the flow of the day — from preparation through the party. Supports multi-day events (rehearsal dinner, day-after).",
+  "categorization": "date_time_ranges",
+  "required_fields": {
+    "event_date": "The wedding date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 40,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_prep_bride",      "display": "Bride Getting Ready",       "day_offset": 0, "time_from": "06:00", "time_to": "13:00", "target": 30,  "keywords": ["bride", "dress", "makeup", "hair"]},
+    {"id": "02_prep_groom",      "display": "Groom Getting Ready",       "day_offset": 0, "time_from": "06:00", "time_to": "13:00", "target": 15,  "keywords": ["groom", "suit"]},
+    {"id": "03_first_look",      "display": "First Look / Pre-Ceremony", "day_offset": 0, "time_from": "13:00", "time_to": "16:00", "target": 20,  "keywords": ["first look"]},
+    {"id": "04_ceremony",        "display": "Ceremony",                  "day_offset": 0, "time_from": "16:00", "time_to": "18:00", "target": 50,  "keywords": ["ceremony", "chuppah", "vows", "rings"]},
+    {"id": "05_couple_portraits","display": "Couple Portraits",          "day_offset": 0, "time_from": "18:00", "time_to": "19:30", "target": 40,  "keywords": ["portrait", "couple"]},
+    {"id": "06_family_portraits","display": "Family Portraits",          "day_offset": 0, "time_from": "18:00", "time_to": "20:00", "target": 25,  "keywords": ["family", "group"]},
+    {"id": "07_cocktail",        "display": "Cocktail Hour",             "day_offset": 0, "time_from": "18:00", "time_to": "20:00", "target": 20,  "keywords": ["cocktail", "drinks"]},
+    {"id": "08_reception_entry", "display": "Grand Entrance / First Dance", "day_offset": 0, "time_from": "20:00", "time_to": "21:00", "target": 25, "keywords": ["first dance", "entrance"]},
+    {"id": "09_speeches",        "display": "Speeches & Toasts",         "day_offset": 0, "time_from": "21:00", "time_to": "22:00", "target": 20,  "keywords": ["speech", "toast"]},
+    {"id": "10_party",           "display": "Dancing & Party",           "day_offset": 0, "time_from": "22:00", "time_to": "03:00", "target": 40,  "keywords": ["dance", "party"]},
+    {"id": "11_cake",            "display": "Cake & Special Moments",    "day_offset": 0, "time_from": "22:00", "time_to": "01:00", "target": 15,  "keywords": ["cake", "bouquet", "garter"]},
+    {"id": "12_candids",         "display": "Guest Candids",             "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 30,  "keywords": ["candid", "guests"]},
+    {"id": "13_details",         "display": "Details & Decor",           "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 20,  "keywords": ["detail", "decor", "flowers", "table", "invitation"]}
+  ],
+  "tips": [
+    "Add face references for the bride and groom in ref_faces/",
+    "Time ranges overlap — images may match multiple categories. Review and adjust in the gallery.",
+    "Photographers often deliver images in chronological order — filenames help with time estimation",
+    "For a photo book, aim for 300-400 total images across all categories",
+    "The 'Guest Candids' and 'Details' categories catch images that don't fit specific time slots"
+  ]
+}

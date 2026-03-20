@@ -1,0 +1,37 @@
+{
+  "event_type": "bar_mitzva",
+  "display_name": "Bar/Bat Mitzva",
+  "description": "A life timeline from birth through bar/bat mitzva age 13. Images are categorized by the child's age, computed from their birthday and the photo's date.",
+  "categorization": "age_brackets",
+  "required_fields": {
+    "subject_birthday": "The child's date of birth (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 75,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "00_birth",         "display": "Birth (0-2 weeks)",   "age_days_from": 0,    "age_days_to": 14},
+    {"id": "01_month1",        "display": "Month 1",             "age_days_from": 14,   "age_days_to": 60},
+    {"id": "02_months2-3",     "display": "Months 2-3",          "age_days_from": 60,   "age_days_to": 120},
+    {"id": "03_months4-6",     "display": "Months 4-6",          "age_days_from": 120,  "age_days_to": 210},
+    {"id": "04_months7-9",     "display": "Months 7-9",          "age_days_from": 210,  "age_days_to": 300},
+    {"id": "05_months10-12",   "display": "Months 10-12",        "age_days_from": 300,  "age_days_to": 365},
+    {"id": "06_age1-2",        "display": "Age 1-2",             "age_days_from": 365,  "age_days_to": 730},
+    {"id": "07_age2-3",        "display": "Age 2-3",             "age_days_from": 730,  "age_days_to": 1095},
+    {"id": "08_age3-5",        "display": "Age 3-5",             "age_days_from": 1095, "age_days_to": 1825},
+    {"id": "09_age5-8",        "display": "Age 5-8",             "age_days_from": 1825, "age_days_to": 2920},
+    {"id": "10_age8-10",       "display": "Age 8-10",            "age_days_from": 2920, "age_days_to": 3650},
+    {"id": "11_age10-13",      "display": "Age 10-13",           "age_days_from": 3650, "age_days_to": 4745},
+    {"id": "12_bar_mitzva",    "display": "Bar/Bat Mitzva",      "age_days_from": 4745, "age_days_to": 5110}
+  ],
+  "tips": [
+    "Add reference face photos of the child in ref_faces/<name>/ for face filtering",
+    "Use multiple sources: phone backups, USB drives, Google Takeout, cloud storage",
+    "Target 75 images per bracket for a balanced presentation",
+    "Run without face detection first for a quick overview, then enable it to filter"
+  ]
+}

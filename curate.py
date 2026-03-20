@@ -340,6 +340,21 @@ def cmd_scan(args):
     min_dim = config.get("min_dim", 600)
     thumb_size = config.get("thumb_size", 120)
 
+    # Load template if config has event_type
+    event_type = config.get("event_type")
+    template = None
+    if event_type:
+        template = load_template(event_type)
+        if not template:
+            # Template might be embedded in config (categories field)
+            if "categories" in config and "categorization" in config:
+                template = {
+                    "categorization": config["categorization"],
+                    "categories": config["categories"],
+                }
+    # Fallback: use hardcoded age brackets (legacy)
+    use_template = template is not None
+
     print("=" * 70)
     print("  CURATE - SCAN ALL SOURCES")
     print("=" * 70)
@@ -450,8 +465,16 @@ def cmd_scan(args):
                 age_days = None
                 bracket = None
                 if img_date:
-                    age_days = (img_date - REEF_BIRTHDAY).days
-                    bracket = age_days_to_bracket(age_days)
+                    if use_template:
+                        bracket = categorize_by_template(template, config, img_date)
+                        # Compute age_days if we have a birthday
+                        bday_str = config.get("subject_birthday")
+                        if bday_str:
+                            bday = datetime.strptime(bday_str, "%Y-%m-%d")
+                            age_days = (img_date - bday).days
+                    else:
+                        age_days = (img_date - REEF_BIRTHDAY).days
+                        bracket = age_days_to_bracket(age_days)
 
                 # Screenshot check (only for small-ish files to save time)
                 screenshot = False
@@ -538,9 +561,14 @@ def cmd_scan(args):
         if img["status"] == "qualified":
             cat_counts[img["category"] or "unknown"] += 1
     print(f"\n  Qualified by category:")
-    for label, start, end, display in AGE_BRACKETS:
-        cnt = cat_counts.get(label, 0)
-        print(f"    {display:<25} {cnt:>5}")
+    if use_template and "categories" in template:
+        for cat in template["categories"]:
+            cnt = cat_counts.get(cat["id"], 0)
+            print(f"    {cat['display']:<25} {cnt:>5}")
+    else:
+        for label, start, end, display in AGE_BRACKETS:
+            cnt = cat_counts.get(label, 0)
+            print(f"    {display:<25} {cnt:>5}")
 
     # Save DB
     db = {
@@ -577,10 +605,16 @@ def cmd_report(args):
 
     print(f"  {len(images)} images loaded")
 
-    # Build category data for JS
+    # Build category data for JS — from config or hardcoded fallback
     categories = {}
-    for label, start, end, display in AGE_BRACKETS:
-        categories[label] = {"display": display, "target": target_per_cat}
+    config_cats = config.get("categories", [])
+    if config_cats and isinstance(config_cats, list):
+        for cat in config_cats:
+            target = cat.get("target", target_per_cat)
+            categories[cat["id"]] = {"display": cat["display"], "target": target}
+    else:
+        for label, start, end, display in AGE_BRACKETS:
+            categories[label] = {"display": display, "target": target_per_cat}
 
     # Prepare data for JS (strip thumbnails into separate array for efficiency)
     js_images = []
@@ -620,7 +654,7 @@ def cmd_report(args):
 def generate_report_html(images_data, categories, config):
     cat_json = json.dumps(categories)
     img_json = json.dumps(images_data)
-    bracket_labels = json.dumps([b[0] for b in AGE_BRACKETS])
+    bracket_labels = json.dumps(list(categories.keys()))
     face_names = json.dumps(config.get("face_names", []))
     source_labels = json.dumps(sorted(set(im["src"] for im in images_data)))
 
@@ -1198,50 +1232,223 @@ def cmd_apply(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TEMPLATE SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+TEMPLATES_DIR = os.path.join(PROJECT_DIR, "templates")
+
+
+def list_templates():
+    """List available event templates."""
+    templates = {}
+    if not os.path.isdir(TEMPLATES_DIR):
+        return templates
+    for fname in sorted(os.listdir(TEMPLATES_DIR)):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(TEMPLATES_DIR, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                t = json.load(f)
+            templates[t["event_type"]] = {
+                "path": fpath,
+                "display_name": t["display_name"],
+                "description": t["description"],
+                "categorization": t["categorization"],
+                "num_categories": len(t.get("categories", [])),
+                "required_fields": t.get("required_fields", {}),
+            }
+        except Exception:
+            pass
+    return templates
+
+
+def load_template(event_type):
+    """Load a template by event type name."""
+    templates = list_templates()
+    if event_type not in templates:
+        return None
+    with open(templates[event_type]["path"], "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def categorize_by_template(template, config, img_date):
+    """
+    Given a template and an image date, return the best matching category ID.
+    Supports: age_brackets, date_time_ranges, date_ranges.
+    Returns None if no category matches.
+    """
+    cat_type = template["categorization"]
+    categories = template["categories"]
+
+    if cat_type == "age_brackets":
+        birthday_str = config.get("subject_birthday")
+        if not birthday_str or not img_date:
+            return None
+        birthday = datetime.strptime(birthday_str, "%Y-%m-%d")
+        age_days = (img_date - birthday).days
+        if age_days < 0:
+            return None
+        for cat in categories:
+            if cat.get("age_days_from") is not None and cat.get("age_days_to") is not None:
+                if cat["age_days_from"] <= age_days < cat["age_days_to"]:
+                    return cat["id"]
+        return None
+
+    elif cat_type == "date_time_ranges":
+        event_date_str = config.get("event_date")
+        if not event_date_str or not img_date:
+            return None
+        event_date = datetime.strptime(event_date_str, "%Y-%m-%d").date()
+        img_day = img_date.date()
+        img_time = img_date.time()
+
+        best = None
+        for cat in categories:
+            day_offset = cat.get("day_offset", 0)
+            # day_offset -1 means "any day" (thematic category)
+            if day_offset == -1:
+                continue  # skip thematic for now, only match time-based
+            target_day = event_date + timedelta(days=day_offset)
+            if img_day != target_day:
+                continue
+            time_from = datetime.strptime(cat.get("time_from", "00:00"), "%H:%M").time()
+            time_to = datetime.strptime(cat.get("time_to", "23:59"), "%H:%M").time()
+            if time_to < time_from:
+                # wraps midnight
+                if img_time >= time_from or img_time <= time_to:
+                    best = cat["id"]
+                    break
+            else:
+                if time_from <= img_time <= time_to:
+                    best = cat["id"]
+                    break
+        return best
+
+    elif cat_type == "date_ranges":
+        if not img_date:
+            return None
+        year = config.get("year")
+        if year:
+            year = int(year)
+            if img_date.year != year:
+                return None
+        img_month = img_date.month
+        for cat in categories:
+            m_from = cat.get("month_from")
+            m_to = cat.get("month_to")
+            if m_from is not None and m_to is not None:
+                if m_from <= img_month <= m_to:
+                    return cat["id"]
+        return None
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TEMPLATES COMMAND
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cmd_templates(args):
+    templates = list_templates()
+    if not templates:
+        print("No templates found in templates/ directory.")
+        return
+
+    print("Available event templates:")
+    print()
+    for etype, info in templates.items():
+        print(f"  {etype}")
+        print(f"    {info['display_name']} - {info['description'][:80]}...")
+        print(f"    Categories: {info['num_categories']} | Type: {info['categorization']}")
+        if info['required_fields']:
+            print(f"    Required: {', '.join(info['required_fields'].keys())}")
+        print()
+
+    print("Usage: python curate.py init --event <event_type>")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  INIT COMMAND
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_init(args):
+    event_type = args.event
+
+    # If no event type, show available templates
+    if not event_type:
+        print("Choose an event template:\n")
+        templates = list_templates()
+        for etype, info in templates.items():
+            print(f"  {etype:<20} {info['display_name']} ({info['num_categories']} categories)")
+        print(f"\nUsage: python curate.py init --event <event_type>")
+        print(f"       python curate.py init --event bar_mitzva --birthday 2013-07-16")
+        return
+
+    template = load_template(event_type)
+    if not template:
+        print(f"Unknown event type: {event_type}")
+        print(f"Available: {', '.join(list_templates().keys())}")
+        return
+
+    # Build config from template
+    defaults = template.get("defaults", {})
     config = {
+        "event_type": event_type,
+        "template": template["display_name"],
+        "categorization": template["categorization"],
         "ref_faces_dir": "./ref_faces",
-        "face_names": ["reef"],
-        "face_tolerance": 0.6,
+        "face_names": [],
+        "face_tolerance": defaults.get("face_tolerance", 0.6),
         "sources": [
-            {"path": r"D:\ריף", "label": "USB Disk"},
-            {
-                "path": os.path.join(
-                    os.path.expanduser("~"),
-                    "OneDrive - Pen-Link Ltd", "Desktop",
-                    "\u05d0\u05d9\u05e9\u05d9", "\u05e8\u05d9\u05e3",
-                    "\u05d1\u05e8 \u05de\u05e6\u05d5\u05d5\u05d4",
-                    "the presentation"
-                ),
-                "label": "Current Presentation",
-            },
-            {
-                "path": os.path.join(
-                    os.path.expanduser("~"),
-                    "OneDrive - Pen-Link Ltd", "Desktop",
-                    "\u05d0\u05d9\u05e9\u05d9", "\u05e8\u05d9\u05e3",
-                    "\u05d1\u05e8 \u05de\u05e6\u05d5\u05d5\u05d4",
-                    "download", "extracted", "Takeout", "Google Photos", "reef"
-                ),
-                "label": "Google Takeout",
-            },
+            {"path": "", "label": "Source 1 (edit me)"},
         ],
-        "categories": "age",
-        "target_per_category": 75,
-        "min_size_kb": 80,
-        "min_dim": 600,
-        "thumb_size": 120,
+        "target_per_category": defaults.get("target_per_category", 75),
+        "min_size_kb": defaults.get("min_size_kb", 80),
+        "min_dim": defaults.get("min_dim", 600),
+        "thumb_size": defaults.get("thumb_size", 120),
+        "categories": template["categories"],
     }
+
+    # Fill required fields from args
+    req = template.get("required_fields", {})
+    if "subject_birthday" in req:
+        bday = args.birthday
+        if not bday:
+            print(f"This template requires --birthday YYYY-MM-DD")
+            return
+        config["subject_birthday"] = bday
+    if "event_date" in req:
+        edate = args.event_date
+        if not edate:
+            print(f"This template requires --event-date YYYY-MM-DD")
+            return
+        config["event_date"] = edate
+    if "end_date" in req:
+        if args.end_date:
+            config["end_date"] = args.end_date
+    if "year" in req:
+        if args.year:
+            config["year"] = args.year
 
     out = args.output or DEFAULT_CONFIG_PATH
     with open(out, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
     print(f"Config created: {out}")
-    print("Edit sources, face_names, etc. as needed, then run:")
-    print(f"  python curate.py scan --config {out}")
+    print(f"  Event: {template['display_name']}")
+    print(f"  Categories: {len(template['categories'])}")
+    print(f"  Categorization: {template['categorization']}")
+    print()
+    if template.get("tips"):
+        print("Tips:")
+        for tip in template["tips"]:
+            print(f"  - {tip}")
+        print()
+    print("Next steps:")
+    print(f"  1. Edit {out} — add your image source paths")
+    print(f"  2. python curate.py scan --config {out}")
+    print(f"  3. python curate.py report")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1252,8 +1459,16 @@ def main():
     p = argparse.ArgumentParser(description="Image Curation Pipeline")
     sub = p.add_subparsers(dest="command")
 
+    # templates
+    sub.add_parser("templates", help="List available event templates")
+
     # init
-    s_init = sub.add_parser("init", help="Create default config file")
+    s_init = sub.add_parser("init", help="Create config from event template")
+    s_init.add_argument("--event", type=str, help="Event type (bar_mitzva, wedding, birthday, etc.)")
+    s_init.add_argument("--birthday", type=str, help="Subject birthday YYYY-MM-DD (for age-based events)")
+    s_init.add_argument("--event-date", type=str, help="Event date YYYY-MM-DD (for date-based events)")
+    s_init.add_argument("--end-date", type=str, help="End date YYYY-MM-DD (for multi-day events)")
+    s_init.add_argument("--year", type=str, help="Year YYYY (for photo book)")
     s_init.add_argument("--output", type=str)
 
     # scan
@@ -1273,7 +1488,9 @@ def main():
 
     args = p.parse_args()
 
-    if args.command == "init":
+    if args.command == "templates":
+        cmd_templates(args)
+    elif args.command == "init":
         cmd_init(args)
     elif args.command == "scan":
         cmd_scan(args)

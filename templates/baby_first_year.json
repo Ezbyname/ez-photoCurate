@@ -1,0 +1,39 @@
+{
+  "event_type": "baby_first_year",
+  "display_name": "Baby's First Year",
+  "description": "Monthly milestone photo collection for a baby's first year of life. Organized by month with special milestone categories.",
+  "categorization": "age_brackets",
+  "required_fields": {
+    "subject_birthday": "The baby's date of birth (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 30,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "00_newborn",   "display": "Newborn (Week 1)",    "age_days_from": 0,   "age_days_to": 7},
+    {"id": "01_month1",    "display": "Month 1",             "age_days_from": 7,   "age_days_to": 30},
+    {"id": "02_month2",    "display": "Month 2",             "age_days_from": 30,  "age_days_to": 60},
+    {"id": "03_month3",    "display": "Month 3",             "age_days_from": 60,  "age_days_to": 90},
+    {"id": "04_month4",    "display": "Month 4",             "age_days_from": 90,  "age_days_to": 120},
+    {"id": "05_month5",    "display": "Month 5",             "age_days_from": 120, "age_days_to": 150},
+    {"id": "06_month6",    "display": "Month 6 (Half Year)", "age_days_from": 150, "age_days_to": 180},
+    {"id": "07_month7",    "display": "Month 7",             "age_days_from": 180, "age_days_to": 210},
+    {"id": "08_month8",    "display": "Month 8",             "age_days_from": 210, "age_days_to": 240},
+    {"id": "09_month9",    "display": "Month 9",             "age_days_from": 240, "age_days_to": 270},
+    {"id": "10_month10",   "display": "Month 10",            "age_days_from": 270, "age_days_to": 300},
+    {"id": "11_month11",   "display": "Month 11",            "age_days_from": 300, "age_days_to": 330},
+    {"id": "12_month12",   "display": "Month 12",            "age_days_from": 330, "age_days_to": 365},
+    {"id": "13_first_bday","display": "First Birthday Party", "age_days_from": 360, "age_days_to": 375},
+    {"id": "14_milestones","display": "Milestones & Firsts",  "age_days_from": 0,   "age_days_to": 365, "keywords": ["first", "milestone", "crawl", "walk", "tooth", "food", "smile"]}
+  ],
+  "tips": [
+    "Take a consistent monthly photo in the same spot for a growth comparison",
+    "First smile, first food, first crawl, first steps — capture these milestones",
+    "30 photos per month gives you 360+ for a beautiful first-year book",
+    "Add faces of both parents and baby for face-filtered family shots"
+  ]
+}

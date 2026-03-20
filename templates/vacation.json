@@ -1,0 +1,38 @@
+{
+  "event_type": "vacation",
+  "display_name": "Vacation / Trip",
+  "description": "A travel photo collection organized by day and activity type. Supports multi-day trips.",
+  "categorization": "date_time_ranges",
+  "required_fields": {
+    "event_date": "The trip start date (YYYY-MM-DD)",
+    "end_date": "The trip end date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 25,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_departure",   "display": "Departure & Travel",    "day_offset": 0,  "time_from": "00:00", "time_to": "23:59", "target": 15},
+    {"id": "02_day1",        "display": "Day 1",                 "day_offset": 0,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "03_day2",        "display": "Day 2",                 "day_offset": 1,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "04_day3",        "display": "Day 3",                 "day_offset": 2,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "05_day4",        "display": "Day 4",                 "day_offset": 3,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "06_day5",        "display": "Day 5",                 "day_offset": 4,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "07_day6",        "display": "Day 6",                 "day_offset": 5,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "08_day7",        "display": "Day 7",                 "day_offset": 6,  "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "20_landscapes",  "display": "Landscapes & Scenery",  "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 30, "keywords": ["landscape", "scenery", "view", "sunset", "sunrise"]},
+    {"id": "21_food",        "display": "Food & Dining",         "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 20, "keywords": ["food", "restaurant", "meal", "dinner"]},
+    {"id": "22_people",      "display": "People & Portraits",    "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 25, "keywords": ["portrait", "selfie", "group"]},
+    {"id": "23_details",     "display": "Details & Culture",     "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 20, "keywords": ["detail", "culture", "architecture", "street"]}
+  ],
+  "tips": [
+    "Day categories auto-expand based on your trip length — edit the config after init",
+    "Categories with day_offset -1 span the entire trip (thematic, not time-based)",
+    "Aim for 20-30 images per day for a well-paced travel album",
+    "Mix wide establishing shots with close-up details for visual variety",
+    "Include at least a few shots of yourselves at each location"
+  ]
+}

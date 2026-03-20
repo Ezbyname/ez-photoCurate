@@ -1,0 +1,35 @@
+{
+  "event_type": "photo_book",
+  "display_name": "Photo Book / Year in Review",
+  "description": "A general-purpose photo book organized by seasons and themes. Works for family year-in-review, travel, or any period-based collection.",
+  "categorization": "date_ranges",
+  "required_fields": {
+    "year": "The year to cover (YYYY), or start_date and end_date for custom range"
+  },
+  "defaults": {
+    "target_per_category": 30,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_winter",     "display": "Winter (Jan-Mar)",     "month_from": 1,  "month_to": 3,  "target": 30},
+    {"id": "02_spring",     "display": "Spring (Apr-Jun)",     "month_from": 4,  "month_to": 6,  "target": 30},
+    {"id": "03_summer",     "display": "Summer (Jul-Sep)",     "month_from": 7,  "month_to": 9,  "target": 30},
+    {"id": "04_fall",       "display": "Fall (Oct-Dec)",       "month_from": 10, "month_to": 12, "target": 30},
+    {"id": "05_family",     "display": "Family Portraits",     "month_from": 1,  "month_to": 12, "target": 20, "keywords": ["family", "portrait", "group"]},
+    {"id": "06_travel",     "display": "Travel & Vacations",   "month_from": 1,  "month_to": 12, "target": 30, "keywords": ["travel", "vacation", "trip", "beach", "mountain"]},
+    {"id": "07_celebrations","display": "Celebrations & Holidays", "month_from": 1, "month_to": 12, "target": 25, "keywords": ["birthday", "holiday", "christmas", "thanksgiving", "easter", "hanukkah"]},
+    {"id": "08_everyday",   "display": "Everyday Moments",     "month_from": 1,  "month_to": 12, "target": 25, "keywords": ["candid", "everyday", "home"]},
+    {"id": "09_pets",       "display": "Pets",                  "month_from": 1,  "month_to": 12, "target": 15, "keywords": ["dog", "cat", "pet"]},
+    {"id": "10_favorites",  "display": "Best Of / Highlights",  "month_from": 1,  "month_to": 12, "target": 20}
+  ],
+  "tips": [
+    "A year-in-review book typically has 150-250 images",
+    "Include a mix of posed and candid shots for variety",
+    "Don't forget the small everyday moments — they become the most precious",
+    "For travel sections, include landscape/detail shots alongside people photos",
+    "The 'Best Of' category is for your absolute favorites regardless of time or theme"
+  ]
+}
