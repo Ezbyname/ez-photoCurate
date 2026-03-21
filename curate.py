@@ -1164,7 +1164,7 @@ function exportChanges() {{
 
 function openLB(img) {{
     const lb = document.getElementById('lightbox');
-    document.getElementById('lb-img').src = 'file:///' + img.path;
+    document.getElementById('lb-img').src = '/api/images/serve/' + img.id;
     document.getElementById('lb-meta').innerHTML =
         '<b>'+esc(img.fn)+'</b><br>' +
         'Source: '+esc(img.src)+' | Device: '+img.dev+'<br>' +

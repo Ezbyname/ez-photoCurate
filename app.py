@@ -1992,7 +1992,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(2)">Back</button>
-        <button class="btn btn-secondary" onclick="skipFaces()">Skip (no face recognition)</button>
+        <button class="btn btn-secondary" id="btn-skip-faces" onclick="skipFaces()">Skip (no face recognition)</button>
         <button class="btn btn-primary" id="btn-next-3" disabled onclick="completeFacesStep()">Next: Start Scan</button>
     </div>
 </div>
@@ -2002,14 +2002,11 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <h2>Scanning your photos</h2>
     <p>This scans all your sources, extracts dates, detects duplicates, and creates thumbnails. This runs once — future scans are incremental.</p>
 
-    <div style="margin-bottom:12px; padding:10px 14px; background:#f7fafc; border:1px solid #e2e8f0; border-radius:8px;">
-        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:.9em; color:#2d3748;">
+    <div style="margin-bottom:10px;">
+        <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; font-size:.8em; color:#4a5568; font-weight:600; white-space:nowrap;">
             <input type="checkbox" id="chk-nsfw-filter" onchange="toggleNsfwFilter(this.checked)">
-            <span>Filter out nudity / inappropriate content</span>
+            Filter out nudity / inappropriate content <span style="font-weight:400; color:#a0aec0;">(AI detection, ~25 MB model)</span>
         </label>
-        <div style="font-size:.78em; color:#718096; margin-top:4px; margin-left:26px;">
-            Uses AI to detect and exclude NSFW images. Requires first-time download of detection model (~25 MB).
-        </div>
     </div>
 
     <div class="btn-group">
@@ -2471,6 +2468,7 @@ async function loadFaceStep() {
     const hasPhotos = faces.some(f => f.photo_count > 0);
     document.getElementById('face-verify-btn-group').style.display = hasPhotos ? 'flex' : 'none';
     if (!facesVerified) document.getElementById('btn-next-3').disabled = hasPhotos;
+    document.getElementById('btn-skip-faces').style.display = facesVerified ? 'none' : '';
 }
 
 function renderFacePersons(faces) {
@@ -2845,6 +2843,7 @@ async function verifyAllFaces() {
 async function runVerifyAll() {
     const allReady = await verifyAllFaces();
     facesVerified = true;
+    document.getElementById('btn-skip-faces').style.display = 'none';
     if (allReady) {
         document.getElementById('btn-next-3').disabled = false;
     } else {
