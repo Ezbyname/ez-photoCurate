@@ -1,0 +1,31 @@
+{
+  "event_type": "anniversary",
+  "display_name": "Anniversary",
+  "description": "A couple's anniversary — their journey through the years and the celebration event.",
+  "categorization": "date_time_ranges",
+  "extra": true,
+  "required_fields": {
+    "event_date": "Anniversary/celebration date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 20,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_early_years", "display": "Early Years Together", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 20},
+    {"id": "02_milestones", "display": "Milestones & Memories", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "03_family", "display": "Family Over the Years", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 20},
+    {"id": "04_preparation", "display": "Preparation & Setup", "day_offset": 0, "time_from": "06:00", "time_to": "15:00", "target": 10},
+    {"id": "05_celebration", "display": "The Celebration", "day_offset": 0, "time_from": "15:00", "time_to": "23:59", "target": 25},
+    {"id": "06_guests", "display": "Guests & Group Photos", "day_offset": 0, "time_from": "15:00", "time_to": "23:59", "target": 20},
+    {"id": "07_portraits", "display": "Couple Portraits", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 15}
+  ],
+  "tips": [
+    "Gather old photos from different decades for the timeline categories",
+    "Add face references for the couple to highlight their best moments",
+    "Scanned old prints may have lower resolution — adjust min quality if needed"
+  ]
+}

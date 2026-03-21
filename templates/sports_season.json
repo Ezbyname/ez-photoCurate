@@ -1,0 +1,31 @@
+{
+  "event_type": "sports_season",
+  "display_name": "Sports Season",
+  "description": "A sports season recap — games, practices, team photos, and awards.",
+  "categorization": "manual",
+  "extra": true,
+  "required_fields": {
+    "event_date": "Season end / awards date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 20,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_team", "display": "Team Photos", "target": 15},
+    {"id": "02_practice", "display": "Practices & Training", "target": 15},
+    {"id": "03_games", "display": "Game Action", "target": 30},
+    {"id": "04_celebrations", "display": "Wins & Celebrations", "target": 15},
+    {"id": "05_portraits", "display": "Player Portraits", "target": 15},
+    {"id": "06_awards", "display": "Awards & Trophies", "target": 10},
+    {"id": "07_off_field", "display": "Off the Field / Fun", "target": 15}
+  ],
+  "tips": [
+    "Action shots from games are usually the highlight",
+    "Add face references for key players to find their best moments",
+    "Photos from multiple games give better variety"
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "event_type": "baby_shower",
+  "display_name": "Baby Shower / Gender Reveal",
+  "description": "A baby shower or gender reveal celebration with games, gifts, and the big moment.",
+  "categorization": "date_time_ranges",
+  "extra": true,
+  "required_fields": {
+    "event_date": "Party date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 15,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_setup", "display": "Decorations & Setup", "day_offset": 0, "time_from": "06:00", "time_to": "13:00", "target": 10},
+    {"id": "02_arrivals", "display": "Arrivals & Greetings", "day_offset": 0, "time_from": "12:00", "time_to": "15:00", "target": 10},
+    {"id": "03_games", "display": "Games & Activities", "day_offset": 0, "time_from": "13:00", "time_to": "18:00", "target": 15},
+    {"id": "04_gifts", "display": "Opening Gifts", "day_offset": 0, "time_from": "14:00", "time_to": "19:00", "target": 15},
+    {"id": "05_reveal", "display": "The Big Reveal / Moment", "day_offset": 0, "time_from": "14:00", "time_to": "19:00", "target": 15},
+    {"id": "06_group", "display": "Group Photos", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15},
+    {"id": "07_candids", "display": "Candids & Fun", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15}
+  ],
+  "tips": [
+    "Add a face reference for the parents-to-be",
+    "Decoration and setup photos set the scene nicely for a slideshow",
+    "The reveal moment is usually the highlight — make sure it's well covered"
+  ]
+}

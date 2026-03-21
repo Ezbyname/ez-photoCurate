@@ -1,0 +1,31 @@
+{
+  "event_type": "retirement",
+  "display_name": "Retirement Party",
+  "description": "A retirement celebration with career highlights, speeches, and the party.",
+  "categorization": "date_time_ranges",
+  "extra": true,
+  "required_fields": {
+    "event_date": "Party date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 15,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_career", "display": "Career Highlights", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 20},
+    {"id": "02_colleagues", "display": "Colleagues & Work Friends", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 15},
+    {"id": "03_setup", "display": "Venue & Setup", "day_offset": 0, "time_from": "06:00", "time_to": "15:00", "target": 10},
+    {"id": "04_speeches", "display": "Speeches & Tributes", "day_offset": 0, "time_from": "15:00", "time_to": "21:00", "target": 15},
+    {"id": "05_celebration", "display": "Celebration & Dinner", "day_offset": 0, "time_from": "17:00", "time_to": "23:59", "target": 20},
+    {"id": "06_group", "display": "Group Photos", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15},
+    {"id": "07_candids", "display": "Candids & Fun Moments", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15}
+  ],
+  "tips": [
+    "Gather old workplace photos for the career highlights category",
+    "Add a face reference for the retiree",
+    "Speech and toast moments are great for the slideshow"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "event_type": "memorial",
+  "display_name": "Memorial / Tribute",
+  "description": "A life tribute or memorial slideshow organized by life stages.",
+  "categorization": "manual",
+  "extra": true,
+  "required_fields": {},
+  "defaults": {
+    "target_per_category": 15,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_childhood", "display": "Childhood", "target": 15},
+    {"id": "02_youth", "display": "Youth & School Years", "target": 15},
+    {"id": "03_family", "display": "Family Life", "target": 20},
+    {"id": "04_career", "display": "Career & Achievements", "target": 15},
+    {"id": "05_friends", "display": "Friends & Community", "target": 15},
+    {"id": "06_hobbies", "display": "Hobbies & Passions", "target": 10},
+    {"id": "07_recent", "display": "Recent Years", "target": 15},
+    {"id": "08_legacy", "display": "Legacy & Special Moments", "target": 15}
+  ],
+  "tips": [
+    "Gather photos from different family members for full life coverage",
+    "Scanned old prints may need lower quality thresholds",
+    "Add a face reference to automatically find their photos across sources"
+  ]
+}

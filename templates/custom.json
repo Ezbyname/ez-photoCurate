@@ -1,0 +1,22 @@
+{
+  "event_type": "custom",
+  "display_name": "Custom Event",
+  "description": "Start from scratch with your own categories. Perfect for any occasion not covered by the built-in templates.",
+  "categorization": "manual",
+  "required_fields": {
+    "event_date": "Event date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 30,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [],
+  "tips": [
+    "Add your own categories in the next step — organize however makes sense for your event",
+    "You can set a different target count for each category",
+    "Face recognition works the same — add reference photos to find specific people"
+  ]
+}

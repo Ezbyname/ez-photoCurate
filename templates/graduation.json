@@ -1,0 +1,31 @@
+{
+  "event_type": "graduation",
+  "display_name": "Graduation",
+  "description": "A graduation ceremony and celebration, from getting ready to the after-party.",
+  "categorization": "date_time_ranges",
+  "extra": true,
+  "required_fields": {
+    "event_date": "Graduation date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 20,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_getting_ready", "display": "Getting Ready", "day_offset": 0, "time_from": "06:00", "time_to": "10:00", "target": 15},
+    {"id": "02_ceremony", "display": "Ceremony", "day_offset": 0, "time_from": "09:00", "time_to": "13:00", "target": 25},
+    {"id": "03_cap_toss", "display": "Cap Toss & Stage", "day_offset": 0, "time_from": "11:00", "time_to": "14:00", "target": 15},
+    {"id": "04_family_photos", "display": "Family Photos", "day_offset": 0, "time_from": "12:00", "time_to": "16:00", "target": 20},
+    {"id": "05_friends", "display": "Friends & Classmates", "day_offset": 0, "time_from": "11:00", "time_to": "18:00", "target": 20},
+    {"id": "06_celebration", "display": "Celebration Dinner", "day_offset": 0, "time_from": "17:00", "time_to": "23:59", "target": 20},
+    {"id": "07_candids", "display": "Candids & Moments", "day_offset": -1, "time_from": "00:00", "time_to": "23:59", "target": 15}
+  ],
+  "tips": [
+    "Ceremony photos are often taken from far away — expect lower quality",
+    "Add face references for the graduate to find their best shots",
+    "Ask family and friends to share their photos too"
+  ]
+}

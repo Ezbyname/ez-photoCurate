@@ -1,0 +1,29 @@
+{
+  "event_type": "pet_timeline",
+  "display_name": "Pet Timeline",
+  "description": "A timeline of your pet's life — from adoption day through their best moments.",
+  "categorization": "manual",
+  "extra": true,
+  "required_fields": {},
+  "defaults": {
+    "target_per_category": 15,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_first_day", "display": "First Day / Adoption", "target": 10},
+    {"id": "02_puppy", "display": "Baby / Young", "target": 20},
+    {"id": "03_growing", "display": "Growing Up", "target": 20},
+    {"id": "04_adventures", "display": "Adventures & Outdoors", "target": 15},
+    {"id": "05_family", "display": "With Family & Friends", "target": 15},
+    {"id": "06_silly", "display": "Silly & Funny Moments", "target": 15},
+    {"id": "07_portraits", "display": "Best Portraits", "target": 15}
+  ],
+  "tips": [
+    "Face recognition works for humans only — skip face references for pets",
+    "Pet photos tend to be taken casually, so lower the quality threshold if needed",
+    "Outdoor and action shots add great variety"
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "event_type": "quinceanera",
+  "display_name": "Quincea\u00f1era / Sweet 16",
+  "description": "A coming-of-age celebration with ceremony, party, and dance.",
+  "categorization": "date_time_ranges",
+  "extra": true,
+  "required_fields": {
+    "subject_birthday": "Birthday of the celebrant (YYYY-MM-DD)",
+    "event_date": "Party date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 20,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_getting_ready", "display": "Getting Ready", "day_offset": 0, "time_from": "06:00", "time_to": "14:00", "target": 15},
+    {"id": "02_ceremony", "display": "Ceremony / Church", "day_offset": 0, "time_from": "10:00", "time_to": "15:00", "target": 20},
+    {"id": "03_portraits", "display": "Formal Portraits", "day_offset": 0, "time_from": "12:00", "time_to": "18:00", "target": 20},
+    {"id": "04_reception", "display": "Reception & Entrance", "day_offset": 0, "time_from": "16:00", "time_to": "20:00", "target": 20},
+    {"id": "05_dances", "display": "Dances & Waltz", "day_offset": 0, "time_from": "18:00", "time_to": "23:00", "target": 20},
+    {"id": "06_cake", "display": "Cake & Toast", "day_offset": 0, "time_from": "19:00", "time_to": "23:00", "target": 15},
+    {"id": "07_party", "display": "Party & Dancing", "day_offset": 0, "time_from": "20:00", "time_to": "23:59", "target": 20},
+    {"id": "08_guests", "display": "Guests & Group Photos", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 20}
+  ],
+  "tips": [
+    "Add a face reference for the celebrant to find their best shots",
+    "Professional photographer photos are usually the highest quality — add them as a source",
+    "Court of honor group shots make great category highlights"
+  ]
+}

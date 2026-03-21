@@ -463,10 +463,13 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
     elif strategy == "diverse":
         sim_threshold = 0.75  # strict diversity
 
-    # Group images by category
+    # Group images by category (only face-matched when face names configured)
+    face_names = config.get("face_names", [])
     by_category = defaultdict(list)
     for img in images:
         if img.get("status") == "rejected":
+            continue
+        if face_names and not img.get("has_target_face"):
             continue
         cat = img.get("category")
         if cat:
@@ -504,9 +507,25 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
             })
             continue
 
+        # Face distance filtering — reject false positives
+        if face_names:
+            age_days_to = cat.get("age_days_to", 99999)
+            if age_days_to <= 365:
+                max_dist = 0.45
+            elif age_days_to <= 1095:
+                max_dist = 0.50
+            else:
+                max_dist = 0.55
+            pool = [i for i in pool
+                    if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
+
         # Score all candidates
         for img in pool:
-            img["_score"] = compute_quality_score(img, weights)
+            fd = img.get("face_distance")
+            base = compute_quality_score(img, weights)
+            if fd is not None and face_names:
+                base += max(0, (0.6 - fd)) * 5
+            img["_score"] = base
 
         # Sort by score descending
         pool.sort(key=lambda x: x["_score"], reverse=True)

@@ -24,6 +24,7 @@ from flask import Flask, request, jsonify, send_file
 sys.stdout.reconfigure(line_buffering=True)
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECTS_DIR = os.path.join(PROJECT_DIR, "projects")
 SCAN_DB_PATH = os.path.join(PROJECT_DIR, "scan_db.json")
 CONFIG_PATH = os.path.join(PROJECT_DIR, "curate_config.json")
 
@@ -100,6 +101,59 @@ def save_scan_db(db):
             json.dump(db, f, ensure_ascii=False)
 
 
+def _check_nsfw(fpath, classifier):
+    """Check if image contains NSFW content using NudeDetector.
+    Returns (is_nsfw: bool, labels: list of detected NSFW class names)."""
+    # NudeDetector labels considered inappropriate
+    NSFW_LABELS = {
+        "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED",
+        "MALE_GENITALIA_EXPOSED", "BUTTOCKS_EXPOSED",
+        "ANUS_EXPOSED",
+    }
+    try:
+        detections = classifier.detect(fpath)
+        found = [d["class"] for d in detections
+                 if d["class"] in NSFW_LABELS and d["score"] >= 0.6]
+        return bool(found), found
+    except Exception:
+        return False, []
+
+
+def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
+    """Fast face detection: auto-rotate + resize to 800px max.
+    Returns (face_count, faces_found, ok, best_distance).
+    best_distance is the minimum distance across all ref encodings (lower = better match)."""
+    import face_recognition as fr
+    import numpy as np
+    from PIL import Image, ImageOps
+    try:
+        pil_img = ImageOps.exif_transpose(Image.open(fpath)).convert("RGB")
+        w, h = pil_img.size
+        max_dim = 800
+        if w > max_dim or h > max_dim:
+            pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        arr = np.array(pil_img)
+        locations = fr.face_locations(arr, model="hog")
+        if not locations:
+            return 0, [], True, None
+        encodings = fr.face_encodings(arr, locations)
+        if not encodings:
+            return len(locations), [], True, None
+        found = set()
+        best_dist = 999.0
+        for person, ref_encs in ref_encodings.items():
+            for ref_enc in ref_encs:
+                dists = fr.face_distance(encodings, ref_enc)
+                min_d = float(np.min(dists))
+                if min_d < best_dist:
+                    best_dist = min_d
+                if min_d <= tolerance:
+                    found.add(person)
+        return len(locations), sorted(found), True, round(best_dist, 3) if best_dist < 999 else None
+    except Exception:
+        return 0, [], False, None
+
+
 def _verify_single_photo(fpath):
     """Verify a single photo for face detection. Returns dict with status/message."""
     try:
@@ -163,6 +217,7 @@ def list_templates():
             "num_categories": len(t.get("categories", [])),
             "required_fields": t.get("required_fields", {}),
             "tips": t.get("tips", []),
+            "extra": t.get("extra", False),
             "categories": [{"id": c["id"], "display": c["display"], "target": c.get("target")} for c in t.get("categories", [])],
         })
     return result
@@ -242,6 +297,7 @@ def api_scan_start():
         return jsonify({"error": "A task is already running"}), 409
 
     full = request.json.get("full", False) if request.json else False
+    nsfw_filter = request.json.get("nsfw_filter", False) if request.json else False
 
     def run_scan():
         try:
@@ -297,6 +353,29 @@ def api_scan_start():
                 _finish_task("Cancelled")
                 return
 
+            # NSFW detection
+            nsfw_classifier = None
+            if nsfw_filter:
+                try:
+                    from nudenet import NudeDetector
+                    _update_task("Loading NSFW detection model (first time may download ~25 MB)...")
+                    nsfw_classifier = NudeDetector()
+                    _update_task("NSFW filter ready.")
+                except ImportError:
+                    _update_task("nudenet not installed — installing...")
+                    import subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "nudenet"], stdout=subprocess.DEVNULL)
+                    from nudenet import NudeDetector
+                    nsfw_classifier = NudeDetector()
+                    _update_task("NSFW filter installed and ready.")
+                except Exception as e:
+                    _update_task(f"NSFW filter failed to load: {e}. Continuing without it.")
+
+            if _is_cancelled():
+                _update_task("Stopped by user.")
+                _finish_task("Cancelled")
+                return
+
             # Existing DB for incremental
             existing_db = {}
             if os.path.isfile(SCAN_DB_PATH) and not full:
@@ -314,6 +393,7 @@ def api_scan_start():
             all_images = []
             seen_hashes = set()
             scanned = 0
+            face_rechecked = 0
             skipped = defaultdict(int)
 
             for source in sources:
@@ -366,6 +446,62 @@ def api_scan_start():
                             entry = existing_db[fhash]
                             entry["path"] = fpath.replace("\\", "/")
                             entry["source_label"] = src_label
+
+                            # Re-run face detection on cached entries that weren't face-checked
+                            # Also backfill face_distance for entries that have faces but no distance
+                            needs_face_check = (use_faces
+                                and not entry.get("_face_checked")
+                                and entry.get("status") != "rejected")
+                            needs_distance_backfill = (use_faces
+                                and entry.get("has_target_face")
+                                and entry.get("face_distance") is None
+                                and entry.get("status") != "rejected")
+                            if needs_face_check or needs_distance_backfill:
+                                try:
+                                    fc, ff, ok, best_d = _fast_face_detect(
+                                        fpath, ref_encodings, face_names, tolerance)
+                                    entry["face_count"] = fc
+                                    entry["faces_found"] = ff
+                                    entry["has_target_face"] = any(n in ff for n in face_names) if face_names else (fc > 0)
+                                    if best_d is not None:
+                                        entry["face_distance"] = best_d
+                                    entry["_face_checked"] = True
+                                    face_rechecked += 1
+                                    if face_rechecked % 100 == 0:
+                                        found_so_far = sum(1 for e in all_images if e.get("has_target_face"))
+                                        _update_task(f"Face-checking: {face_rechecked} done, {found_so_far} with target face...")
+                                    # Periodic save every 500 face-checks
+                                    if face_rechecked % 500 == 0:
+                                        _interim_db = {"scan_date": datetime.now().isoformat(), "config": config,
+                                            "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "face_rechecked": face_rechecked},
+                                            "images": all_images + [existing_db[h] for h in existing_db if h not in seen_hashes]}
+                                        save_scan_db(_interim_db)
+                                        _update_task(f"Progress saved ({face_rechecked} face-checked)...")
+                                    if _is_cancelled():
+                                        _update_task("Stopped by user.")
+                                        _finish_task("Cancelled")
+                                        return
+                                    # Update status based on face results
+                                    if face_names and not entry["has_target_face"]:
+                                        if entry.get("status") in ("qualified", "selected"):
+                                            entry["status"] = "pool"
+                                            entry["reject_reason"] = "no_faces" if fc == 0 else "wrong_person"
+                                    elif entry.get("status") == "pool" and entry.get("reject_reason") in ("no_faces", "wrong_person"):
+                                        if entry.get("category"):
+                                            entry["status"] = "qualified"
+                                            entry["reject_reason"] = None
+                                except Exception:
+                                    entry["_face_checked"] = True
+
+                            # NSFW check on cached entries if filter enabled and not yet checked
+                            if nsfw_classifier and "nsfw" not in entry and entry.get("status") != "rejected":
+                                is_nsfw, nsfw_labels = _check_nsfw(fpath, nsfw_classifier)
+                                entry["nsfw"] = is_nsfw
+                                if is_nsfw:
+                                    entry["nsfw_labels"] = nsfw_labels
+                                    entry["status"] = "rejected"
+                                    entry["reject_reason"] = "nsfw"
+
                             all_images.append(entry)
                             src_count += 1
                             continue
@@ -406,9 +542,10 @@ def api_scan_start():
 
                         face_count = 0
                         faces_found = []
+                        face_dist = None
                         if use_faces:
-                            face_count, faces_found, ok = detect_faces_in_image(
-                                fpath, ref_encodings, tolerance)
+                            face_count, faces_found, ok, face_dist = _fast_face_detect(
+                                fpath, ref_encodings, face_names, tolerance)
 
                         thumb = make_thumbnail_b64(fpath, thumb_size)
                         device = guess_device_source(fname)
@@ -425,13 +562,29 @@ def api_scan_start():
                             "face_count": face_count,
                             "faces_found": faces_found,
                             "has_target_face": any(n in faces_found for n in face_names) if face_names else (face_count > 0),
+                            "face_distance": face_dist,
                             "width": w, "height": h,
                             "size_kb": round(file_size / 1024),
                             "is_screenshot": screenshot,
                             "thumb": thumb,
                         }
 
-                        if screenshot:
+                        # For manual categorization, assign all to first category
+                        if not bracket and config.get("categorization") == "manual" and config.get("categories"):
+                            bracket = config["categories"][0]["id"]
+                            entry["category"] = bracket
+
+                        # NSFW check
+                        if nsfw_classifier:
+                            is_nsfw, nsfw_labels = _check_nsfw(fpath, nsfw_classifier)
+                            entry["nsfw"] = is_nsfw
+                            if is_nsfw:
+                                entry["nsfw_labels"] = nsfw_labels
+
+                        if nsfw_classifier and entry.get("nsfw"):
+                            entry["status"] = "rejected"
+                            entry["reject_reason"] = "nsfw"
+                        elif screenshot:
                             entry["status"] = "rejected"
                             entry["reject_reason"] = "screenshot"
                         elif face_names and not entry["has_target_face"]:
@@ -600,10 +753,13 @@ def api_quick_fill():
             knowledge = EVENT_KNOWLEDGE.get(event_type, EVENT_KNOWLEDGE.get("photo_book"))
             weights = knowledge.get("quality_weights", {})
 
-            # Group by category
+            # Group by category (only face-matched images when face names are configured)
+            face_names = config.get("face_names", [])
             by_cat = {}
             for img in images:
                 if img.get("status") == "rejected":
+                    continue
+                if face_names and not img.get("has_target_face"):
                     continue
                 cat = img.get("category")
                 if cat:
@@ -630,8 +786,28 @@ def api_quick_fill():
 
                 # Score unselected candidates
                 candidates = [i for i in pool if i.get("status") != "selected"]
+
+                # Face distance filtering — stricter for baby categories, standard for others
+                # Only applies to images that already passed all other checks (has_target_face etc.)
+                if face_names:
+                    age_days_to = cat.get("age_days_to", 99999)
+                    if age_days_to <= 365:  # first year — baby faces are generic
+                        max_dist = 0.45
+                    elif age_days_to <= 1095:  # years 1-3 — toddler faces still tricky
+                        max_dist = 0.50
+                    else:
+                        max_dist = 0.55  # general threshold — reject obvious false positives
+                    candidates = [i for i in candidates
+                                  if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
+
                 for img in candidates:
-                    img["_score"] = compute_quality_score(img, weights)
+                    base_score = compute_quality_score(img, weights)
+                    # Boost score for closer face matches (lower distance = better)
+                    fd = img.get("face_distance")
+                    if fd is not None and face_names:
+                        face_bonus = max(0, (0.6 - fd)) * 5  # up to 3 points bonus
+                        base_score += face_bonus
+                    img["_score"] = base_score
                 candidates.sort(key=lambda x: x["_score"], reverse=True)
 
                 picked = 0
@@ -833,7 +1009,8 @@ def api_export():
         return jsonify({"error": "A task is already running"}), 409
 
     data = request.json or {}
-    output_dir = data.get("output_dir", os.path.join(PROJECT_DIR, "final_collection"))
+    default_downloads = os.path.join(os.path.expanduser("~"), "Downloads", "E-z Photo Collection")
+    output_dir = data.get("output_dir", default_downloads)
     status_filter = data.get("status", "selected")
 
     def run_export():
@@ -1014,6 +1191,16 @@ def api_ref_faces_rotate(person):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ref-faces/<person>/photo/<filename>", methods=["DELETE"])
+def api_ref_faces_delete_photo(person, filename):
+    """Delete a single reference photo."""
+    pdir = os.path.join(PROJECT_DIR, "ref_faces", person)
+    fpath = os.path.join(pdir, filename)
+    if os.path.isfile(fpath):
+        os.remove(fpath)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/ref-faces/<person>", methods=["DELETE"])
@@ -1200,6 +1387,8 @@ def api_ref_faces_photos(person):
             img = Image.open(fpath)
             img = ImageOps.exif_transpose(img)
             img.thumbnail((120, 120))
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=70)
             thumb = base64.b64encode(buf.getvalue()).decode()
@@ -1245,6 +1434,7 @@ def api_stats():
         stats["pool"] = sum(1 for i in images if i.get("status") == "pool")
         stats["sources"] = list(set(i.get("source_label", "") for i in images))
 
+    stats["default_export_dir"] = os.path.join(os.path.expanduser("~"), "Downloads", "E-z Photo Collection")
     return jsonify(stats)
 
 
@@ -1273,6 +1463,170 @@ def api_report():
     if os.path.isfile(report_path):
         return send_file(report_path, mimetype="text/html")
     return jsonify({"error": "Report generation failed"}), 500
+
+
+# ── Project save/load ─────────────────────────────────────────────────────────
+
+def _safe_project_name(name):
+    """Sanitize project name for use as directory name."""
+    import re
+    safe = re.sub(r'[<>:"/\\|?*]', '_', name.strip())
+    return safe[:100] or "untitled"
+
+
+def _project_meta_path(pdir):
+    return os.path.join(pdir, "project_meta.json")
+
+
+def _current_project_state():
+    """Gather current wizard step from config, for saving."""
+    config = load_config()
+    return {
+        "has_config": config is not None,
+        "event_type": config.get("event_type") if config else None,
+        "template": config.get("template") if config else None,
+    }
+
+
+@app.route("/api/projects")
+def api_projects_list():
+    """List all saved projects."""
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+    projects = []
+    for name in sorted(os.listdir(PROJECTS_DIR)):
+        pdir = os.path.join(PROJECTS_DIR, name)
+        if not os.path.isdir(pdir):
+            continue
+        meta_path = _project_meta_path(pdir)
+        if os.path.isfile(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        else:
+            meta = {"name": name}
+        meta["dir_name"] = name
+        projects.append(meta)
+    return jsonify(projects)
+
+
+@app.route("/api/projects/save", methods=["POST"])
+def api_projects_save():
+    """Save current state as a project. Expects {name, step}."""
+    data = request.json or {}
+    raw_name = data.get("name", "").strip()
+    if not raw_name:
+        return jsonify({"error": "Project name is required"}), 400
+
+    step = data.get("step", 0)
+    dir_name = _safe_project_name(raw_name)
+    pdir = os.path.join(PROJECTS_DIR, dir_name)
+    os.makedirs(pdir, exist_ok=True)
+
+    # Save meta
+    meta_path = _project_meta_path(pdir)
+    existing_meta = {}
+    if os.path.isfile(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            existing_meta = json.load(f)
+
+    config = load_config()
+    meta = {
+        "name": raw_name,
+        "dir_name": dir_name,
+        "created": existing_meta.get("created", datetime.now().isoformat()),
+        "modified": datetime.now().isoformat(),
+        "step": step,
+        "event_type": config.get("event_type") if config else None,
+        "template": config.get("template") if config else None,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # Copy config
+    if os.path.isfile(CONFIG_PATH):
+        shutil.copy2(CONFIG_PATH, os.path.join(pdir, "curate_config.json"))
+
+    # Copy scan_db
+    if os.path.isfile(SCAN_DB_PATH):
+        with _db_lock:
+            shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
+
+    # Copy ref_faces
+    ref_src = os.path.join(PROJECT_DIR, "ref_faces")
+    ref_dst = os.path.join(pdir, "ref_faces")
+    if os.path.isdir(ref_src):
+        if os.path.isdir(ref_dst):
+            shutil.rmtree(ref_dst)
+        shutil.copytree(ref_src, ref_dst)
+
+    return jsonify({"ok": True, "project": meta})
+
+
+@app.route("/api/projects/load", methods=["POST"])
+def api_projects_load():
+    """Load a saved project. Expects {dir_name}."""
+    data = request.json or {}
+    dir_name = data.get("dir_name", "")
+    pdir = os.path.join(PROJECTS_DIR, dir_name)
+    if not os.path.isdir(pdir):
+        return jsonify({"error": "Project not found"}), 404
+
+    meta_path = _project_meta_path(pdir)
+    meta = {}
+    if os.path.isfile(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+    # Restore config
+    src_config = os.path.join(pdir, "curate_config.json")
+    if os.path.isfile(src_config):
+        shutil.copy2(src_config, CONFIG_PATH)
+    elif os.path.isfile(CONFIG_PATH):
+        os.remove(CONFIG_PATH)
+
+    # Restore scan_db
+    src_db = os.path.join(pdir, "scan_db.json")
+    with _db_lock:
+        if os.path.isfile(src_db):
+            shutil.copy2(src_db, SCAN_DB_PATH)
+        elif os.path.isfile(SCAN_DB_PATH):
+            os.remove(SCAN_DB_PATH)
+
+    # Restore ref_faces
+    ref_dst = os.path.join(PROJECT_DIR, "ref_faces")
+    ref_src = os.path.join(pdir, "ref_faces")
+    if os.path.isdir(ref_dst):
+        shutil.rmtree(ref_dst)
+    if os.path.isdir(ref_src):
+        shutil.copytree(ref_src, ref_dst)
+    else:
+        os.makedirs(ref_dst, exist_ok=True)
+
+    return jsonify({"ok": True, "step": meta.get("step", 0), "project": meta})
+
+
+@app.route("/api/projects/new", methods=["POST"])
+def api_projects_new():
+    """Start a fresh project. Clears current config, scan_db, and ref_faces."""
+    if os.path.isfile(CONFIG_PATH):
+        os.remove(CONFIG_PATH)
+    with _db_lock:
+        if os.path.isfile(SCAN_DB_PATH):
+            os.remove(SCAN_DB_PATH)
+    ref_dir = os.path.join(PROJECT_DIR, "ref_faces")
+    if os.path.isdir(ref_dir):
+        shutil.rmtree(ref_dir)
+    os.makedirs(ref_dir, exist_ok=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/projects/<dir_name>", methods=["DELETE"])
+def api_projects_delete(dir_name):
+    """Delete a saved project."""
+    pdir = os.path.join(PROJECTS_DIR, _safe_project_name(dir_name))
+    if not os.path.isdir(pdir):
+        return jsonify({"error": "Project not found"}), 404
+    shutil.rmtree(pdir)
+    return jsonify({"ok": True})
 
 
 # ── Serve UI ──────────────────────────────────────────────────────────────────
@@ -1429,9 +1783,53 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 #task-overlay .task-lines .line { margin:2px 0; }
 #task-overlay .btn-stop { background:#e53e3e; color:#fff; border:none; padding:8px 24px; border-radius:6px; font-size:.9em; cursor:pointer; }
 #task-overlay .btn-stop:hover { background:#c53030; }
+
+/* ── Side menu (projects) ── */
+.menu-btn { position:fixed; top:12px; left:12px; z-index:1100; background:#fff; border:1px solid #e2e8f0; border-radius:6px; width:36px; height:36px; cursor:pointer; display:flex; align-items:center; justify-content:center; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+.menu-btn:hover { background:#ebf8ff; border-color:#90cdf4; }
+.menu-btn span { display:block; width:18px; height:2px; background:#4a5568; position:relative; }
+.menu-btn span::before, .menu-btn span::after { content:''; position:absolute; left:0; width:18px; height:2px; background:#4a5568; }
+.menu-btn span::before { top:-6px; }
+.menu-btn span::after { top:6px; }
+#side-drawer { position:fixed; top:0; left:-320px; width:300px; height:100%; background:#fff; z-index:1200; box-shadow:4px 0 20px rgba(0,0,0,.1); transition:left .25s ease; display:flex; flex-direction:column; }
+#side-drawer.open { left:0; }
+#side-drawer .drawer-header { padding:16px 18px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; }
+#side-drawer .drawer-header h3 { color:#2d3748; margin:0; font-size:1em; }
+#side-drawer .drawer-close { background:none; border:none; font-size:1.4em; cursor:pointer; color:#718096; padding:0 4px; }
+#side-drawer .drawer-close:hover { color:#2d3748; }
+#side-drawer .drawer-actions { padding:12px 18px; display:flex; gap:8px; border-bottom:1px solid #e2e8f0; }
+#side-drawer .drawer-actions button { flex:1; padding:7px 0; border-radius:5px; font-size:.8em; cursor:pointer; border:1px solid #e2e8f0; background:#f7fafc; color:#4a5568; }
+#side-drawer .drawer-actions button:hover { background:#ebf8ff; border-color:#90cdf4; color:#2b6cb0; }
+#side-drawer .project-list { flex:1; overflow-y:auto; padding:8px 0; }
+#side-drawer .project-item { padding:10px 18px; cursor:pointer; border-bottom:1px solid #f7fafc; transition:background .1s; }
+#side-drawer .project-item:hover { background:#f0f9ff; }
+#side-drawer .project-item .p-name { font-weight:500; color:#2d3748; font-size:.9em; }
+#side-drawer .project-item .p-meta { color:#a0aec0; font-size:.72em; margin-top:2px; }
+#side-drawer .project-item .p-actions { display:flex; gap:6px; margin-top:6px; }
+#side-drawer .project-item .p-del { background:none; border:none; color:#e53e3e; cursor:pointer; font-size:.75em; padding:2px 6px; border-radius:3px; }
+#side-drawer .project-item .p-del:hover { background:#fed7d7; }
+#drawer-backdrop { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.2); z-index:1150; }
+#drawer-backdrop.open { display:block; }
 </style>
 </head>
 <body>
+
+<!-- Side drawer for projects -->
+<button class="menu-btn" onclick="toggleDrawer()"><span></span></button>
+<div id="drawer-backdrop" onclick="toggleDrawer()"></div>
+<div id="side-drawer">
+    <div class="drawer-header">
+        <h3>Projects</h3>
+        <button class="drawer-close" onclick="toggleDrawer()">&times;</button>
+    </div>
+    <div class="drawer-actions">
+        <button onclick="saveCurrentProject()">Save Current</button>
+        <button onclick="newProject()">New Project</button>
+    </div>
+    <div class="project-list" id="project-list">
+        <div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">Loading...</div>
+    </div>
+</div>
 
 <!-- Task overlay -->
 <div id="task-overlay">
@@ -1468,24 +1866,42 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <h2>What are you creating?</h2>
     <p>Choose the type of event. This sets up the right categories and targets for your photo collection.</p>
     <div class="template-grid" id="template-grid"></div>
+    <div id="more-events" style="margin-top:18px; display:none;">
+        <div style="color:#718096; font-size:.85em; margin-bottom:6px; cursor:pointer;" onclick="document.getElementById('more-events-list').style.display = document.getElementById('more-events-list').style.display === 'none' ? 'block' : 'none'; this.querySelector('span').textContent = document.getElementById('more-events-list').style.display === 'none' ? '&#9654;' : '&#9660;'">
+            <span>&#9654;</span> More events...
+        </div>
+        <div id="more-events-list" style="display:none;"></div>
+    </div>
 
     <div id="event-fields" style="margin-top:20px; display:none;">
         <div class="row">
             <div id="field-birthday" style="display:none">
                 <label>Child's Birthday</label>
-                <input type="date" id="inp-birthday">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <input type="date" id="inp-birthday" style="width:160px;">
+                    <label style="font-size:.8em; color:#718096; display:flex; align-items:center; gap:4px; white-space:nowrap;"><input type="checkbox" id="skip-birthday" onchange="toggleSkipDate('birthday')"> Not needed</label>
+                </div>
             </div>
             <div id="field-event-date" style="display:none">
                 <label>Event Date</label>
-                <input type="date" id="inp-event-date">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <input type="date" id="inp-event-date" style="width:160px;">
+                    <label style="font-size:.8em; color:#718096; display:flex; align-items:center; gap:4px; white-space:nowrap;"><input type="checkbox" id="skip-event-date" onchange="toggleSkipDate('event-date')"> Not needed</label>
+                </div>
             </div>
             <div id="field-end-date" style="display:none">
                 <label>End Date</label>
-                <input type="date" id="inp-end-date">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <input type="date" id="inp-end-date" style="width:160px;">
+                    <label style="font-size:.8em; color:#718096; display:flex; align-items:center; gap:4px; white-space:nowrap;"><input type="checkbox" id="skip-end-date" onchange="toggleSkipDate('end-date')"> Not needed</label>
+                </div>
             </div>
             <div id="field-year" style="display:none">
                 <label>Year</label>
-                <input type="number" id="inp-year" placeholder="2024" min="2000" max="2030">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <input type="number" id="inp-year" placeholder="2024" min="2000" max="2030" style="width:100px;">
+                    <label style="font-size:.8em; color:#718096; display:flex; align-items:center; gap:4px; white-space:nowrap;"><input type="checkbox" id="skip-year" onchange="toggleSkipDate('year')"> Not needed</label>
+                </div>
             </div>
         </div>
     </div>
@@ -1543,6 +1959,10 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <div class="source-list" id="source-list"></div>
     <button class="btn btn-secondary" onclick="addSource()" style="margin-top:10px">+ Add Source</button>
 
+    <div style="margin-top:14px; padding:10px 14px; background:#fffff0; border:1px solid #fefcbf; border-radius:6px; font-size:.82em; color:#744210;">
+        <strong>Tip:</strong> If your images are not properly rotated (e.g. sideways photos from phones), face detection may miss faces and scanning will take longer as it retries with rotation correction. For best results, make sure your source images have correct EXIF orientation.
+    </div>
+
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(1)">Back</button>
         <button class="btn btn-primary" onclick="completeStep2()">Next: Face References</button>
@@ -1581,6 +2001,16 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <div class="panel" id="panel-4">
     <h2>Scanning your photos</h2>
     <p>This scans all your sources, extracts dates, detects duplicates, and creates thumbnails. This runs once — future scans are incremental.</p>
+
+    <div style="margin-bottom:12px; padding:10px 14px; background:#f7fafc; border:1px solid #e2e8f0; border-radius:8px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:.9em; color:#2d3748;">
+            <input type="checkbox" id="chk-nsfw-filter" onchange="toggleNsfwFilter(this.checked)">
+            <span>Filter out nudity / inappropriate content</span>
+        </label>
+        <div style="font-size:.78em; color:#718096; margin-top:4px; margin-left:26px;">
+            Uses AI to detect and exclude NSFW images. Requires first-time download of detection model (~25 MB).
+        </div>
+    </div>
 
     <div class="btn-group">
         <button class="btn btn-primary" id="btn-start-scan" onclick="startScan(false)">Start Scan</button>
@@ -1691,7 +2121,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <p>Copy your curated photos to a final folder, organized by category. Ready to use for your presentation, photo book, or slideshow.</p>
 
     <label>Output Folder</label>
-    <input type="text" id="inp-export-dir" value="final_collection">
+    <input type="text" id="inp-export-dir">
 
     <div id="export-stats" style="margin-top:15px;"></div>
 
@@ -1802,14 +2232,47 @@ function goStep(n) {
 async function loadTemplates() {
     const res = await fetch('/api/templates');
     templates = await res.json();
-    const grid = document.getElementById('template-grid');
-    grid.innerHTML = templates.map(t => `
+    var main = templates.filter(t => !t.extra);
+    var extras = templates.filter(t => t.extra);
+    main.sort((a, b) => (a.event_type === 'custom') - (b.event_type === 'custom'));
+    extras.sort((a, b) => a.display_name.localeCompare(b.display_name));
+    // Reorder: main first, then extras
+    templates = main.concat(extras);
+    var grid = document.getElementById('template-grid');
+    grid.innerHTML = main.map(t => `
         <div class="template-card" onclick="selectTemplate('${t.event_type}')" id="tpl-${t.event_type}">
             <h3>${t.display_name}</h3>
             <div class="desc">${t.description}</div>
             <div class="meta">${t.num_categories} categories | ${t.categorization}</div>
         </div>
     `).join('');
+    var moreEl = document.getElementById('more-events');
+    var listEl = document.getElementById('more-events-list');
+    if (extras.length) {
+        moreEl.style.display = 'block';
+        listEl.innerHTML = '';
+        extras.forEach(function(t) {
+            var row = document.createElement('div');
+            row.id = 'tpl-' + t.event_type;
+            row.style.cssText = 'display:flex; align-items:center; gap:12px; padding:8px 12px; cursor:pointer; border-radius:6px; border:1px solid #e2e8f0; margin-bottom:4px; transition:all .15s;';
+            row.onmouseenter = function() { row.style.borderColor = '#63b3ed'; row.style.background = '#f0f9ff'; };
+            row.onmouseleave = function() { if (!row.classList.contains('selected')) { row.style.borderColor = '#e2e8f0'; row.style.background = ''; } };
+            row.onclick = function() { selectTemplate(t.event_type); };
+            var name = document.createElement('span');
+            name.style.cssText = 'font-weight:500; color:#2b6cb0; min-width:160px;';
+            name.textContent = t.display_name;
+            var desc = document.createElement('span');
+            desc.style.cssText = 'color:#718096; font-size:.82em; flex:1;';
+            desc.textContent = t.description;
+            var meta = document.createElement('span');
+            meta.style.cssText = 'color:#a0aec0; font-size:.75em; white-space:nowrap;';
+            meta.textContent = t.num_categories + ' cats';
+            row.appendChild(name);
+            row.appendChild(desc);
+            row.appendChild(meta);
+            listEl.appendChild(row);
+        });
+    }
 
     // Check existing config
     const cfgRes = await fetch('/api/config');
@@ -1826,8 +2289,23 @@ async function loadTemplates() {
 
 function selectTemplate(type) {
     selectedTemplate = templates.find(t => t.event_type === type);
+    // Clear all selections (cards + extra rows)
     document.querySelectorAll('.template-card').forEach(c => c.classList.remove('selected'));
-    document.getElementById('tpl-' + type).classList.add('selected');
+    document.querySelectorAll('#more-events-list > div').forEach(function(r) {
+        r.classList.remove('selected');
+        r.style.borderColor = '#e2e8f0';
+        r.style.background = '';
+    });
+    var el = document.getElementById('tpl-' + type);
+    if (el) {
+        el.classList.add('selected');
+        if (el.parentElement && el.parentElement.id === 'more-events-list') {
+            el.style.borderColor = '#3182ce';
+            el.style.background = '#ebf8ff';
+            // Auto-expand the more events list
+            document.getElementById('more-events-list').style.display = 'block';
+        }
+    }
     document.getElementById('btn-next-0').disabled = false;
 
     // Show required fields
@@ -1846,6 +2324,14 @@ function selectTemplate(type) {
         tipsEl.innerHTML = '<h3 style="color:#4caf50; font-size:.9em; margin-bottom:8px;">Tips</h3>' +
             tips.map(t => '<div style="color:#718096; font-size:.85em; padding:3px 0;">• ' + t + '</div>').join('');
     }
+}
+
+function toggleSkipDate(field) {
+    var inp = document.getElementById('inp-' + field);
+    var skip = document.getElementById('skip-' + field).checked;
+    inp.disabled = skip;
+    inp.style.opacity = skip ? '0.4' : '1';
+    if (skip) inp.value = '';
 }
 
 async function completeStep0() {
@@ -2035,18 +2521,21 @@ async function loadFaceThumbs(person) {
         const safeFn = esc(p.filename).replace(/'/g, "\\\\'");
         const safePerson = esc(person).replace(/'/g, "\\\\'");
         let html = '<div style="display:inline-flex; flex-direction:column; align-items:center; gap:2px; margin-right:8px; margin-bottom:6px;">';
-        if (isReplaced) {
+        // Show "Verify" only on replaced images when at least one other image is already verified
+        const hasAnyVerified = Object.keys(statuses).length > 0;
+        if (isReplaced && hasAnyVerified) {
             html += '<span onclick="verifySinglePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\')" style="font-size:.65em; color:#e53e3e; cursor:pointer; padding:1px 4px; background:#fff5f5; border:1px solid #fed7d7; border-radius:3px; white-space:nowrap;">Verify</span>';
         } else {
             html += '<label style="font-size:.65em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px; white-space:nowrap;" for="replace-' + person + '-' + p.filename + '">Replace</label>';
         }
         html += '<input type="file" id="replace-' + person + '-' + p.filename + '" accept="image/*" style="display:none" onchange="replaceFacePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\', this.files)">';
-        html += '<div style="position:relative;" id="face-img-' + person + '-' + p.filename.replace(/[^a-zA-Z0-9]/g,'-') + '">';
+        html += '<div style="position:relative;" id="face-img-' + person + '-' + p.filename.replace(/[^a-zA-Z0-9]/g,'-') + '" onmouseenter="this.querySelector(\\'.face-x\\').style.display=\\'flex\\'" onmouseleave="this.querySelector(\\'.face-x\\').style.display=\\'none\\'">';
         if (p.thumb) {
             html += '<img src="data:image/jpeg;base64,' + p.thumb + '" style="width:70px; height:70px; object-fit:cover; border-radius:4px; border:' + border + '; cursor:pointer;" title="Double-click to enlarge" ondblclick="openLightbox(\\'' + safePerson + '\\', \\'' + safeFn + '\\')">';
         } else {
             html += '<div style="width:70px; height:70px; background:#e2e8f0; border-radius:4px; border:' + border + '; display:flex; align-items:center; justify-content:center; font-size:.7em; color:#718096;">' + esc(p.filename) + '</div>';
         }
+        html += '<span class="face-x remove-face-btn" data-person="' + esc(person) + '" data-filename="' + esc(p.filename) + '" style="display:none; position:absolute; top:-4px; right:-4px; width:18px; height:18px; background:#e53e3e; color:white; border-radius:50%; font-size:11px; align-items:center; justify-content:center; cursor:pointer; line-height:1; box-shadow:0 1px 3px rgba(0,0,0,.3);">&#x2715;</span>';
         if (label) {
             html += '<span style="position:absolute; bottom:1px; right:3px; font-size:14px; color:' + labelColor + '; text-shadow:0 0 3px #fff;">' + label + '</span>';
         }
@@ -2072,6 +2561,25 @@ async function loadFaceThumbs(person) {
         btn.appendChild(b);
         container.appendChild(btn);
     }
+}
+
+// Event delegation for remove-face buttons (avoids inline onclick quote issues)
+document.addEventListener('click', function(e) {
+    if (e.target.classList.contains('remove-face-btn')) {
+        var person = e.target.getAttribute('data-person');
+        var filename = e.target.getAttribute('data-filename');
+        removeFacePhoto(person, filename);
+    }
+});
+
+async function removeFacePhoto(person, filename) {
+    if (!confirm('Remove "' + filename + '" from ' + person + "'s reference photos?")) return;
+    await fetch('/api/ref-faces/' + encodeURIComponent(person) + '/photo/' + encodeURIComponent(filename), {method: 'DELETE'});
+    // Clean caches
+    if (faceVerifyCache[person]) delete faceVerifyCache[person][filename];
+    if (replacedPhotos[person]) replacedPhotos[person].delete(filename);
+    await loadFaceThumbs(person);
+    await loadFaces();
 }
 
 async function verifySinglePhoto(person, filename) {
@@ -2383,6 +2891,10 @@ async function completeFacesStep() {
 
 // ── Step 4: Scan ──
 async function checkExistingScan() {
+    // Restore NSFW checkbox from config
+    const chk = document.getElementById('chk-nsfw-filter');
+    if (chk && config?.nsfw_filter) chk.checked = true;
+
     const res = await fetch('/api/stats');
     const st = await res.json();
     if (st.has_scan && st.total_images > 0) {
@@ -2392,8 +2904,15 @@ async function checkExistingScan() {
     }
 }
 
+function toggleNsfwFilter(checked) {
+    config = config || {};
+    config.nsfw_filter = checked;
+    fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
+}
+
 async function startScan(full) {
-    await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full}) });
+    const nsfwFilter = document.getElementById('chk-nsfw-filter')?.checked || false;
+    await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full, nsfw_filter: nsfwFilter}) });
     showTaskOverlay('scan');
     // Override completion handler
     const origPoll = taskPoll;
@@ -2755,6 +3274,8 @@ async function loadExportStats() {
     showLoader(el, 'Loading stats...');
     const res = await fetch('/api/stats');
     const st = await res.json();
+    var dirInput = document.getElementById('inp-export-dir');
+    if (!dirInput.value && st.default_export_dir) dirInput.value = st.default_export_dir;
     if (st.has_scan) {
         const selected = st.selected || 0;
         const qualified = st.qualified || 0;
@@ -2803,6 +3324,117 @@ function closeLightbox() {
     document.getElementById('lightbox-img').src = '';
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+// ── Projects drawer ──
+function toggleDrawer() {
+    document.getElementById('side-drawer').classList.toggle('open');
+    document.getElementById('drawer-backdrop').classList.toggle('open');
+    if (document.getElementById('side-drawer').classList.contains('open')) {
+        loadProjectList();
+    }
+}
+
+async function loadProjectList() {
+    const el = document.getElementById('project-list');
+    try {
+        const res = await fetch('/api/projects');
+        const projects = await res.json();
+        if (!projects.length) {
+            el.innerHTML = '<div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">No saved projects yet.</div>';
+            return;
+        }
+        el.innerHTML = '';
+        projects.forEach(function(p) {
+            var modified = p.modified ? new Date(p.modified).toLocaleDateString() + ' ' + new Date(p.modified).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
+            var info = [p.template || p.event_type || '', 'Step ' + ((p.step || 0) + 1)].filter(Boolean).join(' | ');
+            var row = document.createElement('div');
+            row.className = 'project-item';
+            row.onclick = function() { loadProject(p.dir_name); };
+            var nameDiv = document.createElement('div');
+            nameDiv.className = 'p-name';
+            nameDiv.textContent = p.name;
+            var metaDiv = document.createElement('div');
+            metaDiv.className = 'p-meta';
+            metaDiv.textContent = info + (modified ? ' | ' + modified : '');
+            var actDiv = document.createElement('div');
+            actDiv.className = 'p-actions';
+            var delBtn = document.createElement('button');
+            delBtn.className = 'p-del';
+            delBtn.textContent = 'Delete';
+            delBtn.onclick = function(e) { e.stopPropagation(); deleteProject(p.dir_name, p.name); };
+            actDiv.appendChild(delBtn);
+            row.appendChild(nameDiv);
+            row.appendChild(metaDiv);
+            row.appendChild(actDiv);
+            el.appendChild(row);
+        });
+    } catch(e) {
+        el.innerHTML = '<div style="padding:18px; color:#e53e3e; font-size:.85em;">Error loading projects</div>';
+    }
+}
+
+async function saveCurrentProject() {
+    var name = prompt('Project name:');
+    if (!name || !name.trim()) return;
+    showLoader('project-list', 'Saving...');
+    try {
+        var res = await fetch('/api/projects/save', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name: name.trim(), step: currentStep })
+        });
+        var data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        await loadProjectList();
+    } catch(e) { alert('Save failed: ' + e.message); }
+}
+
+async function loadProject(dirName) {
+    if (!confirm('Load this project? Current unsaved progress will be lost.')) return;
+    showLoader('project-list', 'Loading project...');
+    try {
+        var res = await fetch('/api/projects/load', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ dir_name: dirName })
+        });
+        var data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        toggleDrawer();
+        // Reload the app at the saved step
+        config = null;
+        selectedTemplate = null;
+        var savedStep = data.step || 0;
+        await loadTemplates();
+        var cfg = await (await fetch('/api/config')).json();
+        if (cfg && cfg.event_type) {
+            config = cfg;
+            selectedTemplate = cfg.event_type;
+        }
+        goStep(savedStep);
+    } catch(e) { alert('Load failed: ' + e.message); }
+}
+
+async function newProject() {
+    if (!confirm('Start a new project? Current unsaved progress will be lost.')) return;
+    showLoader('project-list', 'Creating new project...');
+    try {
+        await fetch('/api/projects/new', { method: 'POST' });
+        toggleDrawer();
+        config = null;
+        selectedTemplate = null;
+        faceVerifyCache = {};
+        replacedPhotos = {};
+        await loadTemplates();
+        goStep(0);
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function deleteProject(dirName, displayName) {
+    if (!confirm('Delete project "' + displayName + '"? This cannot be undone.')) return;
+    try {
+        await fetch('/api/projects/' + encodeURIComponent(dirName), { method: 'DELETE' });
+        await loadProjectList();
+    } catch(e) { alert('Delete failed: ' + e.message); }
+}
 
 // ── Init ──
 loadTemplates();

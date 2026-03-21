@@ -1,0 +1,31 @@
+{
+  "event_type": "family_reunion",
+  "display_name": "Family Reunion",
+  "description": "A family gathering with multiple branches, activities, and group photos.",
+  "categorization": "date_time_ranges",
+  "extra": true,
+  "required_fields": {
+    "event_date": "Reunion date (YYYY-MM-DD)"
+  },
+  "defaults": {
+    "target_per_category": 20,
+    "face_tolerance": 0.6,
+    "min_size_kb": 80,
+    "min_dim": 600,
+    "thumb_size": 120
+  },
+  "categories": [
+    {"id": "01_arrivals", "display": "Arrivals & Greetings", "day_offset": 0, "time_from": "08:00", "time_to": "12:00", "target": 15},
+    {"id": "02_group_shots", "display": "Group & Family Branch Photos", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 25},
+    {"id": "03_activities", "display": "Activities & Games", "day_offset": 0, "time_from": "10:00", "time_to": "18:00", "target": 25},
+    {"id": "04_food", "display": "Food & Meal Time", "day_offset": 0, "time_from": "11:00", "time_to": "20:00", "target": 15},
+    {"id": "05_kids", "display": "Kids & Young Ones", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 20},
+    {"id": "06_elders", "display": "Elders & Generations", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 15},
+    {"id": "07_candids", "display": "Candids & Fun Moments", "day_offset": 0, "time_from": "00:00", "time_to": "23:59", "target": 20}
+  ],
+  "tips": [
+    "Collect photos from multiple family members for the best coverage",
+    "Add face references for key family members you want to highlight",
+    "Group shots are the most valuable — prioritize those"
+  ]
+}
