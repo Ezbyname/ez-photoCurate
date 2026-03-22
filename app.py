@@ -3031,8 +3031,13 @@ function toggleNsfwFilter(checked) {
 }
 
 async function startScan(full) {
+    var btn = document.getElementById('btn-start-scan');
+    btn.disabled = true;
+    btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid #bee3f8;border-top:2px solid #fff;border-radius:50%;animation:spinA .7s linear infinite;vertical-align:middle;margin-right:6px;"></span>Starting...';
     const nsfwFilter = document.getElementById('chk-nsfw-filter')?.checked || false;
     await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full, nsfw_filter: nsfwFilter}) });
+    btn.disabled = false;
+    btn.textContent = 'Start Scan';
     showTaskOverlay('scan');
     // Override completion handler
     const origPoll = taskPoll;
