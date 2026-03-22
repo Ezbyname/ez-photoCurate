@@ -14,6 +14,8 @@ manifest.json
 presentation_map.json
 dedup_log.json
 curate_config.json
+users.db
+auth_config.json
 
 # Generated reports (large HTML with embedded thumbnails)
 *.html

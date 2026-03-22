@@ -53,6 +53,8 @@ sys.stdout.reconfigure(line_buffering=True)
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp"}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 REEF_BIRTHDAY = datetime(2013, 7, 16)
 VECTOR_SIZE = 64
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -302,6 +304,126 @@ def guess_device_source(filename):
     if name.startswith("screenshot"):
         return "screenshot"
     return "other"
+
+
+def get_video_date(filepath):
+    """Extract creation date from video metadata. Tries ffprobe, then filename, then mtime."""
+    # Try ffprobe first
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filepath],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            import json as _json
+            info = _json.loads(result.stdout)
+            tags = info.get("format", {}).get("tags", {})
+            for key in ("creation_time", "date", "com.apple.quicktime.creationdate"):
+                val = tags.get(key)
+                if val:
+                    try:
+                        return datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except Exception:
+                        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                            try:
+                                return datetime.strptime(val[:len(fmt)+2], fmt)
+                            except ValueError:
+                                continue
+    except FileNotFoundError:
+        pass  # ffprobe not installed
+    except Exception:
+        pass
+    # Fallback to filename date then file mtime
+    dt = get_filename_date(os.path.basename(filepath))
+    if dt:
+        return dt
+    try:
+        mtime = os.path.getmtime(filepath)
+        return datetime.fromtimestamp(mtime)
+    except Exception:
+        return None
+
+
+def get_video_info(filepath):
+    """Get video dimensions and duration. Tries ffprobe, falls back to OpenCV."""
+    # Try ffprobe
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0", filepath],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            import json as _json
+            streams = _json.loads(result.stdout).get("streams", [])
+            if streams:
+                s = streams[0]
+                return int(s.get("width", 0)), int(s.get("height", 0)), float(s.get("duration", 0))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    # Fallback to OpenCV
+    try:
+        import cv2
+        cap = cv2.VideoCapture(filepath)
+        if cap.isOpened():
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            dur = frames / fps if fps > 0 else 0
+            cap.release()
+            return w, h, dur
+    except Exception:
+        pass
+    return 0, 0, 0
+
+
+def make_video_thumbnail_b64(filepath, size=120):
+    """Extract a frame from a video and return as base64 JPEG thumbnail."""
+    # Try ffmpeg first
+    try:
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", filepath, "-ss", "1", "-vframes", "1",
+             "-vf", f"scale={size}:{size}:force_original_aspect_ratio=decrease",
+             tmp_path],
+            capture_output=True, timeout=15)
+        if os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
+            with open(tmp_path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+            os.unlink(tmp_path)
+            return data
+        os.unlink(tmp_path)
+    except FileNotFoundError:
+        pass  # ffmpeg not installed, try OpenCV
+    except Exception:
+        pass
+    # Fallback to OpenCV
+    try:
+        import cv2
+        cap = cv2.VideoCapture(filepath)
+        if cap.isOpened():
+            # Seek to 1 second or 10% in
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            seek_frame = min(int(fps), int(total * 0.1)) if total > 0 else int(fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(1, seek_frame))
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None:
+                h, w = frame.shape[:2]
+                scale = min(size / w, size / h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                frame = cv2.resize(frame, (new_w, new_h))
+                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
+                return base64.b64encode(buf.tobytes()).decode("ascii")
+    except Exception:
+        pass
+    return ""
 
 
 def make_thumbnail_b64(filepath, size=120):

@@ -19,7 +19,7 @@ from collections import defaultdict
 import base64
 import shutil
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, session, redirect
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -29,6 +29,25 @@ SCAN_DB_PATH = os.path.join(PROJECT_DIR, "scan_db.json")
 CONFIG_PATH = os.path.join(PROJECT_DIR, "curate_config.json")
 
 app = Flask(__name__, static_folder=None)
+app.secret_key = os.environ.get("SECRET_KEY", "ez-photo-organizer-dev-key-change-in-prod")
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 30  # 30 days
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+from auth import init_db, register_auth_routes, login_required
+init_db()
+register_auth_routes(app)
+
+@app.before_request
+def require_auth():
+    """Protect all routes except login/auth endpoints."""
+    open_paths = ("/login", "/api/auth/")
+    if any(request.path == p or request.path.startswith(p) for p in open_paths):
+        return None
+    if not session.get("user"):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Not authenticated"}), 401
+        return redirect("/login")
+    return None
 
 # Lock for scan_db.json reads/writes
 _db_lock = threading.Lock()
@@ -315,7 +334,8 @@ def api_scan_start():
                 get_image_date, is_screenshot, file_hash,
                 guess_device_source, make_thumbnail_b64,
                 categorize_by_template, load_template as load_tpl,
-                age_days_to_bracket, IMAGE_EXTS, REEF_BIRTHDAY,
+                age_days_to_bracket, IMAGE_EXTS, VIDEO_EXTS, MEDIA_EXTS, REEF_BIRTHDAY,
+                get_video_date, get_video_info, make_video_thumbnail_b64,
             )
             from PIL import Image as PILImage
 
@@ -412,8 +432,6 @@ def api_scan_start():
                 src_count = 0
 
                 for dirpath, dirnames, filenames in os.walk(src_path):
-                    if any(v in dirpath.lower() for v in ["video", "\u05d5\u05d9\u05d3\u05d0\u05d5"]):
-                        continue
                     rel_dir = os.path.relpath(dirpath, src_path)
 
                     for fname in filenames:
@@ -423,8 +441,9 @@ def api_scan_start():
                             return
 
                         ext = os.path.splitext(fname)[1].lower()
-                        if ext not in IMAGE_EXTS:
+                        if ext not in MEDIA_EXTS:
                             continue
+                        is_video = ext in VIDEO_EXTS
 
                         fpath = os.path.join(dirpath, fname)
                         scanned += 1
@@ -508,20 +527,27 @@ def api_scan_start():
 
                         try:
                             file_size = os.path.getsize(fpath)
-                            if file_size < min_size_kb * 1024:
+                            if not is_video and file_size < min_size_kb * 1024:
                                 skipped["too_small"] += 1
                                 continue
-                            img = PILImage.open(fpath)
-                            w, h = img.size
-                            img.close()
-                            if w < min_dim and h < min_dim:
+                            if is_video:
+                                w, h, duration = get_video_info(fpath)
+                            else:
+                                img = PILImage.open(fpath)
+                                w, h = img.size
+                                img.close()
+                                duration = 0
+                            if not is_video and w < min_dim and h < min_dim:
                                 skipped["low_res"] += 1
                                 continue
                         except Exception:
                             skipped["unreadable"] += 1
                             continue
 
-                        img_date = get_image_date(fpath, rel_dir)
+                        if is_video:
+                            img_date = get_video_date(fpath)
+                        else:
+                            img_date = get_image_date(fpath, rel_dir)
                         age_days = None
                         bracket = None
                         if img_date:
@@ -537,17 +563,20 @@ def api_scan_start():
                                 bracket = age_days_to_bracket(age_days)
 
                         screenshot = False
-                        if file_size < 500 * 1024:
+                        if not is_video and file_size < 500 * 1024:
                             screenshot = is_screenshot(fpath)
 
                         face_count = 0
                         faces_found = []
                         face_dist = None
-                        if use_faces:
+                        if use_faces and not is_video:
                             face_count, faces_found, ok, face_dist = _fast_face_detect(
                                 fpath, ref_encodings, face_names, tolerance)
 
-                        thumb = make_thumbnail_b64(fpath, thumb_size)
+                        if is_video:
+                            thumb = make_video_thumbnail_b64(fpath, thumb_size)
+                        else:
+                            thumb = make_thumbnail_b64(fpath, thumb_size)
                         device = guess_device_source(fname)
 
                         entry = {
@@ -556,6 +585,7 @@ def api_scan_start():
                             "filename": fname,
                             "source_label": src_label,
                             "device": device,
+                            "media_type": "video" if is_video else "image",
                             "date": img_date.strftime("%Y-%m-%d") if img_date else None,
                             "age_days": age_days,
                             "category": bracket,
@@ -564,6 +594,7 @@ def api_scan_start():
                             "has_target_face": any(n in faces_found for n in face_names) if face_names else (face_count > 0),
                             "face_distance": face_dist,
                             "width": w, "height": h,
+                            "duration": round(duration, 1) if is_video else 0,
                             "size_kb": round(file_size / 1024),
                             "is_screenshot": screenshot,
                             "thumb": thumb,
@@ -753,19 +784,22 @@ def api_quick_fill():
             knowledge = EVENT_KNOWLEDGE.get(event_type, EVENT_KNOWLEDGE.get("photo_book"))
             weights = knowledge.get("quality_weights", {})
 
-            # Group by category (only face-matched images when face names are configured)
+            # Group by category (only face-matched when face names are configured)
             face_names = config.get("face_names", [])
+            unlimited = config.get("unlimited_mode", False)
             by_cat = {}
             for img in images:
                 if img.get("status") == "rejected":
                     continue
-                if face_names and not img.get("has_target_face"):
+                # For videos, skip face check (can't detect faces in video thumbs)
+                if face_names and img.get("media_type") != "video" and not img.get("has_target_face"):
                     continue
                 cat = img.get("category")
                 if cat:
                     by_cat.setdefault(cat, []).append(img)
 
             total_selected = 0
+            total_videos = 0
             for cat in categories:
                 if _is_cancelled():
                     _update_task("Stopped by user.")
@@ -773,57 +807,74 @@ def api_quick_fill():
                     return
 
                 cid = cat["id"]
-                target = cat.get("target", target_per_cat)
+                img_target = cat.get("target", target_per_cat)
+                vid_target = cat.get("video_target", 0)
                 pool = by_cat.get(cid, [])
 
-                # Count already selected
-                already = [i for i in pool if i.get("status") == "selected"]
-                remaining = target - len(already)
-                if remaining <= 0:
-                    _update_task(f"{cat.get('display', cid)}: already full ({len(already)}/{target})")
-                    total_selected += len(already)
-                    continue
+                # Split pool into images and videos
+                img_pool = [i for i in pool if i.get("media_type") != "video"]
+                vid_pool = [i for i in pool if i.get("media_type") == "video"]
 
-                # Score unselected candidates
-                candidates = [i for i in pool if i.get("status") != "selected"]
+                def _score_and_select(candidates, target_count, media_label):
+                    # Face distance filtering for images
+                    if face_names and media_label == "images":
+                        age_days_to = cat.get("age_days_to", 99999)
+                        if age_days_to <= 365:
+                            max_dist = 0.45
+                        elif age_days_to <= 1095:
+                            max_dist = 0.50
+                        else:
+                            max_dist = 0.55
+                        candidates = [i for i in candidates
+                                      if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
 
-                # Face distance filtering — stricter for baby categories, standard for others
-                # Only applies to images that already passed all other checks (has_target_face etc.)
-                if face_names:
-                    age_days_to = cat.get("age_days_to", 99999)
-                    if age_days_to <= 365:  # first year — baby faces are generic
-                        max_dist = 0.45
-                    elif age_days_to <= 1095:  # years 1-3 — toddler faces still tricky
-                        max_dist = 0.50
+                    already = [i for i in candidates if i.get("status") == "selected"]
+                    unselected = [i for i in candidates if i.get("status") != "selected"]
+
+                    for img in unselected:
+                        base_score = compute_quality_score(img, weights)
+                        fd = img.get("face_distance")
+                        if fd is not None and face_names:
+                            base_score += max(0, (0.6 - fd)) * 5
+                        img["_score"] = base_score
+                    unselected.sort(key=lambda x: x["_score"], reverse=True)
+
+                    if unlimited:
+                        remaining = len(unselected)
                     else:
-                        max_dist = 0.55  # general threshold — reject obvious false positives
-                    candidates = [i for i in candidates
-                                  if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
+                        remaining = max(0, target_count - len(already))
 
-                for img in candidates:
-                    base_score = compute_quality_score(img, weights)
-                    # Boost score for closer face matches (lower distance = better)
-                    fd = img.get("face_distance")
-                    if fd is not None and face_names:
-                        face_bonus = max(0, (0.6 - fd)) * 5  # up to 3 points bonus
-                        base_score += face_bonus
-                    img["_score"] = base_score
-                candidates.sort(key=lambda x: x["_score"], reverse=True)
+                    picked = 0
+                    for img in unselected[:remaining]:
+                        img["status"] = "selected"
+                        picked += 1
+                    return len(already) + picked, picked
 
-                picked = 0
-                for img in candidates[:remaining]:
-                    img["status"] = "selected"
-                    picked += 1
+                img_total, img_picked = _score_and_select(img_pool, img_target, "images")
+                vid_total, vid_picked = _score_and_select(vid_pool, vid_target, "videos")
 
-                total_selected += len(already) + picked
-                _update_task(f"{cat.get('display', cid)}: selected {picked} new ({len(already) + picked}/{target})")
+                total_selected += img_total
+                total_videos += vid_total
+
+                parts = []
+                if unlimited:
+                    parts.append(f"{img_picked} images, {vid_picked} videos")
+                else:
+                    parts.append(f"{img_total}/{img_target} images")
+                    if vid_target > 0 or vid_picked > 0:
+                        parts.append(f"{vid_total}/{vid_target} videos")
+                _update_task(f"{cat.get('display', cid)}: {', '.join(parts)}")
 
             # Clean temp scores
             for img in images:
                 img.pop("_score", None)
 
             save_scan_db(db)
-            _update_task(f"Done! {total_selected} images selected.")
+            msg = f"Done! {total_selected} images"
+            if total_videos > 0:
+                msg += f" + {total_videos} videos"
+            msg += " selected."
+            _update_task(msg)
             _finish_task()
         except Exception as e:
             _finish_task(str(e))
@@ -1027,12 +1078,17 @@ def api_export():
 
             images = [i for i in db["images"] if i.get("status") == status_filter]
             if not images:
-                _update_task("No selected images found. Use the Select step first.")
-                _finish_task("No images to export")
+                _update_task("No selected media found. Use the Select step first.")
+                _finish_task("No media to export")
                 return
 
             total = len(images)
-            _update_task(f"Exporting {total} images...")
+            vid_count = sum(1 for i in images if i.get("media_type") == "video")
+            img_count = total - vid_count
+            label = f"{img_count} images"
+            if vid_count:
+                label += f" + {vid_count} videos"
+            _update_task(f"Exporting {label}...")
 
             for i, img in enumerate(images):
                 if _is_cancelled():
@@ -1061,7 +1117,7 @@ def api_export():
                 if (i + 1) % 50 == 0:
                     _update_task(f"Exported {exported}/{total}...")
 
-            _update_task(f"Done! {exported} images exported to {output_dir}")
+            _update_task(f"Done! {exported} files exported to {output_dir}")
             _finish_task()
 
         except Exception as e:
@@ -1428,9 +1484,12 @@ def api_stats():
 
     if db:
         images = db["images"]
-        stats["total_images"] = len(images)
+        stats["total_images"] = sum(1 for i in images if i.get("media_type") != "video")
+        stats["total_videos"] = sum(1 for i in images if i.get("media_type") == "video")
+        stats["total_media"] = len(images)
         stats["qualified"] = sum(1 for i in images if i.get("status") == "qualified")
         stats["selected"] = sum(1 for i in images if i.get("status") == "selected")
+        stats["selected_videos"] = sum(1 for i in images if i.get("status") == "selected" and i.get("media_type") == "video")
         stats["pool"] = sum(1 for i in images if i.get("status") == "pool")
         stats["sources"] = list(set(i.get("source_label", "") for i in images))
 
@@ -1810,6 +1869,37 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 #side-drawer .project-item .p-del:hover { background:#fed7d7; }
 #drawer-backdrop { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.2); z-index:1150; }
 #drawer-backdrop.open { display:block; }
+
+/* ── Tutorial overlay ── */
+#tour-backdrop { display:none; position:fixed; top:0; left:0; width:100%; height:100%; z-index:2000; }
+#tour-backdrop.active { display:block; }
+#tour-highlight {
+    position:absolute; z-index:2001; border-radius:8px;
+    box-shadow: 0 0 0 4000px rgba(0,0,0,.55);
+    transition: all .4s cubic-bezier(.4,0,.2,1);
+    pointer-events:none;
+}
+#tour-tooltip {
+    position:absolute; z-index:2002; background:white; border-radius:12px; padding:20px 24px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.2); max-width:360px; min-width:260px;
+    opacity:0; transform:translateY(12px); transition: opacity .35s ease, transform .35s ease;
+}
+#tour-tooltip.show { opacity:1; transform:translateY(0); }
+#tour-tooltip h3 { font-size:1em; color:#2b6cb0; margin-bottom:6px; }
+#tour-tooltip p { font-size:.88em; color:#4a5568; line-height:1.5; margin:0 0 14px; }
+#tour-tooltip .tour-actions { display:flex; justify-content:space-between; align-items:center; }
+#tour-tooltip .tour-dots { display:flex; gap:5px; }
+#tour-tooltip .tour-dot { width:7px; height:7px; border-radius:50%; background:#e2e8f0; }
+#tour-tooltip .tour-dot.active { background:#667eea; }
+#tour-tooltip .tour-skip { font-size:.8em; color:#a0aec0; cursor:pointer; border:none; background:none; }
+#tour-tooltip .tour-skip:hover { color:#718096; }
+#tour-tooltip .tour-next {
+    padding:7px 18px; border:none; border-radius:6px; background:#667eea; color:white;
+    font-size:.85em; font-weight:600; cursor:pointer; transition: background .2s;
+}
+#tour-tooltip .tour-next:hover { background:#5a67d8; }
+@keyframes tour-pulse { 0%,100% { box-shadow: 0 0 0 4000px rgba(0,0,0,.55); } 50% { box-shadow: 0 0 0 4000px rgba(0,0,0,.5), 0 0 0 8px rgba(102,126,234,.4); } }
+#tour-highlight.pulse { animation: tour-pulse 1.5s ease infinite; }
 </style>
 </head>
 <body>
@@ -1829,6 +1919,11 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <div class="project-list" id="project-list">
         <div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">Loading...</div>
     </div>
+    <div style="padding:12px 18px; border-top:1px solid #e2e8f0;">
+        <div id="user-info" style="font-size:.8em; color:#718096; margin-bottom:8px;"></div>
+        <button onclick="toggleDrawer(); startTutorial();" style="width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; margin-bottom:8px;">Replay Tutorial</button>
+        <button onclick="logout()" style="width:100%; padding:8px; border:1px solid #fed7d7; border-radius:6px; background:#fff5f5; color:#e53e3e; font-size:.85em; cursor:pointer;">Sign Out</button>
+    </div>
 </div>
 
 <!-- Task overlay -->
@@ -1846,7 +1941,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
 <div class="header">
     <h1>E-z Photo Organizer</h1>
-    <p>Build a meaningful photo collection for your special event</p>
+    <p id="header-greeting">Build a meaningful photo collection for your special event</p>
 </div>
 
 <div class="steps" id="steps-nav">
@@ -1925,8 +2020,16 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         </div>
         <div style="background:#f0fff4; border:1px solid #c6f6d5; border-radius:8px; padding:15px; flex:1; min-width:150px; text-align:center;">
             <div style="font-size:1.8em; font-weight:bold; color:#38a169;" id="cat-total-target">0</div>
-            <div style="color:#718096; font-size:.85em;">Total Target Images</div>
+            <div style="color:#718096; font-size:.85em;">Total Target (images + videos)</div>
         </div>
+    </div>
+
+    <div style="margin-bottom:12px;">
+        <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:.85em; color:#4a5568; font-weight:600;">
+            <input type="checkbox" id="chk-unlimited" onchange="toggleUnlimited(this.checked)">
+            Select all matching media (no count limit)
+        </label>
+        <span style="font-size:.75em; color:#a0aec0; margin-left:4px;">Selects every image/video that matches your face reference</span>
     </div>
 
     <table class="analysis-table" id="cat-table">
@@ -1934,7 +2037,8 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
             <tr>
                 <th style="width:40px;">#</th>
                 <th>Category Name</th>
-                <th style="width:120px;">Target</th>
+                <th style="width:100px;">Photos</th>
+                <th style="width:100px;">Videos</th>
                 <th style="width:60px;"></th>
             </tr>
         </thead>
@@ -2138,6 +2242,8 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <div class="lightbox" id="lightbox" onclick="closeLightbox()">
     <button class="close-btn" onclick="closeLightbox()">&times;</button>
     <img id="lightbox-img" src="">
+    <video id="lightbox-video" controls style="display:none; max-width:90vw; max-height:80vh;" onclick="event.stopPropagation()"></video>
+    <div id="lightbox-info" style="color:#ccc; font-size:.85em; text-align:center; margin-top:8px;"></div>
 </div>
 
 <script>
@@ -2364,12 +2470,15 @@ function loadCategoriesStep() {
 }
 
 function renderCategories(cats) {
+    const unlimited = config?.unlimited_mode || false;
+    document.getElementById('chk-unlimited').checked = unlimited;
     const tbody = document.getElementById('cat-tbody');
     tbody.innerHTML = cats.map((c, i) => `
         <tr>
             <td style="color:#a0aec0;">${i + 1}</td>
             <td><input type="text" value="${esc(c.display || c.id || '')}" onchange="updateCatField(${i}, 'display', this.value)" style="border:1px solid #e2e8f0;"></td>
-            <td><input type="number" value="${c.target || config?.target_per_category || 75}" min="1" max="500" onchange="updateCatField(${i}, 'target', parseInt(this.value))" style="width:100px; border:1px solid #e2e8f0;"></td>
+            <td><input type="number" value="${c.target || config?.target_per_category || 75}" min="0" max="500" onchange="updateCatField(${i}, 'target', parseInt(this.value))" style="width:80px; border:1px solid #e2e8f0;" ${unlimited ? 'disabled' : ''}></td>
+            <td><input type="number" value="${c.video_target || 0}" min="0" max="500" onchange="updateCatField(${i}, 'video_target', parseInt(this.value))" style="width:80px; border:1px solid #e2e8f0;" ${unlimited ? 'disabled' : ''}></td>
             <td><span style="color:#e53e3e; cursor:pointer; font-size:1.2em;" onclick="removeCategory(${i})">&times;</span></td>
         </tr>
     `).join('');
@@ -2382,12 +2491,23 @@ function updateCatField(i, field, value) {
     updateCatSummary();
 }
 
+function toggleUnlimited(checked) {
+    config = config || {};
+    config.unlimited_mode = checked;
+    renderCategories(config.categories || []);
+}
+
 function updateCatSummary() {
     const cats = config?.categories || [];
     const defaultTarget = config?.target_per_category || 75;
     document.getElementById('cat-total-count').textContent = cats.length;
-    const total = cats.reduce((sum, c) => sum + (c.target || defaultTarget), 0);
-    document.getElementById('cat-total-target').textContent = total;
+    if (config?.unlimited_mode) {
+        document.getElementById('cat-total-target').textContent = 'All matching';
+    } else {
+        const imgTotal = cats.reduce((sum, c) => sum + (c.target || defaultTarget), 0);
+        const vidTotal = cats.reduce((sum, c) => sum + (c.video_target || 0), 0);
+        document.getElementById('cat-total-target').textContent = imgTotal + (vidTotal ? ' + ' + vidTotal + ' videos' : '');
+    }
 }
 
 function addCategory() {
@@ -2397,7 +2517,8 @@ function addCategory() {
     config.categories.push({
         id: 'custom_' + n,
         display: 'New Category ' + n,
-        target: config.target_per_category || 75
+        target: config.target_per_category || 75,
+        video_target: 0
     });
     renderCategories(config.categories);
 }
@@ -3126,14 +3247,17 @@ function renderSelGrid() {
             border:3px solid ${img._sel ? '#3182ce' : '#e2e8f0'}; flex-shrink:0;`;
         if (img._sel) div.style.boxShadow = '0 0 0 2px #bee3f8';
         const thumbSrc = img.thumb ? 'data:image/jpeg;base64,' + img.thumb : '';
+        const isVid = img.media_type === 'video';
+        const vidBadge = isVid ? '<div style="position:absolute; bottom:2px; left:2px; background:rgba(0,0,0,.7); color:#fff; border-radius:4px; padding:1px 5px; font-size:10px; font-weight:600;">&#9654; VID</div>' : '';
         div.innerHTML = `<img src="${thumbSrc}" style="width:100%; height:100%; object-fit:cover;">
+            ${vidBadge}
             ${img._sel ? '<div style="position:absolute; top:2px; right:2px; background:#3182ce; color:#fff; border-radius:50%; width:18px; height:18px; font-size:12px; display:flex; align-items:center; justify-content:center;">&#10003;</div>' : ''}`;
         div.onclick = () => toggleSelImage(img);
         div.ondblclick = (e) => { e.stopPropagation(); showSelLightbox(img); };
         grid.appendChild(div);
     });
     if (paged.length === 0) {
-        grid.innerHTML = '<div style="color:#718096; padding:20px;">No images in this category.</div>';
+        grid.innerHTML = '<div style="color:#718096; padding:20px;">No photos or videos in this category.</div>';
     }
 }
 
@@ -3203,19 +3327,38 @@ async function saveTarget() {
 
 function showSelLightbox(img) {
     const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:9999;display:flex;align-items:center;justify-content:center;';
-    overlay.onclick = () => overlay.remove();
-    const imgEl = document.createElement('img');
-    imgEl.src = '/api/images/serve/' + img.hash;
-    imgEl.style.cssText = 'max-width:90vw;max-height:85vh;border-radius:8px;box-shadow:0 4px 30px rgba(0,0,0,.5);';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;';
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+    const isVid = img.media_type === 'video';
+    var mediaEl;
+    if (isVid) {
+        mediaEl = document.createElement('video');
+        mediaEl.src = '/api/images/serve/' + img.hash;
+        mediaEl.controls = true;
+        mediaEl.autoplay = true;
+        mediaEl.style.cssText = 'max-width:90vw;max-height:80vh;border-radius:8px;box-shadow:0 4px 30px rgba(0,0,0,.5);';
+        mediaEl.onclick = (e) => e.stopPropagation();
+    } else {
+        mediaEl = document.createElement('img');
+        mediaEl.src = '/api/images/serve/' + img.hash;
+        mediaEl.style.cssText = 'max-width:90vw;max-height:85vh;border-radius:8px;box-shadow:0 4px 30px rgba(0,0,0,.5);';
+    }
+
     const close = document.createElement('div');
     close.innerHTML = '&times;';
-    close.style.cssText = 'position:absolute;top:20px;right:30px;color:#fff;font-size:36px;cursor:pointer;';
-    close.onclick = () => overlay.remove();
+    close.style.cssText = 'position:absolute;top:20px;right:30px;color:#fff;font-size:36px;cursor:pointer;z-index:10;';
+    close.onclick = () => { if (isVid) mediaEl.pause(); overlay.remove(); };
+
     const info = document.createElement('div');
     info.style.cssText = 'position:absolute;bottom:20px;left:50%;transform:translateX(-50%);color:#fff;font-size:.85em;background:rgba(0,0,0,.6);padding:6px 16px;border-radius:6px;';
-    info.textContent = (img.filename || '') + (img.date_taken ? ' | ' + img.date_taken : '') + (img.source_label ? ' | ' + img.source_label : '');
-    overlay.appendChild(imgEl);
+    var label = (img.filename || '');
+    if (isVid && img.duration) label += ' | ' + Math.round(img.duration) + 's';
+    if (img.date_taken) label += ' | ' + img.date_taken;
+    if (img.source_label) label += ' | ' + img.source_label;
+    info.textContent = label;
+
+    overlay.appendChild(mediaEl);
     overlay.appendChild(close);
     overlay.appendChild(info);
     document.body.appendChild(overlay);
@@ -3330,7 +3473,24 @@ function toggleDrawer() {
     document.getElementById('drawer-backdrop').classList.toggle('open');
     if (document.getElementById('side-drawer').classList.contains('open')) {
         loadProjectList();
+        loadUserInfo();
     }
+}
+
+async function loadUserInfo() {
+    try {
+        const res = await fetch('/api/auth/me');
+        const data = await res.json();
+        if (data.authenticated) {
+            document.getElementById('user-info').textContent = data.user;
+        }
+    } catch(e) {}
+}
+
+async function logout() {
+    if (!confirm('Sign out?')) return;
+    await fetch('/api/auth/logout', {method: 'POST'});
+    window.location.href = '/login';
 }
 
 async function loadProjectList() {
@@ -3435,8 +3595,196 @@ async function deleteProject(dirName, displayName) {
     } catch(e) { alert('Delete failed: ' + e.message); }
 }
 
+// ── Tutorial system ──
+
+const TOUR_STEPS = [
+    {
+        target: '.header h1',
+        title: 'Welcome!',
+        text: 'This is E-z Photo Organizer. It helps you build a curated photo collection for any special event — step by step.',
+        position: 'bottom'
+    },
+    {
+        target: '#steps-nav',
+        title: 'Step Navigation',
+        text: 'These are your 9 steps. Each one guides you through the process — from choosing an event type to exporting your final collection.',
+        position: 'bottom'
+    },
+    {
+        target: '.step-dot:first-child',
+        title: 'Step 1: Choose Event',
+        text: 'Start here. Pick your event type (Bar Mitzva, Wedding, Graduation, etc.) and the app will set up categories and settings for you.',
+        position: 'bottom'
+    },
+    {
+        target: '.menu-btn',
+        title: 'Side Menu',
+        text: 'Access your saved projects, start a new project, replay this tutorial, or sign out from here.',
+        position: 'right'
+    },
+    {
+        target: '.step-dot:nth-child(3)',
+        title: 'Add Your Photo Sources',
+        text: 'In the Sources step, add folders from USB drives, cloud backups, phone exports — anywhere your photos live.',
+        position: 'bottom'
+    },
+    {
+        target: '.step-dot:nth-child(4)',
+        title: 'Face Recognition',
+        text: 'Add reference photos of the main person. The app will automatically find them across thousands of photos.',
+        position: 'bottom'
+    },
+    {
+        target: '.step-dot:nth-child(5)',
+        title: 'Smart Scanning',
+        text: 'The scanner extracts dates, detects faces, filters duplicates, and categorizes everything automatically.',
+        position: 'bottom'
+    },
+    {
+        target: '.step-dot:nth-child(7)',
+        title: 'Auto-Select & Review',
+        text: 'Use Quick Fill or Smart Fill to automatically pick the best photos, then manually review and swap as needed.',
+        position: 'bottom'
+    },
+    {
+        target: '.step-dot:nth-child(9)',
+        title: 'Export',
+        text: 'When you are happy with your selection, export everything to a folder — organized and ready for your event!',
+        position: 'bottom'
+    }
+];
+
+let tourIdx = -1;
+
+function startTutorial() {
+    tourIdx = 0;
+    // Create overlay elements if they don't exist
+    if (!document.getElementById('tour-backdrop')) {
+        var bd = document.createElement('div');
+        bd.id = 'tour-backdrop';
+        bd.onclick = function(e) { if (e.target === bd) endTutorial(); };
+        document.body.appendChild(bd);
+
+        var hl = document.createElement('div');
+        hl.id = 'tour-highlight';
+        document.body.appendChild(hl);
+
+        var tt = document.createElement('div');
+        tt.id = 'tour-tooltip';
+        document.body.appendChild(tt);
+    }
+    document.getElementById('tour-backdrop').classList.add('active');
+    document.getElementById('tour-highlight').style.display = 'block';
+    document.getElementById('tour-tooltip').style.display = 'block';
+    showTourStep();
+}
+
+function showTourStep() {
+    var step = TOUR_STEPS[tourIdx];
+    var el = document.querySelector(step.target);
+    var hl = document.getElementById('tour-highlight');
+    var tt = document.getElementById('tour-tooltip');
+
+    tt.classList.remove('show');
+
+    if (!el) { tourNext(); return; }
+
+    // Scroll element into view
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    setTimeout(function() {
+        var rect = el.getBoundingClientRect();
+        var pad = 6;
+
+        // Position highlight
+        hl.style.left = (rect.left - pad + window.scrollX) + 'px';
+        hl.style.top = (rect.top - pad + window.scrollY) + 'px';
+        hl.style.width = (rect.width + pad * 2) + 'px';
+        hl.style.height = (rect.height + pad * 2) + 'px';
+        hl.classList.add('pulse');
+
+        // Build tooltip content
+        var dotsHtml = '';
+        for (var i = 0; i < TOUR_STEPS.length; i++) {
+            dotsHtml += '<span class="tour-dot' + (i === tourIdx ? ' active' : '') + '"></span>';
+        }
+
+        tt.innerHTML = '<h3>' + step.title + '</h3><p>' + step.text + '</p>' +
+            '<div class="tour-actions">' +
+            '<div class="tour-dots">' + dotsHtml + '</div>' +
+            '<div style="display:flex; gap:8px; align-items:center;">' +
+            '<button class="tour-skip" onclick="endTutorial()">Skip</button>' +
+            '<button class="tour-next" onclick="tourNext()">' + (tourIdx < TOUR_STEPS.length - 1 ? 'Next' : 'Got it!') + '</button>' +
+            '</div></div>';
+
+        // Position tooltip
+        var pos = step.position || 'bottom';
+        var ttW = 340;
+        var ttLeft, ttTop;
+
+        if (pos === 'bottom') {
+            ttLeft = rect.left + rect.width / 2 - ttW / 2 + window.scrollX;
+            ttTop = rect.bottom + 16 + window.scrollY;
+        } else if (pos === 'right') {
+            ttLeft = rect.right + 16 + window.scrollX;
+            ttTop = rect.top + window.scrollY;
+        } else if (pos === 'top') {
+            ttLeft = rect.left + rect.width / 2 - ttW / 2 + window.scrollX;
+            ttTop = rect.top - 140 + window.scrollY;
+        }
+
+        // Keep in viewport
+        ttLeft = Math.max(12, Math.min(ttLeft, window.innerWidth - ttW - 12));
+
+        tt.style.left = ttLeft + 'px';
+        tt.style.top = ttTop + 'px';
+        tt.style.width = ttW + 'px';
+
+        // Animate in
+        setTimeout(function() { tt.classList.add('show'); }, 50);
+    }, 300);
+}
+
+function tourNext() {
+    tourIdx++;
+    if (tourIdx >= TOUR_STEPS.length) {
+        endTutorial();
+        return;
+    }
+    showTourStep();
+}
+
+function endTutorial() {
+    tourIdx = -1;
+    var bd = document.getElementById('tour-backdrop');
+    var hl = document.getElementById('tour-highlight');
+    var tt = document.getElementById('tour-tooltip');
+    if (bd) bd.classList.remove('active');
+    if (hl) { hl.classList.remove('pulse'); hl.style.display = 'none'; }
+    if (tt) { tt.classList.remove('show'); tt.style.display = 'none'; }
+    localStorage.setItem('tutorial_seen', '1');
+}
+
+// ── Personalized greeting ──
+async function loadGreeting() {
+    try {
+        var res = await fetch('/api/auth/me');
+        var data = await res.json();
+        if (data.authenticated && data.name) {
+            var firstName = data.name.split(' ')[0];
+            document.getElementById('header-greeting').textContent = 'Hi ' + firstName + ', how can I help you today?';
+
+            // First visit — auto-start tutorial
+            if (!localStorage.getItem('tutorial_seen')) {
+                setTimeout(startTutorial, 800);
+            }
+        }
+    } catch(e) {}
+}
+
 // ── Init ──
 loadTemplates();
+loadGreeting();
 </script>
 </body>
 </html>"""

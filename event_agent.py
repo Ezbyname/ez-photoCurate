@@ -465,11 +465,12 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
 
     # Group images by category (only face-matched when face names configured)
     face_names = config.get("face_names", [])
+    unlimited = config.get("unlimited_mode", False)
     by_category = defaultdict(list)
     for img in images:
         if img.get("status") == "rejected":
             continue
-        if face_names and not img.get("has_target_face"):
+        if face_names and img.get("media_type") != "video" and not img.get("has_target_face"):
             continue
         cat = img.get("category")
         if cat:
@@ -477,8 +478,10 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
 
     # Build category targets
     cat_targets = {}
+    cat_vid_targets = {}
     for cat in categories:
         cat_targets[cat["id"]] = cat.get("target", target_per_cat)
+        cat_vid_targets[cat["id"]] = cat.get("video_target", 0)
 
     report = {
         "strategy": strategy,
