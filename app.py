@@ -1973,7 +1973,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
             <div id="field-birthday" style="display:none">
                 <label>Child's Birthday</label>
                 <div style="display:flex; align-items:center; gap:10px;">
-                    <input type="date" id="inp-birthday" style="width:160px;">
+                    <input type="date" id="inp-birthday" style="width:160px;" max="">
                     <label style="font-size:.8em; color:#718096; display:flex; align-items:center; gap:4px; white-space:nowrap;"><input type="checkbox" id="skip-birthday" onchange="toggleSkipDate('birthday')"> Not needed</label>
                 </div>
             </div>
@@ -3788,6 +3788,7 @@ async function loadGreeting() {
 }
 
 // ── Init ──
+document.getElementById('inp-birthday').max = new Date().toISOString().split('T')[0];
 loadTemplates();
 loadGreeting();
 </script>
