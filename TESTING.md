@@ -8,7 +8,7 @@ Pre-push sanity tests for E-z Photo Organizer.
 pytest test_sanity.py -v
 ```
 
-## What's Covered (81 tests)
+## What's Covered (100 tests)
 
 | Area | Tests |
 |------|-------|
@@ -23,7 +23,7 @@ pytest test_sanity.py -v
 | **Image Serving** | 404 for missing image, serve real image via hash |
 | **Video Support** | VIDEO_EXTS defined, thumbnail generation (OpenCV), video info extraction |
 | **Face References** | Upload (multipart), list after upload, PNG transparency, delete single photo, delete person |
-| **Project Save/Load** | Save project, list projects, load project (verify state restored), delete project, missing name |
+| **Project Save/Load** | Save project, list projects, load project (verify state restored), delete project, missing name, rename project, rename empty name, rename nonexistent |
 | **Report** | No scan data (graceful error), report with data |
 | **Category Targets** | Update target, update with no config |
 | **Image Move** | Move between categories, move to pool (reject reason) |
@@ -33,6 +33,7 @@ pytest test_sanity.py -v
 | **NSFW** | `_check_nsfw` function exists and handles edge cases |
 | **Curate Module** | IMAGE_EXTS, REEF_BIRTHDAY, age bracket mapping, thumbnail generation |
 | **Resilience** | Missing scan_db, corrupt/malformed scan_db, image serve with no DB |
+| **Cleanup Tool** | List images, mark/unmark trash, trash count, trash filter, confirm recycle (missing file + real file), empty hashes |
 
 ## Pre-Push Usage
 
@@ -59,5 +60,5 @@ pytest test_sanity.py -v --tb=short && echo "All tests passed!" || echo "TESTS F
 - Tests use a **temporary SQLite database** — your real `users.db` is never touched.
 - Tests that need images create tiny synthetic ones via Pillow.
 - Tests that need videos create synthetic AVI files via OpenCV.
-- The test suite runs in ~22 seconds.
+- The test suite runs in ~27 seconds.
 - If a test is skipped, it means an optional dependency (Pillow, OpenCV) is missing.

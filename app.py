@@ -1678,6 +1678,32 @@ def api_projects_new():
     return jsonify({"ok": True})
 
 
+@app.route("/api/projects/<dir_name>/rename", methods=["POST"])
+def api_projects_rename(dir_name):
+    """Rename a saved project. Expects {name}."""
+    data = request.json or {}
+    new_name = data.get("name", "").strip()
+    if not new_name:
+        return jsonify({"error": "Name is required"}), 400
+
+    pdir = os.path.join(PROJECTS_DIR, _safe_project_name(dir_name))
+    if not os.path.isdir(pdir):
+        return jsonify({"error": "Project not found"}), 404
+
+    meta_path = _project_meta_path(pdir)
+    meta = {}
+    if os.path.isfile(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+    meta["name"] = new_name
+    meta["modified"] = datetime.now().isoformat()
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return jsonify({"ok": True, "name": new_name})
+
+
 @app.route("/api/projects/<dir_name>", methods=["DELETE"])
 def api_projects_delete(dir_name):
     """Delete a saved project."""
@@ -1686,6 +1712,133 @@ def api_projects_delete(dir_name):
         return jsonify({"error": "Project not found"}), 404
     shutil.rmtree(pdir)
     return jsonify({"ok": True})
+
+
+# ── Cleanup / Trash ──────────────────────────────────────────────────────────
+
+@app.route("/api/cleanup/images")
+def api_cleanup_images():
+    """Get all images for cleanup review, grouped by category."""
+    db = load_scan_db()
+    if not db:
+        return jsonify({"images": [], "total": 0})
+
+    images = db["images"]
+    status_filter = request.args.get("status")  # e.g. "candidate", "pool"
+    category = request.args.get("category")
+    media_type = request.args.get("media_type")
+    trash_only = request.args.get("trash") == "1"
+
+    filtered = images
+    if trash_only:
+        filtered = [i for i in filtered if i.get("trash")]
+    if status_filter:
+        filtered = [i for i in filtered if i.get("status") == status_filter]
+    if category:
+        filtered = [i for i in filtered if i.get("category") == category]
+    if media_type:
+        filtered = [i for i in filtered if i.get("media_type", "image") == media_type]
+
+    offset = int(request.args.get("offset", 0))
+    limit = int(request.args.get("limit", 200))
+    total = len(filtered)
+    page = filtered[offset:offset + limit]
+    return jsonify({"images": page, "total": total, "offset": offset})
+
+
+@app.route("/api/cleanup/mark-trash", methods=["POST"])
+def api_cleanup_mark_trash():
+    """Mark images for trash (soft mark, not deleted yet)."""
+    data = request.json or {}
+    hashes = set(data.get("hashes", []))
+    if not hashes:
+        return jsonify({"error": "No hashes provided"}), 400
+
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    marked = 0
+    for img in db["images"]:
+        if img["hash"] in hashes:
+            img["trash"] = True
+            marked += 1
+
+    save_scan_db(db)
+    return jsonify({"ok": True, "marked": marked})
+
+
+@app.route("/api/cleanup/unmark-trash", methods=["POST"])
+def api_cleanup_unmark_trash():
+    """Remove trash mark from images."""
+    data = request.json or {}
+    hashes = set(data.get("hashes", []))
+
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    unmarked = 0
+    for img in db["images"]:
+        if img["hash"] in hashes and img.get("trash"):
+            img["trash"] = False
+            unmarked += 1
+
+    save_scan_db(db)
+    return jsonify({"ok": True, "unmarked": unmarked})
+
+
+@app.route("/api/cleanup/trash-count")
+def api_cleanup_trash_count():
+    """Get count of images marked for trash."""
+    db = load_scan_db()
+    if not db:
+        return jsonify({"count": 0, "size_mb": 0})
+    count = 0
+    size_kb = 0
+    for img in db["images"]:
+        if img.get("trash"):
+            count += 1
+            size_kb += img.get("size_kb", 0)
+    return jsonify({"count": count, "size_mb": round(size_kb / 1024, 1)})
+
+
+@app.route("/api/cleanup/confirm-trash", methods=["POST"])
+def api_cleanup_confirm_trash():
+    """Send all trash-marked images to the OS recycle bin."""
+    try:
+        from send2trash import send2trash
+    except ImportError:
+        return jsonify({"error": "send2trash not installed. Run: pip install send2trash"}), 500
+
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    trashed = []
+    failed = []
+    for img in db["images"]:
+        if img.get("trash"):
+            fpath = img["path"].replace("/", os.sep)
+            if os.path.isfile(fpath):
+                try:
+                    send2trash(fpath)
+                    trashed.append(img["hash"])
+                except Exception as e:
+                    failed.append({"hash": img["hash"], "error": str(e)})
+            else:
+                trashed.append(img["hash"])  # Already gone
+
+    # Remove trashed entries from scan_db
+    db["images"] = [i for i in db["images"] if i["hash"] not in set(trashed)]
+    save_scan_db(db)
+
+    return jsonify({
+        "ok": True,
+        "recycled": len(trashed),
+        "failed": len(failed),
+        "failures": failed[:10],
+    })
 
 
 # ── Serve UI ──────────────────────────────────────────────────────────────────
@@ -1708,7 +1861,7 @@ WIZARD_HTML = """<!DOCTYPE html>
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#f5f7fa; color:#2d3748; min-height:100vh; }
 
 /* ── Layout ── */
-.app { max-width:1200px; margin:0 auto; padding:20px; }
+.app { max-width:1200px; margin:0 auto; padding:20px; padding-left:68px; }
 .header { text-align:center; padding:30px 0 20px; }
 .header h1 { font-size:2em; color:#2b6cb0; margin-bottom:5px; }
 .header p { color:#718096; font-size:.9em; }
@@ -1844,13 +1997,37 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 #task-overlay .btn-stop:hover { background:#c53030; }
 
 /* ── Side menu (projects) ── */
-.menu-btn { position:fixed; top:12px; left:12px; z-index:1100; background:#fff; border:1px solid #e2e8f0; border-radius:6px; width:36px; height:36px; cursor:pointer; display:flex; align-items:center; justify-content:center; box-shadow:0 1px 4px rgba(0,0,0,.08); }
-.menu-btn:hover { background:#ebf8ff; border-color:#90cdf4; }
-.menu-btn span { display:block; width:18px; height:2px; background:#4a5568; position:relative; }
-.menu-btn span::before, .menu-btn span::after { content:''; position:absolute; left:0; width:18px; height:2px; background:#4a5568; }
-.menu-btn span::before { top:-6px; }
-.menu-btn span::after { top:6px; }
-#side-drawer { position:fixed; top:0; left:-320px; width:300px; height:100%; background:#fff; z-index:1200; box-shadow:4px 0 20px rgba(0,0,0,.1); transition:left .25s ease; display:flex; flex-direction:column; }
+/* ── Icon rail (always visible) ── */
+#icon-rail { position:fixed; top:0; left:0; width:48px; height:100%; background:#fff; z-index:1100; display:flex; flex-direction:column; align-items:center; padding:10px 0; border-right:1px solid #e2e8f0; box-shadow:1px 0 6px rgba(0,0,0,.04); }
+#icon-rail .rail-btn { width:36px; height:36px; border:none; background:none; border-radius:8px; cursor:pointer; display:flex; align-items:center; justify-content:center; color:#718096; transition:all .15s; position:relative; margin-bottom:4px; }
+#icon-rail .rail-btn:hover { background:#ebf8ff; color:#2b6cb0; }
+#icon-rail .rail-btn.active { background:#ebf8ff; color:#2b6cb0; }
+#icon-rail .rail-btn svg { width:20px; height:20px; }
+#icon-rail .rail-btn .rail-tip { display:none; position:absolute; left:46px; top:50%; transform:translateY(-50%); background:#2d3748; color:#fff; font-size:.72em; padding:4px 10px; border-radius:5px; white-space:nowrap; pointer-events:none; z-index:10; }
+#icon-rail .rail-btn:hover .rail-tip { display:block; }
+#icon-rail .rail-spacer { flex:1; }
+#icon-rail .rail-divider { width:24px; height:1px; background:#e2e8f0; margin:6px 0; }
+.menu-btn { display:none; }
+/* ── Cleanup overlay ── */
+#cleanup-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:#f5f7fa; z-index:1300; overflow-y:auto; }
+#cleanup-overlay.active { display:block; }
+#cleanup-overlay .cleanup-header { position:sticky; top:0; background:#fff; z-index:10; padding:16px 24px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 8px rgba(0,0,0,.05); }
+#cleanup-overlay .cleanup-header h2 { margin:0; color:#2d3748; font-size:1.3em; }
+#cleanup-overlay .cleanup-body { padding:20px 24px; max-width:1400px; margin:0 auto; }
+#cleanup-overlay .cleanup-filters { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
+#cleanup-overlay .cleanup-filters select, #cleanup-overlay .cleanup-filters input { padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:.85em; }
+.cleanup-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; }
+.cleanup-card { position:relative; border-radius:8px; overflow:hidden; cursor:pointer; border:2px solid transparent; transition:all .15s; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+.cleanup-card:hover { box-shadow:0 2px 8px rgba(0,0,0,.15); }
+.cleanup-card.trashed { border-color:#e53e3e; opacity:.7; }
+.cleanup-card.trashed::after { content:'TRASH'; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%) rotate(-20deg); font-size:1.4em; font-weight:900; color:#e53e3e; background:rgba(255,255,255,.85); padding:4px 16px; border-radius:6px; pointer-events:none; }
+.cleanup-card img { width:100%; height:130px; object-fit:cover; display:block; }
+.cleanup-card .card-info { padding:6px 8px; font-size:.72em; color:#718096; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cleanup-trash-bar { position:sticky; bottom:0; background:#fff; border-top:1px solid #e2e8f0; padding:12px 24px; display:flex; justify-content:space-between; align-items:center; box-shadow:0 -2px 8px rgba(0,0,0,.05); z-index:10; }
+.cleanup-trash-bar .trash-count { font-size:.95em; color:#4a5568; font-weight:600; }
+.cleanup-trash-bar .trash-size { font-size:.8em; color:#a0aec0; margin-left:8px; }
+
+#side-drawer { position:fixed; top:0; left:-320px; width:300px; height:100%; background:#fff; z-index:1150; box-shadow:4px 0 20px rgba(0,0,0,.1); transition:left .25s ease; display:flex; flex-direction:column; padding-left:48px; }
 #side-drawer.open { left:0; }
 #side-drawer .drawer-header { padding:16px 18px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; }
 #side-drawer .drawer-header h3 { color:#2d3748; margin:0; font-size:1em; }
@@ -1904,25 +2081,160 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 </head>
 <body>
 
-<!-- Side drawer for projects -->
-<button class="menu-btn" onclick="toggleDrawer()"><span></span></button>
+<!-- Icon rail (always visible) -->
+<div id="icon-rail">
+    <button class="rail-btn" onclick="toggleDrawer()" id="rail-toggle" title="Menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        <span class="rail-tip">Menu</span>
+    </button>
+    <div class="rail-divider"></div>
+    <button class="rail-btn" onclick="newProject()" title="New Project">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        <span class="rail-tip">New Project</span>
+    </button>
+    <button class="rail-btn" onclick="openDrawerToProjects()" title="Saved Projects">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+        <span class="rail-tip">Saved Projects</span>
+    </button>
+    <div class="rail-divider"></div>
+    <button class="rail-btn" onclick="openCleanup()" title="Cleanup">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        <span class="rail-tip">Cleanup Tool</span>
+    </button>
+    <button class="rail-btn" onclick="openPhoneImages()" title="Phone Images">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+        <span class="rail-tip">Phone Images</span>
+    </button>
+    <div class="rail-spacer"></div>
+    <div class="rail-divider"></div>
+    <button class="rail-btn" onclick="startTutorial()" title="Tutorial">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="rail-tip">Tutorial</span>
+    </button>
+    <button class="rail-btn" onclick="logout()" title="Sign Out">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span class="rail-tip">Sign Out</span>
+    </button>
+</div>
+
+<!-- Side drawer (slides from behind icon rail) -->
 <div id="drawer-backdrop" onclick="toggleDrawer()"></div>
 <div id="side-drawer">
     <div class="drawer-header">
-        <h3>Projects</h3>
+        <h3 id="drawer-title">Menu</h3>
         <button class="drawer-close" onclick="toggleDrawer()">&times;</button>
     </div>
-    <div class="drawer-actions">
-        <button onclick="saveCurrentProject()">Save Current</button>
-        <button onclick="newProject()">New Project</button>
+
+    <!-- New Project button -->
+    <div style="padding:12px 18px; border-bottom:1px solid #e2e8f0;">
+        <button onclick="newProject()" style="width:100%; padding:10px 12px; border:1px solid #bee3f8; border-radius:8px; background:#ebf8ff; color:#2b6cb0; font-size:.85em; font-weight:600; cursor:pointer; display:flex; align-items:center; gap:8px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            New Project
+        </button>
     </div>
-    <div class="project-list" id="project-list">
-        <div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">Loading...</div>
+
+    <!-- Saved Projects section (collapsible) -->
+    <div style="border-bottom:1px solid #e2e8f0;">
+        <div onclick="toggleProjectsSection()" style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; cursor:pointer; user-select:none;" id="projects-toggle">
+            <span style="font-weight:600; font-size:.9em; color:#2d3748; display:flex; align-items:center; gap:8px;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                Saved Projects
+            </span>
+            <svg id="projects-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div id="projects-section" style="display:none;">
+            <div class="project-list" id="project-list">
+                <div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">Loading...</div>
+            </div>
+        </div>
     </div>
+
+    <!-- Cleanup section -->
+    <div style="border-bottom:1px solid #e2e8f0;">
+        <div onclick="toggleCleanupSection()" style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; cursor:pointer; user-select:none;">
+            <span style="font-weight:600; font-size:.9em; color:#2d3748; display:flex; align-items:center; gap:8px;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                Cleanup
+            </span>
+            <svg id="cleanup-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div id="cleanup-section" style="display:none; padding:0 18px 12px;">
+            <button onclick="toggleDrawer(); openCleanup();" style="width:100%; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; margin-bottom:6px; display:flex; align-items:center; gap:8px; text-align:left;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                Desktop / Laptop / Portable Memory
+            </button>
+            <button onclick="toggleDrawer(); openPhoneImages();" style="width:100%; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; display:flex; align-items:center; gap:8px; text-align:left;">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+                Mobile
+            </button>
+        </div>
+    </div>
+
+    <!-- Bottom actions -->
+    <div style="flex:1;"></div>
     <div style="padding:12px 18px; border-top:1px solid #e2e8f0;">
         <div id="user-info" style="font-size:.8em; color:#718096; margin-bottom:8px;"></div>
-        <button onclick="toggleDrawer(); startTutorial();" style="width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; margin-bottom:8px;">Replay Tutorial</button>
-        <button onclick="logout()" style="width:100%; padding:8px; border:1px solid #fed7d7; border-radius:6px; background:#fff5f5; color:#e53e3e; font-size:.85em; cursor:pointer;">Sign Out</button>
+        <button onclick="toggleDrawer(); startTutorial();" style="width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; margin-bottom:8px; display:flex; align-items:center; justify-content:center; gap:6px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            Tutorial
+        </button>
+        <button onclick="logout()" style="width:100%; padding:8px; border:1px solid #fed7d7; border-radius:6px; background:#fff5f5; color:#e53e3e; font-size:.85em; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Sign Out
+        </button>
+    </div>
+</div>
+
+<!-- Cleanup overlay -->
+<div id="cleanup-overlay">
+    <div class="cleanup-header">
+        <h2>Cleanup Tool</h2>
+        <div style="display:flex; gap:10px; align-items:center;">
+            <span id="cleanup-trash-badge" style="background:#fed7d7; color:#c53030; padding:4px 12px; border-radius:12px; font-size:.85em; font-weight:600; display:none;">0 in trash</span>
+            <button class="btn btn-secondary" onclick="showCleanupTrash()" id="btn-review-trash" style="display:none;">Review Trash</button>
+            <button class="btn btn-secondary" onclick="closeCleanup()" style="font-size:.85em;">Close</button>
+        </div>
+    </div>
+    <div class="cleanup-body">
+        <div class="cleanup-filters">
+            <select id="cleanup-filter-cat" onchange="loadCleanupImages()">
+                <option value="">All Categories</option>
+            </select>
+            <select id="cleanup-filter-status" onchange="loadCleanupImages()">
+                <option value="">All Statuses</option>
+                <option value="candidate">Candidate</option>
+                <option value="qualified">Qualified</option>
+                <option value="selected">Selected</option>
+                <option value="pool">Rejected / Pool</option>
+            </select>
+            <select id="cleanup-filter-media" onchange="loadCleanupImages()">
+                <option value="">All Media</option>
+                <option value="image">Images Only</option>
+                <option value="video">Videos Only</option>
+            </select>
+            <label style="display:flex; align-items:center; gap:4px; font-size:.85em; color:#4a5568; cursor:pointer;">
+                <input type="checkbox" id="cleanup-show-trash" onchange="loadCleanupImages()"> Show trash only
+            </label>
+            <div style="flex:1;"></div>
+            <button class="btn btn-secondary" onclick="cleanupSelectAll()" style="font-size:.8em; padding:6px 14px;">Select All Visible</button>
+            <button class="btn btn-secondary" onclick="cleanupDeselectAll()" style="font-size:.8em; padding:6px 14px;">Deselect All</button>
+        </div>
+        <div id="cleanup-grid" class="cleanup-grid">
+            <div style="grid-column:1/-1; text-align:center; color:#a0aec0; padding:40px;">Open the cleanup tool to review and trash unwanted images.</div>
+        </div>
+        <div id="cleanup-load-more" style="text-align:center; padding:16px; display:none;">
+            <button class="btn btn-secondary" onclick="loadCleanupMore()">Load More</button>
+        </div>
+    </div>
+    <div class="cleanup-trash-bar" id="cleanup-bottom-bar" style="display:none;">
+        <div>
+            <span class="trash-count" id="cleanup-bar-count">0 items in trash</span>
+            <span class="trash-size" id="cleanup-bar-size"></span>
+        </div>
+        <div style="display:flex; gap:10px;">
+            <button class="btn btn-secondary" onclick="cleanupClearTrash()">Clear All Trash Marks</button>
+            <button class="btn" style="background:#e53e3e; color:#fff;" onclick="cleanupConfirmRecycle()">Move to Recycle Bin</button>
+        </div>
     </div>
 </div>
 
@@ -1944,16 +2256,21 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <p id="header-greeting">Build a meaningful photo collection for your special event</p>
 </div>
 
-<div class="steps" id="steps-nav">
-    <div class="step-dot active" onclick="goStep(0)"><span class="num">1</span> Event</div>
-    <div class="step-dot" onclick="goStep(1)"><span class="num">2</span> Categories</div>
-    <div class="step-dot" onclick="goStep(2)"><span class="num">3</span> Sources</div>
-    <div class="step-dot" onclick="goStep(3)"><span class="num">4</span> Faces</div>
-    <div class="step-dot" onclick="goStep(4)"><span class="num">5</span> Scan</div>
-    <div class="step-dot" onclick="goStep(5)"><span class="num">6</span> Analyze</div>
-    <div class="step-dot" onclick="goStep(6)"><span class="num">7</span> Select</div>
-    <div class="step-dot" onclick="goStep(7)"><span class="num">8</span> Review</div>
-    <div class="step-dot" onclick="goStep(8)"><span class="num">9</span> Export</div>
+<div style="display:flex; align-items:center; gap:12px; margin:25px 0;">
+    <div class="steps" id="steps-nav" style="margin:0;">
+        <div class="step-dot active" onclick="goStep(0)"><span class="num">1</span> Event</div>
+        <div class="step-dot" onclick="goStep(1)"><span class="num">2</span> Categories</div>
+        <div class="step-dot" onclick="goStep(2)"><span class="num">3</span> Sources</div>
+        <div class="step-dot" onclick="goStep(3)"><span class="num">4</span> Faces</div>
+        <div class="step-dot" onclick="goStep(4)"><span class="num">5</span> Scan</div>
+        <div class="step-dot" onclick="goStep(5)"><span class="num">6</span> Analyze</div>
+        <div class="step-dot" onclick="goStep(6)"><span class="num">7</span> Select</div>
+        <div class="step-dot" onclick="goStep(7)"><span class="num">8</span> Review</div>
+        <div class="step-dot" onclick="goStep(8)"><span class="num">9</span> Export</div>
+    </div>
+    <button id="btn-save-project" onclick="saveCurrentProject()" title="Save Project" style="flex-shrink:0; width:38px; height:38px; border:1px solid #e2e8f0; background:#fff; border-radius:8px; cursor:pointer; display:flex; align-items:center; justify-content:center; color:#4a5568; transition:all .2s;" onmouseover="this.style.background='#ebf8ff';this.style.borderColor='#90cdf4';this.style.color='#2b6cb0'" onmouseout="this.style.background='#fff';this.style.borderColor='#e2e8f0';this.style.color='#4a5568'">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+    </button>
 </div>
 
 <!-- ── STEP 0: Choose Event ── -->
@@ -2013,6 +2330,12 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <h2>Customize Your Categories</h2>
     <p>These categories come from your event template. Adjust names, targets, or add/remove as needed.</p>
 
+    <div style="margin-bottom:16px;">
+        <label style="font-weight:600; font-size:.9em; color:#2d3748;">Project Name <span style="color:#e53e3e;">*</span></label>
+        <input type="text" id="inp-project-name" placeholder="e.g. Reef's Bar Mitzva Photos" style="width:100%; max-width:400px; margin-top:4px; padding:8px 12px; border:1px solid #e2e8f0; border-radius:6px; font-size:.9em;" oninput="validateProjectName()">
+        <div id="project-name-error" style="color:#e53e3e; font-size:.8em; margin-top:4px; display:none;">Project name is required</div>
+    </div>
+
     <div style="display:flex; gap:20px; margin-bottom:15px; flex-wrap:wrap;">
         <div style="background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; padding:15px; flex:1; min-width:150px; text-align:center;">
             <div style="font-size:1.8em; font-weight:bold; color:#2b6cb0;" id="cat-total-count">0</div>
@@ -2025,11 +2348,11 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     </div>
 
     <div style="margin-bottom:12px;">
-        <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:.85em; color:#4a5568; font-weight:600;">
+        <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:.85em; color:#4a5568; font-weight:600; white-space:nowrap;">
             <input type="checkbox" id="chk-unlimited" onchange="toggleUnlimited(this.checked)">
             Select all matching media (no count limit)
+            <span style="font-weight:400; font-size:.88em; color:#a0aec0;">— Selects every image/video that matches your face reference</span>
         </label>
-        <span style="font-size:.75em; color:#a0aec0; margin-left:4px;">Selects every image/video that matches your face reference</span>
     </div>
 
     <table class="analysis-table" id="cat-table">
@@ -2087,6 +2410,29 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     </div>
 
     <div id="face-persons"></div>
+
+    <div id="face-match-mode" style="display:none; margin:16px 0; padding:14px 18px; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px;">
+        <div style="font-weight:600; font-size:.9em; color:#2d3748; margin-bottom:4px; display:flex; align-items:center; gap:6px;">Face matching mode <span style="color:#e53e3e;">*</span>
+            <span style="position:relative; display:inline-flex; cursor:help;" id="face-mode-info">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#718096" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                <span style="display:none; position:absolute; left:24px; top:-8px; width:320px; padding:10px 14px; background:#2d3748; color:#fff; font-size:.8em; font-weight:400; border-radius:6px; line-height:1.5; z-index:10; box-shadow:0 4px 12px rgba(0,0,0,.2); pointer-events:none;" id="face-mode-tooltip">
+                    <strong>Any person:</strong> A photo is included if it contains at least one of the people you added. Good for collecting all photos of each person separately.<br><br>
+                    <strong>All people together:</strong> A photo is only included if every person appears in it. Great for finding group shots where everyone is together.
+                </span>
+            </span>
+        </div>
+        <table style="border-collapse:collapse;">
+            <tr>
+                <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="face-match" value="any" checked style="margin:0; cursor:pointer;"></td>
+                <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true"><strong style="color:#4a5568;">Any person</strong> <span style="color:#a0aec0;">— At least one appears</span></td>
+            </tr>
+            <tr>
+                <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="face-match" value="all" style="margin:0; cursor:pointer;"></td>
+                <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true"><strong style="color:#4a5568;">All together</strong> <span style="color:#a0aec0;">— Everyone must appear</span></td>
+            </tr>
+        </table>
+        <div id="face-match-people" style="margin-top:8px; font-size:.8em; color:#718096;"></div>
+    </div>
 
     <div class="btn-group" id="face-verify-btn-group" style="display:none;">
         <button class="btn btn-primary" onclick="runVerifyAll()">Verify All Faces</button>
@@ -2465,6 +2811,11 @@ async function completeStep0() {
 
 // ── Step 1: Categories ──
 function loadCategoriesStep() {
+    // Populate project name from config
+    var nameInp = document.getElementById('inp-project-name');
+    if (config && config.project_name) {
+        nameInp.value = config.project_name;
+    }
     const cats = config?.categories || [];
     renderCategories(cats);
 }
@@ -2530,6 +2881,16 @@ function removeCategory(i) {
 }
 
 async function completeCategoriesStep() {
+    // Validate project name
+    var projName = document.getElementById('inp-project-name').value.trim();
+    if (!projName) {
+        validateProjectName();
+        document.getElementById('inp-project-name').focus();
+        return;
+    }
+    if (!config) config = {};
+    config.project_name = projName;
+
     // Ensure all categories have an id
     if (config?.categories) {
         config.categories.forEach((c, i) => {
@@ -2619,6 +2980,20 @@ function renderFacePersons(faces) {
 
     // Load thumbnails for each person
     faces.forEach(f => loadFaceThumbs(f.name));
+
+    // Show face match mode selector when multiple persons have photos
+    var personsWithPhotos = faces.filter(f => f.photo_count > 0);
+    var matchArea = document.getElementById('face-match-mode');
+    if (personsWithPhotos.length > 1) {
+        matchArea.style.display = 'block';
+        var names = personsWithPhotos.map(function(f) { return f.name.charAt(0).toUpperCase() + f.name.slice(1); });
+        document.getElementById('face-match-people').textContent = 'People: ' + names.join(', ');
+        updateMatchModeStyle();
+    } else if (personsWithPhotos.length === 1) {
+        matchArea.style.display = 'none';
+    } else {
+        matchArea.style.display = 'none';
+    }
 }
 
 let faceVerifyCache = {};
@@ -2972,6 +3347,25 @@ async function runVerifyAll() {
     }
 }
 
+// Info tooltip hover
+(function() {
+    var info = document.getElementById('face-mode-info');
+    var tip = document.getElementById('face-mode-tooltip');
+    if (info && tip) {
+        info.addEventListener('mouseenter', function() { tip.style.display = 'block'; });
+        info.addEventListener('mouseleave', function() { tip.style.display = 'none'; });
+    }
+})();
+
+function updateMatchModeStyle() {
+    // No visual highlight — just the radio button selection is enough
+}
+
+function getFaceMatchMode() {
+    var radio = document.querySelector('input[name="face-match"]:checked');
+    return radio ? radio.value : 'any';
+}
+
 function skipFaces() {
     config.face_names = [];
     fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
@@ -2983,7 +3377,9 @@ async function completeFacesStep() {
     // Get list of persons with faces
     const res = await fetch('/api/ref-faces');
     const faces = await res.json();
-    const personNames = faces.filter(f => f.photo_count > 0).map(f => f.name);
+    const personsWithPhotos = faces.filter(f => f.photo_count > 0);
+
+    var personNames = personsWithPhotos.map(f => f.name);
 
     if (personNames.length > 0) {
         if (!facesVerified) {
@@ -3000,8 +3396,10 @@ async function completeFacesStep() {
             if (!confirm('Some face references need more photos for reliable recognition. Proceed anyway?')) return;
         }
         config.face_names = personNames;
+        config.face_match_mode = personNames.length > 1 ? getFaceMatchMode() : 'any';
     } else {
         config.face_names = [];
+        config.face_match_mode = 'any';
     }
 
     await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
@@ -3474,12 +3872,53 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbo
 
 // ── Projects drawer ──
 function toggleDrawer() {
-    document.getElementById('side-drawer').classList.toggle('open');
-    document.getElementById('drawer-backdrop').classList.toggle('open');
-    if (document.getElementById('side-drawer').classList.contains('open')) {
+    var drawer = document.getElementById('side-drawer');
+    var backdrop = document.getElementById('drawer-backdrop');
+    var toggle = document.getElementById('rail-toggle');
+    drawer.classList.toggle('open');
+    backdrop.classList.toggle('open');
+    if (toggle) toggle.classList.toggle('active', drawer.classList.contains('open'));
+    if (drawer.classList.contains('open')) {
         loadProjectList();
         loadUserInfo();
     }
+}
+
+function openDrawerToProjects() {
+    var drawer = document.getElementById('side-drawer');
+    if (!drawer.classList.contains('open')) toggleDrawer();
+    // Expand projects section
+    document.getElementById('projects-section').style.display = 'block';
+    document.getElementById('projects-arrow').style.transform = 'rotate(180deg)';
+}
+
+function toggleProjectsSection() {
+    var sec = document.getElementById('projects-section');
+    var arrow = document.getElementById('projects-arrow');
+    if (sec.style.display === 'none') {
+        sec.style.display = 'block';
+        arrow.style.transform = 'rotate(180deg)';
+        loadProjectList();
+    } else {
+        sec.style.display = 'none';
+        arrow.style.transform = '';
+    }
+}
+
+function toggleCleanupSection() {
+    var sec = document.getElementById('cleanup-section');
+    var arrow = document.getElementById('cleanup-arrow');
+    if (sec.style.display === 'none') {
+        sec.style.display = 'block';
+        arrow.style.transform = 'rotate(180deg)';
+    } else {
+        sec.style.display = 'none';
+        arrow.style.transform = '';
+    }
+}
+
+function openPhoneImages() {
+    alert('Phone Images feature coming soon!\\nConnect your phone via USB to manage and clean up photos directly.');
 }
 
 async function loadUserInfo() {
@@ -3502,8 +3941,9 @@ async function loadProjectList() {
     const el = document.getElementById('project-list');
     try {
         const res = await fetch('/api/projects');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         const projects = await res.json();
-        if (!projects.length) {
+        if (!Array.isArray(projects) || !projects.length) {
             el.innerHTML = '<div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">No saved projects yet.</div>';
             return;
         }
@@ -3522,6 +3962,12 @@ async function loadProjectList() {
             metaDiv.textContent = info + (modified ? ' | ' + modified : '');
             var actDiv = document.createElement('div');
             actDiv.className = 'p-actions';
+            var renBtn = document.createElement('button');
+            renBtn.className = 'p-del';
+            renBtn.style.color = '#2b6cb0';
+            renBtn.textContent = 'Rename';
+            renBtn.onclick = function(e) { e.stopPropagation(); renameProject(p.dir_name, p.name); };
+            actDiv.appendChild(renBtn);
             var delBtn = document.createElement('button');
             delBtn.className = 'p-del';
             delBtn.textContent = 'Delete';
@@ -3533,12 +3979,36 @@ async function loadProjectList() {
             el.appendChild(row);
         });
     } catch(e) {
-        el.innerHTML = '<div style="padding:18px; color:#e53e3e; font-size:.85em;">Error loading projects</div>';
+        console.error('loadProjectList error:', e);
+        el.innerHTML = '<div style="padding:18px; color:#e53e3e; font-size:.85em;">Error loading projects: ' + e.message + '</div>';
     }
 }
 
+async function autoSaveDraft() {
+    // Auto-save current work as a draft with date-based name
+    try {
+        var cfg = await (await fetch('/api/config')).json();
+        var hasWork = cfg && (cfg.event_type || cfg.sources && cfg.sources.length > 0);
+        if (!hasWork) return; // Nothing to save
+
+        var now = new Date();
+        var draftName = 'Draft - ' + now.toLocaleDateString() + ' ' + now.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        var projectName = cfg.project_name || draftName;
+        if (!cfg.project_name) projectName = draftName;
+
+        await fetch('/api/projects/save', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name: projectName, step: currentStep })
+        });
+    } catch(e) { /* silent */ }
+}
+
 async function saveCurrentProject() {
-    var name = prompt('Project name:');
+    var projectName = '';
+    if (config && config.project_name) {
+        projectName = config.project_name;
+    }
+    var name = prompt('Project name:', projectName);
     if (!name || !name.trim()) return;
     showLoader('project-list', 'Saving...');
     try {
@@ -3578,15 +4048,16 @@ async function loadProject(dirName) {
 }
 
 async function newProject() {
-    if (!confirm('Start a new project? Current unsaved progress will be lost.')) return;
-    showLoader('project-list', 'Creating new project...');
+    if (!confirm('Start a new project? Your current work will be saved as a draft.')) return;
     try {
+        await autoSaveDraft();
         await fetch('/api/projects/new', { method: 'POST' });
-        toggleDrawer();
+        if (document.getElementById('side-drawer').classList.contains('open')) toggleDrawer();
         config = null;
         selectedTemplate = null;
         faceVerifyCache = {};
         replacedPhotos = {};
+        document.getElementById('inp-project-name').value = '';
         await loadTemplates();
         goStep(0);
     } catch(e) { alert('Error: ' + e.message); }
@@ -3598,6 +4069,32 @@ async function deleteProject(dirName, displayName) {
         await fetch('/api/projects/' + encodeURIComponent(dirName), { method: 'DELETE' });
         await loadProjectList();
     } catch(e) { alert('Delete failed: ' + e.message); }
+}
+
+async function renameProject(dirName, currentName) {
+    var newName = prompt('Rename project:', currentName);
+    if (!newName || !newName.trim() || newName.trim() === currentName) return;
+    try {
+        var res = await fetch('/api/projects/' + encodeURIComponent(dirName) + '/rename', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ name: newName.trim() })
+        });
+        var data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        await loadProjectList();
+    } catch(e) { alert('Rename failed: ' + e.message); }
+}
+
+function validateProjectName() {
+    var inp = document.getElementById('inp-project-name');
+    var err = document.getElementById('project-name-error');
+    if (inp.value.trim()) {
+        err.style.display = 'none';
+        inp.style.borderColor = '#e2e8f0';
+    } else {
+        err.style.display = 'block';
+        inp.style.borderColor = '#e53e3e';
+    }
 }
 
 // ── Tutorial system ──
@@ -3622,9 +4119,9 @@ const TOUR_STEPS = [
         position: 'bottom'
     },
     {
-        target: '.menu-btn',
+        target: '#icon-rail',
         title: 'Side Menu',
-        text: 'Access your saved projects, start a new project, replay this tutorial, or sign out from here.',
+        text: 'Quick access to projects, cleanup tools, phone images, tutorial, and more. Click any icon or open the full menu.',
         position: 'right'
     },
     {
@@ -3785,6 +4282,239 @@ async function loadGreeting() {
             }
         }
     } catch(e) {}
+}
+
+// ── Cleanup Tool ──
+var cleanupOffset = 0;
+var cleanupImages = [];
+
+async function openCleanup() {
+    await autoSaveDraft();
+    document.getElementById('cleanup-overlay').classList.add('active');
+    cleanupOffset = 0;
+    cleanupImages = [];
+    populateCleanupCategories();
+    loadCleanupImages();
+    updateTrashBadge();
+}
+
+function closeCleanup() {
+    document.getElementById('cleanup-overlay').classList.remove('active');
+}
+
+async function populateCleanupCategories() {
+    try {
+        var res = await fetch('/api/categories/summary');
+        var data = await res.json();
+        var sel = document.getElementById('cleanup-filter-cat');
+        sel.innerHTML = '<option value="">All Categories</option>';
+        (data.categories || []).forEach(function(c) {
+            var opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.display || c.id;
+            sel.appendChild(opt);
+        });
+    } catch(e) {}
+}
+
+async function loadCleanupImages() {
+    cleanupOffset = 0;
+    cleanupImages = [];
+    var grid = document.getElementById('cleanup-grid');
+    grid.innerHTML = '<div style="grid-column:1/-1; text-align:center; color:#a0aec0; padding:40px;"><span style="display:inline-block;width:18px;height:18px;border:3px solid #bee3f8;border-top:3px solid #3182ce;border-radius:50%;animation:spinA .7s linear infinite;vertical-align:middle;margin-right:8px;"></span>Loading...</div>';
+    await fetchCleanupPage();
+}
+
+async function fetchCleanupPage() {
+    var cat = document.getElementById('cleanup-filter-cat').value;
+    var status = document.getElementById('cleanup-filter-status').value;
+    var media = document.getElementById('cleanup-filter-media').value;
+    var trashOnly = document.getElementById('cleanup-show-trash').checked;
+
+    var params = new URLSearchParams({offset: cleanupOffset, limit: 200});
+    if (cat) params.set('category', cat);
+    if (status) params.set('status', status);
+    if (media) params.set('media_type', media);
+    if (trashOnly) params.set('trash', '1');
+
+    try {
+        var res = await fetch('/api/cleanup/images?' + params.toString());
+        var data = await res.json();
+        var grid = document.getElementById('cleanup-grid');
+
+        if (cleanupOffset === 0) grid.innerHTML = '';
+
+        if (data.images.length === 0 && cleanupOffset === 0) {
+            grid.innerHTML = '<div style="grid-column:1/-1; text-align:center; color:#a0aec0; padding:40px;">No images found. Run a scan first or adjust filters.</div>';
+        }
+
+        data.images.forEach(function(img) {
+            cleanupImages.push(img);
+            var card = document.createElement('div');
+            card.className = 'cleanup-card' + (img.trash ? ' trashed' : '');
+            card.dataset.hash = img.hash;
+
+            var isVid = img.media_type === 'video';
+            var thumbSrc = img.thumb ? ('data:image/jpeg;base64,' + img.thumb) : '';
+            var vidBadge = isVid ? '<div style="position:absolute;top:4px;right:4px;background:rgba(0,0,0,.7);color:#fff;font-size:.65em;padding:2px 6px;border-radius:3px;">VID</div>' : '';
+
+            var imgEl = document.createElement('div');
+            imgEl.style.position = 'relative';
+            var pic = document.createElement('img');
+            pic.src = thumbSrc;
+            pic.alt = '';
+            pic.style.cssText = 'width:100%;height:130px;object-fit:cover;display:block;';
+            pic.onerror = function() { this.style.background = '#edf2f7'; };
+            imgEl.appendChild(pic);
+            if (isVid) {
+                var vb = document.createElement('div');
+                vb.style.cssText = 'position:absolute;top:4px;right:4px;background:rgba(0,0,0,.7);color:#fff;font-size:.65em;padding:2px 6px;border-radius:3px;';
+                vb.textContent = 'VID';
+                imgEl.appendChild(vb);
+            }
+            var infoEl = document.createElement('div');
+            infoEl.className = 'card-info';
+            infoEl.textContent = img.filename;
+            card.appendChild(imgEl);
+            card.appendChild(infoEl);
+
+            card.onclick = function() { toggleCleanupTrash(img.hash, card); };
+            grid.appendChild(card);
+        });
+
+        var loadMore = document.getElementById('cleanup-load-more');
+        if (data.total > cleanupOffset + 200) {
+            loadMore.style.display = 'block';
+            cleanupOffset += 200;
+        } else {
+            loadMore.style.display = 'none';
+        }
+    } catch(e) {
+        document.getElementById('cleanup-grid').innerHTML = '<div style="grid-column:1/-1; text-align:center; color:#e53e3e; padding:40px;">Failed to load images.</div>';
+    }
+}
+
+function loadCleanupMore() {
+    fetchCleanupPage();
+}
+
+async function toggleCleanupTrash(hash, card) {
+    var isTrash = card.classList.contains('trashed');
+    var endpoint = isTrash ? '/api/cleanup/unmark-trash' : '/api/cleanup/mark-trash';
+    try {
+        await fetch(endpoint, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({hashes: [hash]})
+        });
+        card.classList.toggle('trashed');
+        updateTrashBadge();
+    } catch(e) {}
+}
+
+async function updateTrashBadge() {
+    try {
+        var res = await fetch('/api/cleanup/trash-count');
+        var data = await res.json();
+        var badge = document.getElementById('cleanup-trash-badge');
+        var reviewBtn = document.getElementById('btn-review-trash');
+        var bar = document.getElementById('cleanup-bottom-bar');
+        var barCount = document.getElementById('cleanup-bar-count');
+        var barSize = document.getElementById('cleanup-bar-size');
+
+        if (data.count > 0) {
+            badge.textContent = data.count + ' in trash';
+            badge.style.display = 'inline-block';
+            reviewBtn.style.display = 'inline-block';
+            bar.style.display = 'flex';
+            barCount.textContent = data.count + ' item' + (data.count !== 1 ? 's' : '') + ' in trash';
+            barSize.textContent = data.size_mb > 0 ? '(' + data.size_mb + ' MB)' : '';
+        } else {
+            badge.style.display = 'none';
+            reviewBtn.style.display = 'none';
+            bar.style.display = 'none';
+        }
+    } catch(e) {}
+}
+
+function showCleanupTrash() {
+    document.getElementById('cleanup-show-trash').checked = true;
+    loadCleanupImages();
+}
+
+function cleanupSelectAll() {
+    var cards = document.querySelectorAll('#cleanup-grid .cleanup-card:not(.trashed)');
+    var hashes = [];
+    cards.forEach(function(c) { hashes.push(c.dataset.hash); });
+    if (hashes.length === 0) return;
+    if (!confirm('Mark ' + hashes.length + ' visible images for trash?')) return;
+    fetch('/api/cleanup/mark-trash', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({hashes: hashes})
+    }).then(function() {
+        cards.forEach(function(c) { c.classList.add('trashed'); });
+        updateTrashBadge();
+    });
+}
+
+function cleanupDeselectAll() {
+    var cards = document.querySelectorAll('#cleanup-grid .cleanup-card.trashed');
+    var hashes = [];
+    cards.forEach(function(c) { hashes.push(c.dataset.hash); });
+    if (hashes.length === 0) return;
+    fetch('/api/cleanup/unmark-trash', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({hashes: hashes})
+    }).then(function() {
+        cards.forEach(function(c) { c.classList.remove('trashed'); });
+        updateTrashBadge();
+    });
+}
+
+function cleanupClearTrash() {
+    fetch('/api/cleanup/images?trash=1&limit=99999').then(function(r) { return r.json(); }).then(function(data) {
+        var hashes = data.images.map(function(i) { return i.hash; });
+        if (hashes.length === 0) return;
+        return fetch('/api/cleanup/unmark-trash', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({hashes: hashes})
+        });
+    }).then(function() {
+        loadCleanupImages();
+        updateTrashBadge();
+    });
+}
+
+async function cleanupConfirmRecycle() {
+    var res = await fetch('/api/cleanup/trash-count');
+    var data = await res.json();
+    if (data.count === 0) { alert('No items in trash.'); return; }
+    if (!confirm('Move ' + data.count + ' file' + (data.count !== 1 ? 's' : '') + ' (' + data.size_mb + ' MB) to the Recycle Bin?\\n\\nYou can recover them from the Recycle Bin if needed.')) return;
+
+    var btn = document.querySelector('#cleanup-bottom-bar .btn[style*="e53e3e"]');
+    btn.disabled = true;
+    btn.textContent = 'Moving...';
+
+    try {
+        var r = await fetch('/api/cleanup/confirm-trash', { method: 'POST' });
+        var result = await r.json();
+        if (result.ok) {
+            var msg = result.recycled + ' file' + (result.recycled !== 1 ? 's' : '') + ' moved to Recycle Bin.';
+            if (result.failed > 0) msg += '\\n' + result.failed + ' failed.';
+            alert(msg);
+            loadCleanupImages();
+            updateTrashBadge();
+        } else {
+            alert('Error: ' + (result.error || 'Unknown'));
+        }
+    } catch(e) {
+        alert('Failed to recycle files.');
+    }
+    btn.disabled = false;
+    btn.textContent = 'Move to Recycle Bin';
 }
 
 // ── Init ──

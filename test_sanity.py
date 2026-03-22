@@ -210,6 +210,115 @@ class TestWizardUI:
         html = resp.data.decode()
         assert "Sign Out" in html or "logout" in html.lower()
 
+    def test_icon_rail_present(self, authed_client):
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        assert "icon-rail" in html
+
+    def test_cleanup_tool_in_sidebar(self, authed_client):
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        assert "Cleanup" in html
+
+    def test_cleanup_section_in_sidebar(self, authed_client):
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        assert "Cleanup" in html
+
+    def test_phone_images_in_sidebar(self, authed_client):
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        assert "Phone Images" in html
+
+
+# ── JavaScript syntax validation ─────────────────────────────────────────────
+
+class TestJavaScript:
+    def test_js_syntax_valid(self, authed_client):
+        """Extract all JS from the page and validate syntax with node --check."""
+        import subprocess
+        import tempfile
+
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+
+        # Extract all <script> blocks
+        js_blocks = []
+        start = 0
+        while True:
+            s = html.find("<script>", start)
+            if s == -1:
+                break
+            e = html.find("</script>", s)
+            if e == -1:
+                break
+            js_blocks.append(html[s + 8:e])
+            start = e + 9
+
+        assert js_blocks, "No <script> blocks found in page"
+        full_js = "\n".join(js_blocks)
+
+        with tempfile.NamedTemporaryFile(suffix=".js", mode="w", encoding="utf-8", delete=False) as f:
+            f.write(full_js)
+            tmp_path = f.name
+
+        try:
+            result = subprocess.run(
+                ["node", "--check", tmp_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, (
+                f"JavaScript syntax error:\n{result.stderr}"
+            )
+        except FileNotFoundError:
+            pytest.skip("Node.js not installed — cannot validate JS syntax")
+        finally:
+            os.unlink(tmp_path)
+
+    def test_js_key_functions_exist(self, authed_client):
+        """Verify critical JS functions are present (not broken by syntax errors)."""
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        functions = [
+            "toggleDrawer", "loadTemplates", "startScan", "goStep",
+            "showTaskOverlay", "startTutorial", "loadGreeting",
+            "openCleanup", "closeCleanup", "cleanupConfirmRecycle",
+            "toggleProjectsSection", "toggleCleanupSection",
+            "updateMatchModeStyle", "getFaceMatchMode",
+            "openDrawerToProjects", "openPhoneImages",
+        ]
+        for fn in functions:
+            assert f"function {fn}" in html, (
+                f"JS function '{fn}' not found — possible syntax error breaking the script"
+            )
+
+    def test_no_nested_quote_issues(self, authed_client):
+        """Check for common nested quote patterns that break JS in Python triple-quoted strings."""
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+
+        # Find all <script> content
+        scripts = []
+        start = 0
+        while True:
+            s = html.find("<script>", start)
+            if s == -1:
+                break
+            e = html.find("</script>", s)
+            scripts.append(html[s + 8:e])
+            start = e + 9
+
+        js = "\n".join(scripts)
+
+        # Pattern: onclick="...='...'" — single quotes nested in single quotes inside double quotes
+        # This is hard to catch generically, but we can check for common broken patterns
+        import re
+        # Look for onerror="...='...'" or onclick="...='...'" with unescaped nested quotes
+        broken = re.findall(r"""onerror=["'].*?=\s*'[^"']*'[^"']*["']""", js)
+        for match in broken:
+            # If quotes are unbalanced, it's a problem
+            assert match.count("'") % 2 == 0, f"Possible nested quote issue: {match}"
+
 
 # ── API endpoints ────────────────────────────────────────────────────────────
 
@@ -701,6 +810,30 @@ class TestProjectSaveLoad:
     def test_save_project_missing_name(self, authed_client):
         resp = authed_client.post("/api/projects/save", json={"name": ""})
         assert resp.status_code == 400
+
+    def test_rename_project(self, authed_client):
+        """Save a project, rename it, verify new name in list."""
+        authed_client.post("/api/config", json={"event_type": "wedding", "sources": ["/tmp/rn"]})
+        authed_client.post("/api/projects/save", json={"name": "Before Rename", "step": 1})
+
+        resp = authed_client.post("/api/projects/Before Rename/rename", json={"name": "After Rename"})
+        assert resp.status_code == 200
+        assert resp.get_json()["name"] == "After Rename"
+
+        # Verify in list
+        projects = authed_client.get("/api/projects").get_json()
+        names = [p["name"] for p in projects]
+        assert "After Rename" in names
+
+    def test_rename_project_missing_name(self, authed_client):
+        """Rename with empty name should fail."""
+        resp = authed_client.post("/api/projects/Before Rename/rename", json={"name": ""})
+        assert resp.status_code == 400
+
+    def test_rename_nonexistent_project(self, authed_client):
+        """Rename a project that doesn't exist should 404."""
+        resp = authed_client.post("/api/projects/nonexistent_xyz_999/rename", json={"name": "Foo"})
+        assert resp.status_code == 404
 
 
 # ── Report generation ────────────────────────────────────────────────────────
@@ -1202,6 +1335,139 @@ class TestResilience:
             if backup and os.path.isfile(backup):
                 shutil.copy2(backup, app_module.SCAN_DB_PATH)
                 os.remove(backup)
+
+
+# ── Cleanup / Trash ──────────────────────────────────────────────────────────
+
+class TestCleanup:
+    def _inject_test_image(self, client, hash_id="cleanup_hash"):
+        import app as app_module
+        db = app_module.load_scan_db() or {"images": [], "config": {}}
+        db["images"] = [e for e in db.get("images", []) if e["hash"] != hash_id]
+        db["images"].append({
+            "hash": hash_id,
+            "path": "/tmp/cleanup_test.jpg",
+            "filename": "cleanup_test.jpg",
+            "media_type": "image",
+            "status": "candidate",
+            "category": "test",
+            "size_kb": 512,
+        })
+        app_module.save_scan_db(db)
+
+    def _remove_test_image(self, hash_id="cleanup_hash"):
+        import app as app_module
+        db = app_module.load_scan_db() or {"images": [], "config": {}}
+        db["images"] = [e for e in db["images"] if e["hash"] != hash_id]
+        app_module.save_scan_db(db)
+
+    def test_cleanup_images_list(self, authed_client):
+        resp = authed_client.get("/api/cleanup/images")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "images" in data
+        assert "total" in data
+
+    def test_mark_trash(self, authed_client):
+        self._inject_test_image(authed_client)
+        resp = authed_client.post("/api/cleanup/mark-trash", json={
+            "hashes": ["cleanup_hash"],
+        })
+        assert resp.status_code == 200
+        assert resp.get_json().get("marked") == 1
+
+        # Verify trash flag
+        import app as app_module
+        db = app_module.load_scan_db()
+        entry = next(i for i in db["images"] if i["hash"] == "cleanup_hash")
+        assert entry.get("trash") is True
+
+    def test_trash_count(self, authed_client):
+        resp = authed_client.get("/api/cleanup/trash-count")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["count"] >= 1
+        assert "size_mb" in data
+
+    def test_trash_filter(self, authed_client):
+        resp = authed_client.get("/api/cleanup/images?trash=1")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["total"] >= 1
+        assert all(i.get("trash") for i in data["images"])
+
+    def test_unmark_trash(self, authed_client):
+        resp = authed_client.post("/api/cleanup/unmark-trash", json={
+            "hashes": ["cleanup_hash"],
+        })
+        assert resp.status_code == 200
+        assert resp.get_json().get("unmarked") == 1
+
+        import app as app_module
+        db = app_module.load_scan_db()
+        entry = next(i for i in db["images"] if i["hash"] == "cleanup_hash")
+        assert entry.get("trash") is False
+
+    def test_confirm_trash_with_missing_file(self, authed_client):
+        """Confirm trash when file doesn't exist — should still remove from DB."""
+        self._inject_test_image(authed_client, "cleanup_gone")
+        authed_client.post("/api/cleanup/mark-trash", json={
+            "hashes": ["cleanup_gone"],
+        })
+
+        resp = authed_client.post("/api/cleanup/confirm-trash")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data.get("ok")
+        assert data.get("recycled") >= 1
+
+        # Entry should be removed from DB
+        import app as app_module
+        db = app_module.load_scan_db()
+        hashes = [i["hash"] for i in db["images"]]
+        assert "cleanup_gone" not in hashes
+
+    def test_confirm_trash_real_file(self, authed_client, tmp_path):
+        """Confirm trash with a real file — should send to recycle bin."""
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+
+        import app as app_module
+
+        img_path = tmp_path / "trash_me.jpg"
+        Image.new("RGB", (10, 10), "red").save(str(img_path))
+
+        db = app_module.load_scan_db() or {"images": [], "config": {}}
+        db["images"] = [e for e in db["images"] if e["hash"] != "real_trash"]
+        db["images"].append({
+            "hash": "real_trash",
+            "path": str(img_path).replace("\\", "/"),
+            "filename": "trash_me.jpg",
+            "media_type": "image",
+            "status": "candidate",
+            "category": "test",
+            "trash": True,
+            "size_kb": 1,
+        })
+        app_module.save_scan_db(db)
+
+        resp = authed_client.post("/api/cleanup/confirm-trash")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data.get("ok")
+        assert data.get("recycled") >= 1
+
+        # File should be gone from original location
+        assert not os.path.exists(str(img_path))
+
+    def test_mark_trash_empty_hashes(self, authed_client):
+        resp = authed_client.post("/api/cleanup/mark-trash", json={"hashes": []})
+        assert resp.status_code == 400
+
+    def test_cleanup_finish(self, authed_client):
+        self._remove_test_image("cleanup_hash")
 
 
 if __name__ == "__main__":
