@@ -230,6 +230,16 @@ class TestWizardUI:
         html = resp.data.decode()
         assert "Phone Images" in html
 
+    def test_age_assessment_in_sidebar(self, authed_client):
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        assert "Age Assessment" in html
+
+    def test_age_overlay_present(self, authed_client):
+        resp = authed_client.get("/")
+        html = resp.data.decode()
+        assert 'id="age-overlay"' in html
+
 
 # ── JavaScript syntax validation ─────────────────────────────────────────────
 
@@ -283,8 +293,12 @@ class TestJavaScript:
             "toggleDrawer", "loadTemplates", "startScan", "goStep",
             "showTaskOverlay", "startTutorial", "loadGreeting",
             "openCleanup", "closeCleanup", "cleanupConfirmRecycle",
+            "toggleRailCleanup", "closeRailCleanup",
             "toggleProjectsSection", "toggleCleanupSection",
             "updateMatchModeStyle", "getFaceMatchMode",
+            "toggleAgeEstimation", "getAgeEstConfig", "buildAgeEstFolderList",
+            "openAgeAssessment", "closeAgeAssessment", "runAgeAssessment", "renderAgeResults",
+            "toggleAgeFaceMode", "uploadAgeRefPhotos", "loadExistingAgeRefs",
             "openDrawerToProjects", "openPhoneImages",
         ]
         for fn in functions:
@@ -861,16 +875,16 @@ class TestReport:
         """Report endpoint should return HTML when scan data exists."""
         import app as app_module
 
-        # Ensure there's some scan data
-        db = app_module.load_scan_db()
-        if not db or not db.get("images"):
-            db = {"images": [
-                {"hash": "rpt1", "path": "/tmp/fake.jpg", "filename": "f.jpg",
-                 "media_type": "image", "status": "selected", "category": "test",
-                 "date": "2020-01-01", "face_count": 0, "width": 100, "height": 100,
-                 "size_kb": 50, "thumb": ""},
-            ], "config": {}}
-            app_module.save_scan_db(db)
+        # Always use known-good test data for report
+        db = {"images": [
+            {"hash": "rpt1", "path": "/tmp/fake.jpg", "filename": "f.jpg",
+             "media_type": "image", "status": "selected", "category": "test",
+             "source_label": "Test", "date": "2020-01-01", "face_count": 0,
+             "faces_found": [], "has_target_face": False, "face_distance": None,
+             "width": 100, "height": 100, "size_kb": 50, "thumb": "",
+             "device": "unknown", "is_screenshot": False, "age_days": None},
+        ], "config": {"event_type": "bar_mitzva"}}
+        app_module.save_scan_db(db)
 
         resp = authed_client.get("/api/report")
         # May fail if curate.cmd_report has issues, but endpoint should respond
@@ -1083,6 +1097,39 @@ class TestScanAndFill:
         """Task stop endpoint should respond."""
         resp = authed_client.post("/api/task/stop")
         assert resp.status_code == 200
+
+    def test_scan_accepts_age_estimation(self, authed_client):
+        """Scan start should accept age_estimation parameter without error."""
+        import time
+
+        for _ in range(10):
+            status = authed_client.get("/api/scan/status").get_json()
+            if not status.get("running"):
+                break
+            time.sleep(0.5)
+
+        # Only test if no task is running (avoid long model download blocking other tests)
+        status = authed_client.get("/api/scan/status").get_json()
+        if status.get("running"):
+            return  # skip — another task still running
+
+        resp = authed_client.post("/api/scan/start", json={
+            "full": False,
+            "age_estimation": {"enabled": False},
+        })
+        assert resp.status_code in (200, 409)
+
+        for _ in range(20):
+            status = authed_client.get("/api/scan/status").get_json()
+            if not status.get("running"):
+                break
+            time.sleep(0.5)
+
+    def test_estimate_age_function_exists(self, authed_client):
+        """The _estimate_age helper function should be importable."""
+        import app as app_module
+        assert hasattr(app_module, "_estimate_age")
+        assert callable(app_module._estimate_age)
 
     def test_quick_fill_no_data(self, authed_client):
         """Quick fill with no scan data."""

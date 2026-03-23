@@ -138,6 +138,25 @@ def _check_nsfw(fpath, classifier):
         return False, []
 
 
+def _estimate_age(fpath):
+    """Estimate the age of the primary face in an image using DeepFace.
+    Returns estimated age (int) or None on failure."""
+    try:
+        from deepface import DeepFace
+        results = DeepFace.analyze(
+            img_path=fpath, actions=["age"],
+            enforce_detection=False, silent=True,
+            detector_backend="opencv",
+        )
+        if isinstance(results, list) and results:
+            return results[0].get("age")
+        elif isinstance(results, dict):
+            return results.get("age")
+    except Exception:
+        pass
+    return None
+
+
 def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
     """Fast face detection: auto-rotate + resize to 800px max.
     Returns (face_count, faces_found, ok, best_distance).
@@ -317,6 +336,7 @@ def api_scan_start():
 
     full = request.json.get("full", False) if request.json else False
     nsfw_filter = request.json.get("nsfw_filter", False) if request.json else False
+    age_estimation = request.json.get("age_estimation", None) if request.json else None
 
     def run_scan():
         try:
@@ -396,6 +416,42 @@ def api_scan_start():
                 _finish_task("Cancelled")
                 return
 
+            # Age estimation setup
+            age_est_enabled = False
+            age_est_scope = "all"
+            age_est_folders = []
+            if age_estimation and age_estimation.get("enabled"):
+                try:
+                    from deepface import DeepFace
+                    _update_task("Loading age estimation model (first run may download ~500 MB)...")
+                    # Warm up the model with a dummy analysis
+                    import numpy as np
+                    _dummy = np.zeros((100, 100, 3), dtype=np.uint8)
+                    try:
+                        DeepFace.analyze(_dummy, actions=["age"], enforce_detection=False, silent=True)
+                    except Exception:
+                        pass
+                    age_est_enabled = True
+                    age_est_scope = age_estimation.get("scope", "all")
+                    age_est_folders = [f.replace("\\", "/") for f in age_estimation.get("folders", [])]
+                    _update_task("Age estimation model ready.")
+                except ImportError:
+                    _update_task("deepface not installed — installing...")
+                    import subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "deepface", "tf-keras"], stdout=subprocess.DEVNULL)
+                    from deepface import DeepFace
+                    age_est_enabled = True
+                    age_est_scope = age_estimation.get("scope", "all")
+                    age_est_folders = [f.replace("\\", "/") for f in age_estimation.get("folders", [])]
+                    _update_task("Age estimation installed and ready.")
+                except Exception as e:
+                    _update_task(f"Age estimation failed to load: {e}. Continuing without it.")
+
+            if _is_cancelled():
+                _update_task("Stopped by user.")
+                _finish_task("Cancelled")
+                return
+
             # Existing DB for incremental
             existing_db = {}
             if os.path.isfile(SCAN_DB_PATH) and not full:
@@ -421,8 +477,12 @@ def api_scan_start():
                     _update_task("Stopped by user.")
                     _finish_task("Cancelled")
                     return
-                src_path = source.get("path", "")
-                src_label = source.get("label", "Unknown")
+                if isinstance(source, str):
+                    src_path = source
+                    src_label = os.path.basename(source) or source
+                else:
+                    src_path = source.get("path", "")
+                    src_label = source.get("label", "Unknown")
 
                 if not os.path.isdir(src_path):
                     _update_task(f"Source not found: {src_label}")
@@ -521,6 +581,23 @@ def api_scan_start():
                                     entry["status"] = "rejected"
                                     entry["reject_reason"] = "nsfw"
 
+                            # Age estimation on cached entries if enabled and not yet done
+                            if (age_est_enabled
+                                and "estimated_age" not in entry
+                                and entry.get("has_target_face")
+                                and entry.get("media_type") != "video"
+                                and entry.get("status") != "rejected"):
+                                run_age = False
+                                if age_est_scope == "all":
+                                    run_age = True
+                                elif age_est_scope == "folders":
+                                    src_norm = src_path.replace("\\", "/")
+                                    run_age = src_norm in age_est_folders
+                                if run_age:
+                                    est = _estimate_age(fpath)
+                                    if est is not None:
+                                        entry["estimated_age"] = est
+
                             all_images.append(entry)
                             src_count += 1
                             continue
@@ -611,6 +688,19 @@ def api_scan_start():
                             entry["nsfw"] = is_nsfw
                             if is_nsfw:
                                 entry["nsfw_labels"] = nsfw_labels
+
+                        # Age estimation
+                        if age_est_enabled and not is_video and entry["has_target_face"]:
+                            run_age = False
+                            if age_est_scope == "all":
+                                run_age = True
+                            elif age_est_scope == "folders":
+                                src_norm = src_path.replace("\\", "/")
+                                run_age = src_norm in age_est_folders
+                            if run_age:
+                                est = _estimate_age(fpath)
+                                if est is not None:
+                                    entry["estimated_age"] = est
 
                         if nsfw_classifier and entry.get("nsfw"):
                             entry["status"] = "rejected"
@@ -1090,18 +1180,21 @@ def api_export():
                 label += f" + {vid_count} videos"
             _update_task(f"Exporting {label}...")
 
+            skipped = 0
             for i, img in enumerate(images):
                 if _is_cancelled():
                     _update_task("Stopped by user.")
                     _finish_task("Cancelled")
                     return
-                cat = img.get("category", "uncategorized")
-                dest_dir = os.path.join(output_dir, cat)
-                os.makedirs(dest_dir, exist_ok=True)
 
                 src = img["path"].replace("/", os.sep)
                 if not os.path.isfile(src):
+                    skipped += 1
                     continue
+
+                cat = img.get("category", "uncategorized")
+                dest_dir = os.path.join(output_dir, cat)
+                os.makedirs(dest_dir, exist_ok=True)
 
                 dest = os.path.join(dest_dir, img["filename"])
                 if os.path.exists(dest):
@@ -1117,7 +1210,10 @@ def api_export():
                 if (i + 1) % 50 == 0:
                     _update_task(f"Exported {exported}/{total}...")
 
-            _update_task(f"Done! {exported} files exported to {output_dir}")
+            msg = f"Done! {exported} files exported to {output_dir}"
+            if skipped:
+                msg += f" ({skipped} skipped — source files not found, check if all drives are connected)"
+            _update_task(msg)
             _finish_task()
 
         except Exception as e:
@@ -1569,15 +1665,21 @@ def api_projects_list():
 
 @app.route("/api/projects/save", methods=["POST"])
 def api_projects_save():
-    """Save current state as a project. Expects {name, step}."""
+    """Save current state as a project. Expects {name, step, overwrite?}."""
     data = request.json or {}
     raw_name = data.get("name", "").strip()
     if not raw_name:
         return jsonify({"error": "Project name is required"}), 400
 
     step = data.get("step", 0)
+    allow_overwrite = data.get("overwrite", False)
     dir_name = _safe_project_name(raw_name)
     pdir = os.path.join(PROJECTS_DIR, dir_name)
+
+    # Check for duplicate name
+    if os.path.isdir(pdir) and not allow_overwrite:
+        return jsonify({"error": "A project with this name already exists. Choose a different name."}), 409
+
     os.makedirs(pdir, exist_ok=True)
 
     # Save meta
@@ -1841,6 +1943,159 @@ def api_cleanup_confirm_trash():
     })
 
 
+# ── Age Assessment (standalone) ──────────────────────────────────────────────
+
+@app.route("/api/age-assess/start", methods=["POST"])
+def api_age_assess_start():
+    """Run age assessment as a standalone background task on selected folders."""
+    if _task["running"]:
+        return jsonify({"error": "A task is already running"}), 409
+
+    data = request.json or {}
+    folders = data.get("folders", [])
+    if not folders:
+        return jsonify({"error": "No folders selected"}), 400
+    face_mode = data.get("face_mode", "all")  # "all" or "specific"
+    person_name = data.get("person_name", "")
+
+    def run_age_assess():
+        try:
+            _reset_task("age_assess")
+            _update_task("Loading age estimation model (first run may download ~500 MB)...")
+
+            from deepface import DeepFace
+            import numpy as np
+
+            # Warm up
+            _dummy = np.zeros((100, 100, 3), dtype=np.uint8)
+            try:
+                DeepFace.analyze(_dummy, actions=["age"], enforce_detection=False, silent=True)
+            except Exception:
+                pass
+            _update_task("Model ready.")
+
+            if _is_cancelled():
+                _finish_task("Cancelled")
+                return
+
+            # Load face references if specific person mode
+            ref_encodings = {}
+            use_face_filter = False
+            if face_mode == "specific" and person_name:
+                from curate import load_reference_faces
+                face_dir = os.path.join(PROJECT_DIR, "ref_faces")
+                if os.path.isdir(face_dir):
+                    _update_task(f"Loading face references for {person_name}...")
+                    ref_encodings = load_reference_faces(face_dir)
+                    if person_name in ref_encodings:
+                        use_face_filter = True
+                        _update_task(f"Face references loaded for {person_name}.")
+                    else:
+                        _update_task(f"No face reference found for '{person_name}'. Running on all faces.")
+
+            from curate import IMAGE_EXTS, file_hash, make_thumbnail_b64
+
+            results = []
+            total_files = 0
+            processed = 0
+            face_matched = 0
+
+            # Count files first
+            for folder in folders:
+                if os.path.isdir(folder):
+                    for dp, dn, fns in os.walk(folder):
+                        for fn in fns:
+                            if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
+                                total_files += 1
+
+            _update_task(f"Found {total_files} images to analyze...")
+
+            for folder in folders:
+                if not os.path.isdir(folder):
+                    _update_task(f"Folder not found: {folder}")
+                    continue
+
+                folder_label = os.path.basename(folder) or folder
+
+                for dp, dn, fns in os.walk(folder):
+                    for fn in fns:
+                        if _is_cancelled():
+                            _finish_task("Cancelled")
+                            return
+
+                        ext = os.path.splitext(fn)[1].lower()
+                        if ext not in IMAGE_EXTS:
+                            continue
+
+                        fpath = os.path.join(dp, fn)
+                        processed += 1
+
+                        if processed % 10 == 0:
+                            _update_task(f"Analyzing {processed}/{total_files} — {len(results)} faces aged...")
+
+                        # If specific person, check face first
+                        if use_face_filter:
+                            fc, ff, ok, dist = _fast_face_detect(
+                                fpath, ref_encodings, [person_name], 0.6)
+                            if person_name not in ff:
+                                continue
+                            face_matched += 1
+
+                        est = _estimate_age(fpath)
+                        if est is not None:
+                            thumb = make_thumbnail_b64(fpath, 120)
+                            fh = file_hash(fpath)
+                            results.append({
+                                "path": fpath.replace("\\", "/"),
+                                "filename": fn,
+                                "folder": folder_label,
+                                "hash": fh,
+                                "estimated_age": est,
+                                "person": person_name if use_face_filter else None,
+                                "thumb": thumb,
+                            })
+
+            # Also store results in scan_db entries if they exist
+            db = load_scan_db()
+            if db:
+                result_map = {r["hash"]: r["estimated_age"] for r in results}
+                updated = 0
+                for img in db.get("images", []):
+                    if img["hash"] in result_map and "estimated_age" not in img:
+                        img["estimated_age"] = result_map[img["hash"]]
+                        updated += 1
+                if updated > 0:
+                    save_scan_db(db)
+                    _update_task(f"Updated {updated} entries in scan database.")
+
+            # Save results to a temp file for the UI to fetch
+            results_path = os.path.join(PROJECT_DIR, "age_results.json")
+            with open(results_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False)
+
+            msg = f"Done! Estimated age for {len(results)} images out of {processed} analyzed."
+            if use_face_filter:
+                msg += f" ({face_matched} photos matched {person_name})"
+            _update_task(msg)
+            _finish_task()
+
+        except Exception as e:
+            _finish_task(str(e))
+
+    threading.Thread(target=run_age_assess, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/age-assess/results")
+def api_age_assess_results():
+    """Return saved age assessment results."""
+    results_path = os.path.join(PROJECT_DIR, "age_results.json")
+    if not os.path.isfile(results_path):
+        return jsonify([])
+    with open(results_path, "r", encoding="utf-8") as f:
+        return jsonify(json.load(f))
+
+
 # ── Serve UI ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -1998,7 +2253,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
 /* ── Side menu (projects) ── */
 /* ── Icon rail (always visible) ── */
-#icon-rail { position:fixed; top:0; left:0; width:48px; height:100%; background:#fff; z-index:1100; display:flex; flex-direction:column; align-items:center; padding:10px 0; border-right:1px solid #e2e8f0; box-shadow:1px 0 6px rgba(0,0,0,.04); }
+#icon-rail { position:fixed; top:0; left:0; width:48px; height:100%; background:#fff; z-index:10000; display:flex; flex-direction:column; align-items:center; padding:10px 0; border-right:1px solid #e2e8f0; box-shadow:1px 0 6px rgba(0,0,0,.04); }
 #icon-rail .rail-btn { width:36px; height:36px; border:none; background:none; border-radius:8px; cursor:pointer; display:flex; align-items:center; justify-content:center; color:#718096; transition:all .15s; position:relative; margin-bottom:4px; }
 #icon-rail .rail-btn:hover { background:#ebf8ff; color:#2b6cb0; }
 #icon-rail .rail-btn.active { background:#ebf8ff; color:#2b6cb0; }
@@ -2009,13 +2264,24 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 #icon-rail .rail-divider { width:24px; height:1px; background:#e2e8f0; margin:6px 0; }
 .menu-btn { display:none; }
 /* ── Cleanup overlay ── */
-#cleanup-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:#f5f7fa; z-index:1300; overflow-y:auto; }
+#cleanup-overlay { display:none; position:fixed; top:0; left:48px; width:calc(100% - 48px); height:100%; background:#f5f7fa; z-index:1300; overflow-y:auto; }
 #cleanup-overlay.active { display:block; }
 #cleanup-overlay .cleanup-header { position:sticky; top:0; background:#fff; z-index:10; padding:16px 24px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 8px rgba(0,0,0,.05); }
 #cleanup-overlay .cleanup-header h2 { margin:0; color:#2d3748; font-size:1.3em; }
 #cleanup-overlay .cleanup-body { padding:20px 24px; max-width:1400px; margin:0 auto; }
 #cleanup-overlay .cleanup-filters { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
 #cleanup-overlay .cleanup-filters select, #cleanup-overlay .cleanup-filters input { padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:.85em; }
+#age-overlay { display:none; position:fixed; top:0; left:48px; width:calc(100% - 48px); height:100%; background:#f5f7fa; z-index:1300; overflow-y:auto; }
+#age-overlay.active { display:block; }
+#age-overlay .age-header { position:sticky; top:0; background:#fff; z-index:10; padding:16px 24px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 8px rgba(0,0,0,.05); }
+#age-overlay .age-header h2 { margin:0; color:#2d3748; font-size:1.3em; }
+#age-overlay .age-body { padding:20px 24px; max-width:1200px; margin:0 auto; }
+#age-overlay .age-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:12px; }
+#age-overlay .age-card { background:#fff; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden; text-align:center; transition:box-shadow .2s; }
+#age-overlay .age-card:hover { box-shadow:0 4px 12px rgba(0,0,0,.1); }
+#age-overlay .age-card img { width:100%; height:120px; object-fit:cover; }
+#age-overlay .age-card .age-info { padding:6px 8px; font-size:.78em; color:#4a5568; }
+#age-overlay .age-card .age-badge { display:inline-block; background:#ebf8ff; color:#2b6cb0; padding:2px 8px; border-radius:10px; font-weight:600; font-size:.85em; }
 .cleanup-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; }
 .cleanup-card { position:relative; border-radius:8px; overflow:hidden; cursor:pointer; border:2px solid transparent; transition:all .15s; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.08); }
 .cleanup-card:hover { box-shadow:0 2px 8px rgba(0,0,0,.15); }
@@ -2097,13 +2363,25 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         <span class="rail-tip">Saved Projects</span>
     </button>
     <div class="rail-divider"></div>
-    <button class="rail-btn" onclick="openCleanup()" title="Cleanup">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-        <span class="rail-tip">Cleanup Tool</span>
-    </button>
-    <button class="rail-btn" onclick="openPhoneImages()" title="Phone Images">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-        <span class="rail-tip">Phone Images</span>
+    <div style="position:relative;" id="rail-cleanup-group">
+        <button class="rail-btn" onclick="toggleRailCleanup()" title="Cleanup Assistant" id="rail-cleanup-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            <span class="rail-tip">Cleanup Assistant</span>
+        </button>
+        <div id="rail-cleanup-sub" style="display:none; position:absolute; left:46px; top:0; background:#fff; border:1px solid #e2e8f0; border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,.12); padding:6px; z-index:20; white-space:nowrap;">
+            <button onclick="openCleanup(); closeRailCleanup();" style="display:flex; align-items:center; gap:8px; width:100%; padding:8px 14px; border:none; background:none; cursor:pointer; border-radius:6px; font-size:.82em; color:#4a5568; text-align:left;" onmouseover="this.style.background='#ebf8ff'" onmouseout="this.style.background='none'">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                Hard Drives
+            </button>
+            <button onclick="openPhoneImages(); closeRailCleanup();" style="display:flex; align-items:center; gap:8px; width:100%; padding:8px 14px; border:none; background:none; cursor:pointer; border-radius:6px; font-size:.82em; color:#4a5568; text-align:left;" onmouseover="this.style.background='#ebf8ff'" onmouseout="this.style.background='none'">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+                Mobile Images
+            </button>
+        </div>
+    </div>
+    <button class="rail-btn" onclick="openAgeAssessment()" title="Age Assessment">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+        <span class="rail-tip">Age Assessment</span>
     </button>
     <div class="rail-spacer"></div>
     <div class="rail-divider"></div>
@@ -2170,6 +2448,14 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         </div>
     </div>
 
+    <!-- Age Assessment -->
+    <div style="border-bottom:1px solid #e2e8f0;">
+        <button onclick="toggleDrawer(); openAgeAssessment();" style="display:flex; align-items:center; gap:8px; padding:12px 18px; width:100%; border:none; background:none; cursor:pointer; font-weight:600; font-size:.9em; color:#2d3748; text-align:left;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+            Age Assessment
+        </button>
+    </div>
+
     <!-- Bottom actions -->
     <div style="flex:1;"></div>
     <div style="padding:12px 18px; border-top:1px solid #e2e8f0;">
@@ -2234,6 +2520,84 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         <div style="display:flex; gap:10px;">
             <button class="btn btn-secondary" onclick="cleanupClearTrash()">Clear All Trash Marks</button>
             <button class="btn" style="background:#e53e3e; color:#fff;" onclick="cleanupConfirmRecycle()">Move to Recycle Bin</button>
+        </div>
+    </div>
+</div>
+
+<!-- Age Assessment overlay -->
+<div id="age-overlay">
+    <div class="age-header">
+        <h2>Age Assessment</h2>
+        <div style="display:flex; gap:10px; align-items:center;">
+            <span id="age-status" style="font-size:.85em; color:#718096;"></span>
+            <button class="btn btn-secondary" onclick="closeAgeAssessment()" style="font-size:.85em;">Close</button>
+        </div>
+    </div>
+    <div class="age-body">
+        <p style="color:#4a5568; font-size:.9em; margin-bottom:16px;">Estimate the age of people in your photos using AI face analysis.</p>
+
+        <div id="age-setup" style="margin-bottom:20px;">
+            <!-- Step 1: Face mode -->
+            <div style="font-weight:600; font-size:.9em; color:#2d3748; margin-bottom:6px;">1. Who to analyze</div>
+            <div style="margin-bottom:12px;">
+                <table style="border-collapse:collapse;">
+                    <tr>
+                        <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="age-face-mode" value="all" checked style="margin:0; cursor:pointer;" onchange="toggleAgeFaceMode()"></td>
+                        <td style="padding:2px 0; font-size:.82em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true; toggleAgeFaceMode()"><strong style="color:#4a5568;">All faces</strong> <span style="color:#a0aec0;">— Estimate age for every face found in each image</span></td>
+                    </tr>
+                    <tr>
+                        <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="age-face-mode" value="specific" style="margin:0; cursor:pointer;" onchange="toggleAgeFaceMode()"></td>
+                        <td style="padding:2px 0; font-size:.82em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true; toggleAgeFaceMode()"><strong style="color:#4a5568;">Specific person</strong> <span style="color:#a0aec0;">— Only estimate age for a recognized person (requires reference photos)</span></td>
+                    </tr>
+                </table>
+            </div>
+
+            <!-- Face reference upload (shown only for specific person) -->
+            <div id="age-face-ref" style="display:none; margin-bottom:14px; padding:12px 16px; background:#f7fafc; border:1px solid #e2e8f0; border-radius:8px;">
+                <div style="font-weight:600; font-size:.85em; color:#2d3748; margin-bottom:6px;">Reference photos for recognition</div>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">
+                    <input type="text" id="age-ref-person-name" placeholder="Person name (e.g. Reef)" style="padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:.82em; max-width:180px;">
+                    <label class="btn btn-secondary" style="font-size:.8em; padding:6px 12px; margin:0; cursor:pointer;" for="age-ref-upload">+ Add Photos</label>
+                    <input type="file" id="age-ref-upload" multiple accept="image/*" style="display:none" onchange="uploadAgeRefPhotos(this.files)">
+                    <button class="btn btn-secondary" id="btn-age-verify" onclick="verifyAgeRefFaces()" style="font-size:.8em; padding:6px 12px; margin:0; display:none;">Verify Faces</button>
+                </div>
+                <div id="age-ref-status" style="font-size:.82em; color:#718096; margin-bottom:6px;"></div>
+                <div id="age-ref-thumbs" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;"></div>
+                <div id="age-verify-result" style="display:none; font-size:.82em; margin-bottom:8px; padding:8px 12px; border-radius:6px;"></div>
+                <div style="font-size:.75em; color:#a0aec0;">Upload 3-5 clear face photos from different angles. Verify before running.</div>
+                <div id="age-use-existing" style="margin-top:8px;"></div>
+            </div>
+
+            <!-- Step 2: Folders -->
+            <div style="font-weight:600; font-size:.9em; color:#2d3748; margin-bottom:6px;">2. Select folders to analyze</div>
+            <div id="age-folder-list" style="margin-bottom:12px;"></div>
+
+            <!-- Run -->
+            <div style="display:flex; gap:10px; align-items:center; margin-bottom:12px;">
+                <button class="btn btn-primary" id="btn-run-age" onclick="runAgeAssessment()">Run Age Assessment</button>
+                <button class="btn btn-secondary" id="btn-stop-age" onclick="stopAgeAssessment()" style="display:none;">Stop</button>
+            </div>
+            <div id="age-progress" style="display:none; padding:10px 14px; background:#f7fafc; border:1px solid #e2e8f0; border-radius:6px; font-size:.85em; color:#4a5568;"></div>
+        </div>
+
+        <div id="age-results" style="display:none;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <div style="font-weight:600; font-size:.95em; color:#2d3748;">Results <span id="age-result-count" style="font-weight:400; color:#718096;"></span></div>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <label style="font-size:.8em; color:#4a5568;">Sort:</label>
+                    <select id="age-sort" onchange="renderAgeResults()" style="padding:4px 8px; border:1px solid #e2e8f0; border-radius:5px; font-size:.8em;">
+                        <option value="age-asc">Age (youngest first)</option>
+                        <option value="age-desc">Age (oldest first)</option>
+                        <option value="name">Person name</option>
+                        <option value="date">Photo date</option>
+                    </select>
+                    <label style="font-size:.8em; color:#4a5568;">Filter person:</label>
+                    <select id="age-filter-person" onchange="renderAgeResults()" style="padding:4px 8px; border:1px solid #e2e8f0; border-radius:5px; font-size:.8em;">
+                        <option value="">All</option>
+                    </select>
+                </div>
+            </div>
+            <div id="age-grid" class="age-grid"></div>
         </div>
     </div>
 </div>
@@ -2459,6 +2823,26 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         </label>
     </div>
 
+    <div style="margin-bottom:10px;">
+        <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; font-size:.8em; color:#4a5568; font-weight:600; white-space:nowrap;">
+            <input type="checkbox" id="chk-age-estimation" onchange="toggleAgeEstimation(this.checked)">
+            Estimate age from faces <span style="font-weight:400; color:#a0aec0;">(AI age detection — helps sort undated photos, first run downloads ~500 MB model)</span>
+        </label>
+        <div id="age-est-options" style="display:none; margin-top:8px; margin-left:22px;">
+            <table style="border-collapse:collapse;">
+                <tr>
+                    <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="age-est-scope" value="all" checked style="margin:0; cursor:pointer;"></td>
+                    <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true"><strong style="color:#4a5568;">All scanned images</strong> <span style="color:#a0aec0;">— Estimate age on every photo with a recognized face</span></td>
+                </tr>
+                <tr>
+                    <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="age-est-scope" value="folders" style="margin:0; cursor:pointer;"></td>
+                    <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true; showAgeEstFolders()"><strong style="color:#4a5568;">Specific folders only</strong> <span style="color:#a0aec0;">— Choose which source folders to run age estimation on</span></td>
+                </tr>
+            </table>
+            <div id="age-est-folders" style="display:none; margin-top:6px; text-align:left;"></div>
+        </div>
+    </div>
+
     <div class="btn-group">
         <button class="btn btn-primary" id="btn-start-scan" onclick="startScan(false)">Start Scan</button>
         <button class="btn btn-secondary" onclick="startScan(true)">Full Rescan</button>
@@ -2515,9 +2899,9 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
                     <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="saveTarget()">Set</button>
                 </div>
             </div>
-            <div id="sel-filter-bar" style="display:none; margin-bottom:8px; font-size:.85em;">
-                <label style="margin-right:8px;">
-                    <input type="checkbox" id="sel-show-selected" checked onchange="renderSelGrid()"> Show selected
+            <div id="sel-filter-bar" style="display:none; margin-bottom:8px; font-size:.85em; align-items:center; gap:10px;">
+                <label style="display:inline-flex; align-items:center; gap:4px; margin:0; cursor:pointer; font-size:1em; color:#4a5568;">
+                    <input type="checkbox" id="sel-show-selected" checked onchange="renderSelGrid()" style="margin:0;"> Show selected
                 </label>
                 <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="selectAllVisible()">Select All</button>
                 <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="deselectAllVisible()">Deselect All</button>
@@ -2670,6 +3054,7 @@ function goStep(n) {
     });
 
     if (n === 1) loadCategoriesStep();
+    if (n === 2) renderSources();
     if (n === 3) loadFaceStep();
     if (n === 4) checkExistingScan();
     if (n === 5) runAnalysis();
@@ -2906,14 +3291,39 @@ async function completeCategoriesStep() {
 // ── Step 2: Sources ──
 function renderSources() {
     const list = document.getElementById('source-list');
-    const sources = config?.sources || [];
-    list.innerHTML = sources.map((s, i) => `
-        <div class="source-item">
-            <input type="text" value="${s.label || ''}" placeholder="Label" style="max-width:150px" onchange="updateSource(${i},'label',this.value)">
-            <input type="text" value="${s.path || ''}" placeholder="Full path to folder (e.g. D:\\\\Photos)" onchange="updateSource(${i},'path',this.value)">
-            <span class="remove" onclick="removeSource(${i})">&times;</span>
-        </div>
-    `).join('');
+    if (!config) config = { sources: [] };
+    if (!config.sources) config.sources = [];
+    // Normalize: convert plain strings to {path, label} objects
+    config.sources = config.sources.map(function(s, i) {
+        if (typeof s === 'string') return { path: s, label: 'Source ' + (i + 1) };
+        return s;
+    });
+    var sources = config.sources;
+    list.innerHTML = '';
+    sources.forEach(function(s, i) {
+        var lbl = s.label || ('Source ' + (i + 1));
+        var row = document.createElement('div');
+        row.className = 'source-item';
+        var lblInput = document.createElement('input');
+        lblInput.type = 'text';
+        lblInput.value = lbl;
+        lblInput.placeholder = 'Source ' + (i + 1);
+        lblInput.style.maxWidth = '150px';
+        lblInput.onchange = function() { updateSource(i, 'label', this.value); };
+        var pathInput = document.createElement('input');
+        pathInput.type = 'text';
+        pathInput.value = s.path || '';
+        pathInput.placeholder = 'Full path to folder (e.g. D:\\Photos)';
+        pathInput.onchange = function() { updateSource(i, 'path', this.value); };
+        var removeSpan = document.createElement('span');
+        removeSpan.className = 'remove';
+        removeSpan.innerHTML = '&times;';
+        removeSpan.onclick = function() { removeSource(i); };
+        row.appendChild(lblInput);
+        row.appendChild(pathInput);
+        row.appendChild(removeSpan);
+        list.appendChild(row);
+    });
 }
 
 function addSource() {
@@ -2933,6 +3343,12 @@ function updateSource(i, field, value) {
 }
 
 async function completeStep2() {
+    // Fill in empty labels before saving
+    if (config && config.sources) {
+        config.sources.forEach(function(s, i) {
+            if (!s.label || !s.label.trim()) s.label = 'Source ' + (i + 1);
+        });
+    }
     await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
 
     document.querySelectorAll('.step-dot')[2].classList.add('done');
@@ -3006,41 +3422,104 @@ async function loadFaceThumbs(person) {
     if (!container) return;
     const statuses = faceVerifyCache[person] || {};
     const replaced = replacedPhotos[person] || new Set();
-    container.innerHTML = photos.map(p => {
-        const st = statuses[p.filename];
-        const isReplaced = replaced.has(p.filename) && !st;
-        const border = st === 'ok' || st === 'ok_multi' ? '3px solid #4caf50' : st === 'no_face' || st === 'encode_fail' || st === 'error' ? '3px solid #f44336' : isReplaced ? '3px dashed #dd6b20' : '2px solid #cbd5e0';
-        const label = st === 'no_face' ? '\\u2718' : st === 'ok' || st === 'ok_multi' ? '\\u2714' : '';
-        const labelColor = st === 'ok' || st === 'ok_multi' ? '#4caf50' : '#f44336';
-        const safeFn = esc(p.filename).replace(/'/g, "\\\\'");
-        const safePerson = esc(person).replace(/'/g, "\\\\'");
-        let html = '<div style="display:inline-flex; flex-direction:column; align-items:center; gap:2px; margin-right:8px; margin-bottom:6px;">';
-        // Show "Verify" only on replaced images when at least one other image is already verified
-        const hasAnyVerified = Object.keys(statuses).length > 0;
+    container.innerHTML = '';
+    photos.forEach(function(p) {
+        var st = statuses[p.filename];
+        var isReplaced = replaced.has(p.filename) && !st;
+        var border = st === 'ok' || st === 'ok_multi' ? '3px solid #4caf50' : st === 'no_face' || st === 'encode_fail' || st === 'error' ? '3px solid #f44336' : isReplaced ? '3px dashed #dd6b20' : '2px solid #cbd5e0';
+        var hasAnyVerified = Object.keys(statuses).length > 0;
+
+        var wrap = document.createElement('div');
+        wrap.style.cssText = 'display:inline-flex; flex-direction:column; align-items:center; gap:2px; margin-right:8px; margin-bottom:6px;';
+
+        // Verify or Replace button
         if (isReplaced && hasAnyVerified) {
-            html += '<span onclick="verifySinglePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\')" style="font-size:.65em; color:#e53e3e; cursor:pointer; padding:1px 4px; background:#fff5f5; border:1px solid #fed7d7; border-radius:3px; white-space:nowrap;">Verify</span>';
+            var verifySpan = document.createElement('span');
+            verifySpan.textContent = 'Verify';
+            verifySpan.style.cssText = 'font-size:.65em; color:#e53e3e; cursor:pointer; padding:1px 4px; background:#fff5f5; border:1px solid #fed7d7; border-radius:3px; white-space:nowrap;';
+            (function(pn, fn) { verifySpan.onclick = function() { verifySinglePhoto(pn, fn); }; })(person, p.filename);
+            wrap.appendChild(verifySpan);
         } else {
-            html += '<label style="font-size:.65em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px; white-space:nowrap;" for="replace-' + person + '-' + p.filename + '">Replace</label>';
+            var replaceLabel = document.createElement('label');
+            replaceLabel.textContent = 'Replace';
+            replaceLabel.style.cssText = 'font-size:.65em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px; white-space:nowrap;';
+            replaceLabel.setAttribute('for', 'replace-' + person + '-' + p.filename);
+            wrap.appendChild(replaceLabel);
         }
-        html += '<input type="file" id="replace-' + person + '-' + p.filename + '" accept="image/*" style="display:none" onchange="replaceFacePhoto(\\'' + safePerson + '\\', \\'' + safeFn + '\\', this.files)">';
-        html += '<div style="position:relative;" id="face-img-' + person + '-' + p.filename.replace(/[^a-zA-Z0-9]/g,'-') + '" onmouseenter="this.querySelector(\\'.face-x\\').style.display=\\'flex\\'" onmouseleave="this.querySelector(\\'.face-x\\').style.display=\\'none\\'">';
+
+        // Hidden file input for replace
+        var fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.id = 'replace-' + person + '-' + p.filename;
+        fileInput.accept = 'image/*';
+        fileInput.style.display = 'none';
+        (function(pn, fn) { fileInput.onchange = function() { replaceFacePhoto(pn, fn, this.files); }; })(person, p.filename);
+        wrap.appendChild(fileInput);
+
+        // Image container
+        var imgDiv = document.createElement('div');
+        imgDiv.style.cssText = 'position:relative;';
+        imgDiv.id = 'face-img-' + person + '-' + p.filename.replace(/[^a-zA-Z0-9]/g, '-');
+        imgDiv.onmouseenter = function() { var x = this.querySelector('.face-x'); if (x) x.style.display = 'flex'; };
+        imgDiv.onmouseleave = function() { var x = this.querySelector('.face-x'); if (x) x.style.display = 'none'; };
+
         if (p.thumb) {
-            html += '<img src="data:image/jpeg;base64,' + p.thumb + '" style="width:70px; height:70px; object-fit:cover; border-radius:4px; border:' + border + '; cursor:pointer;" title="Double-click to enlarge" ondblclick="openLightbox(\\'' + safePerson + '\\', \\'' + safeFn + '\\')">';
+            var img = document.createElement('img');
+            img.src = 'data:image/jpeg;base64,' + p.thumb;
+            img.style.cssText = 'width:70px; height:70px; object-fit:cover; border-radius:4px; border:' + border + '; cursor:pointer;';
+            img.title = 'Double-click to enlarge';
+            (function(pn, fn) { img.ondblclick = function() { openLightbox(pn, fn); }; })(person, p.filename);
+            imgDiv.appendChild(img);
         } else {
-            html += '<div style="width:70px; height:70px; background:#e2e8f0; border-radius:4px; border:' + border + '; display:flex; align-items:center; justify-content:center; font-size:.7em; color:#718096;">' + esc(p.filename) + '</div>';
+            var placeholder = document.createElement('div');
+            placeholder.style.cssText = 'width:70px; height:70px; background:#e2e8f0; border-radius:4px; border:' + border + '; display:flex; align-items:center; justify-content:center; font-size:.7em; color:#718096;';
+            placeholder.textContent = p.filename;
+            imgDiv.appendChild(placeholder);
         }
-        html += '<span class="face-x remove-face-btn" data-person="' + esc(person) + '" data-filename="' + esc(p.filename) + '" style="display:none; position:absolute; top:-4px; right:-4px; width:18px; height:18px; background:#e53e3e; color:white; border-radius:50%; font-size:11px; align-items:center; justify-content:center; cursor:pointer; line-height:1; box-shadow:0 1px 3px rgba(0,0,0,.3);">&#x2715;</span>';
-        if (label) {
-            html += '<span style="position:absolute; bottom:1px; right:3px; font-size:14px; color:' + labelColor + '; text-shadow:0 0 3px #fff;">' + label + '</span>';
+
+        // Remove X button
+        var xBtn = document.createElement('span');
+        xBtn.className = 'face-x remove-face-btn';
+        xBtn.setAttribute('data-person', person);
+        xBtn.setAttribute('data-filename', p.filename);
+        xBtn.innerHTML = '&#x2715;';
+        xBtn.style.cssText = 'display:none; position:absolute; top:-4px; right:-4px; width:18px; height:18px; background:#e53e3e; color:white; border-radius:50%; font-size:11px; align-items:center; justify-content:center; cursor:pointer; line-height:1; box-shadow:0 1px 3px rgba(0,0,0,.3);';
+        imgDiv.appendChild(xBtn);
+
+        // Status label
+        if (st === 'no_face') {
+            var lbl = document.createElement('span');
+            lbl.innerHTML = '&#x2718;';
+            lbl.style.cssText = 'position:absolute; bottom:1px; right:3px; font-size:14px; color:#f44336; text-shadow:0 0 3px #fff;';
+            imgDiv.appendChild(lbl);
+        } else if (st === 'ok' || st === 'ok_multi') {
+            var lbl = document.createElement('span');
+            lbl.innerHTML = '&#x2714;';
+            lbl.style.cssText = 'position:absolute; bottom:1px; right:3px; font-size:14px; color:#4caf50; text-shadow:0 0 3px #fff;';
+            imgDiv.appendChild(lbl);
         }
-        html += '</div>';
-        html += '<div style="display:flex; gap:2px;">';
-        html += '<button onclick="rotateFace(\\'' + safePerson + '\\', \\'' + safeFn + '\\', \\'ccw\\')" style="font-size:.7em; padding:1px 5px; cursor:pointer; background:#edf2f7; border:1px solid #cbd5e0; border-radius:3px;" title="Rotate left">&#x21BA;</button>';
-        html += '<button onclick="rotateFace(\\'' + safePerson + '\\', \\'' + safeFn + '\\', \\'cw\\')" style="font-size:.7em; padding:1px 5px; cursor:pointer; background:#edf2f7; border:1px solid #cbd5e0; border-radius:3px;" title="Rotate right">&#x21BB;</button>';
-        html += '</div>';
-        html += '</div>';
-        return html;
-    }).join('');
+
+        wrap.appendChild(imgDiv);
+
+        // Rotate buttons
+        var rotDiv = document.createElement('div');
+        rotDiv.style.cssText = 'display:flex; gap:2px;';
+        var rotL = document.createElement('button');
+        rotL.innerHTML = '&#x21BA;';
+        rotL.title = 'Rotate left';
+        rotL.style.cssText = 'font-size:.7em; padding:1px 5px; cursor:pointer; background:#edf2f7; border:1px solid #cbd5e0; border-radius:3px;';
+        (function(pn, fn) { rotL.onclick = function() { rotateFace(pn, fn, 'ccw'); }; })(person, p.filename);
+        var rotR = document.createElement('button');
+        rotR.innerHTML = '&#x21BB;';
+        rotR.title = 'Rotate right';
+        rotR.style.cssText = 'font-size:.7em; padding:1px 5px; cursor:pointer; background:#edf2f7; border:1px solid #cbd5e0; border-radius:3px;';
+        (function(pn, fn) { rotR.onclick = function() { rotateFace(pn, fn, 'cw'); }; })(person, p.filename);
+        rotDiv.appendChild(rotL);
+        rotDiv.appendChild(rotR);
+        wrap.appendChild(rotDiv);
+
+        container.appendChild(wrap);
+    });
 
     // Add "Verify All Replaced" button if multiple unverified replacements
     const unverified = [...replaced].filter(fn => !statuses[fn]);
@@ -3428,12 +3907,72 @@ function toggleNsfwFilter(checked) {
     fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
 }
 
+function toggleAgeEstimation(checked) {
+    document.getElementById('age-est-options').style.display = checked ? 'block' : 'none';
+    if (checked) buildAgeEstFolderList();
+}
+
+function showAgeEstFolders() {
+    document.querySelector('input[name="age-est-scope"][value="folders"]').checked = true;
+    document.getElementById('age-est-folders').style.display = 'block';
+    buildAgeEstFolderList();
+}
+
+function buildAgeEstFolderList() {
+    var container = document.getElementById('age-est-folders');
+    var validSources = (config && config.sources) ? config.sources.filter(function(s) { return s.path && s.path.trim(); }) : [];
+    if (!validSources.length) {
+        container.innerHTML = '<div style="font-size:.8em; color:#a0aec0;">No sources configured yet.</div>';
+        return;
+    }
+    var tbl = document.createElement('table');
+    tbl.style.cssText = 'border-collapse:collapse;';
+    validSources.forEach(function(src) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td');
+        td1.style.cssText = 'padding:2px 6px 2px 0; vertical-align:middle;';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'age-est-folder-cb';
+        cb.value = src.path;
+        cb.checked = true;
+        cb.style.cssText = 'margin:0;';
+        td1.appendChild(cb);
+        var td2 = document.createElement('td');
+        td2.style.cssText = 'padding:2px 0; font-size:.8em; color:#4a5568;';
+        td2.textContent = src.path;
+        tr.appendChild(td1);
+        tr.appendChild(td2);
+        tbl.appendChild(tr);
+    });
+    container.innerHTML = '';
+    container.appendChild(tbl);
+    // Wire up radio buttons to toggle folder list visibility
+    document.querySelectorAll('input[name="age-est-scope"]').forEach(function(r) {
+        r.onchange = function() {
+            document.getElementById('age-est-folders').style.display = this.value === 'folders' ? 'block' : 'none';
+        };
+    });
+}
+
+function getAgeEstConfig() {
+    var chk = document.getElementById('chk-age-estimation');
+    if (!chk || !chk.checked) return null;
+    var scope = document.querySelector('input[name="age-est-scope"]:checked');
+    var result = { enabled: true, scope: scope ? scope.value : 'all' };
+    if (result.scope === 'folders') {
+        result.folders = [...document.querySelectorAll('.age-est-folder-cb:checked')].map(function(cb) { return cb.value; });
+    }
+    return result;
+}
+
 async function startScan(full) {
     var btn = document.getElementById('btn-start-scan');
     btn.disabled = true;
     btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid #bee3f8;border-top:2px solid #fff;border-radius:50%;animation:spinA .7s linear infinite;vertical-align:middle;margin-right:6px;"></span>Starting...';
     const nsfwFilter = document.getElementById('chk-nsfw-filter')?.checked || false;
-    await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full, nsfw_filter: nsfwFilter}) });
+    const ageEst = getAgeEstConfig();
+    await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full, nsfw_filter: nsfwFilter, age_estimation: ageEst}) });
     btn.disabled = false;
     btn.textContent = 'Start Scan';
     showTaskOverlay('scan');
@@ -3595,7 +4134,7 @@ async function selectCategory(catId) {
     document.getElementById('sel-cat-title').textContent = cat ? cat.display : catId;
     document.getElementById('sel-target-edit').style.display = 'flex';
     document.getElementById('sel-target-input').value = cat ? cat.target : 75;
-    document.getElementById('sel-filter-bar').style.display = 'block';
+    document.getElementById('sel-filter-bar').style.display = 'flex';
     await loadSelImages();
 }
 
@@ -3998,7 +4537,7 @@ async function autoSaveDraft() {
 
         await fetch('/api/projects/save', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ name: projectName, step: currentStep })
+            body: JSON.stringify({ name: projectName, step: currentStep, overwrite: true })
         });
     } catch(e) { /* silent */ }
 }
@@ -4010,14 +4549,18 @@ async function saveCurrentProject() {
     }
     var name = prompt('Project name:', projectName);
     if (!name || !name.trim()) return;
+    name = name.trim();
+    // Allow overwrite if saving with the same name as current project
+    var overwrite = (config && config.project_name && config.project_name === name);
     showLoader('project-list', 'Saving...');
     try {
         var res = await fetch('/api/projects/save', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ name: name.trim(), step: currentStep })
+            body: JSON.stringify({ name: name, step: currentStep, overwrite: overwrite })
         });
         var data = await res.json();
         if (data.error) { alert(data.error); return; }
+        if (config) config.project_name = name;
         await loadProjectList();
     } catch(e) { alert('Save failed: ' + e.message); }
 }
@@ -4288,6 +4831,28 @@ async function loadGreeting() {
 var cleanupOffset = 0;
 var cleanupImages = [];
 
+function toggleRailCleanup() {
+    var sub = document.getElementById('rail-cleanup-sub');
+    if (sub.style.display === 'none') {
+        sub.style.display = 'block';
+        document.addEventListener('click', _closeRailCleanupOutside, true);
+    } else {
+        closeRailCleanup();
+    }
+}
+
+function closeRailCleanup() {
+    document.getElementById('rail-cleanup-sub').style.display = 'none';
+    document.removeEventListener('click', _closeRailCleanupOutside, true);
+}
+
+function _closeRailCleanupOutside(e) {
+    var group = document.getElementById('rail-cleanup-group');
+    if (group && !group.contains(e.target)) {
+        closeRailCleanup();
+    }
+}
+
 async function openCleanup() {
     await autoSaveDraft();
     document.getElementById('cleanup-overlay').classList.add('active');
@@ -4515,6 +5080,433 @@ async function cleanupConfirmRecycle() {
     }
     btn.disabled = false;
     btn.textContent = 'Move to Recycle Bin';
+}
+
+// ── Age Assessment ──
+var ageResults = [];
+
+var ageRefPhotos = [];
+
+function openAgeAssessment() {
+    document.getElementById('age-overlay').classList.add('active');
+    buildAgeFolderList();
+    loadAgeResults();
+    toggleAgeFaceMode();
+    loadExistingAgeRefs();
+}
+
+function closeAgeAssessment() {
+    document.getElementById('age-overlay').classList.remove('active');
+}
+
+function toggleAgeFaceMode() {
+    var mode = document.querySelector('input[name="age-face-mode"]:checked');
+    document.getElementById('age-face-ref').style.display = (mode && mode.value === 'specific') ? 'block' : 'none';
+}
+
+var ageRefVerified = false;
+
+async function loadExistingAgeRefs() {
+    try {
+        var res = await fetch('/api/ref-faces');
+        var faces = await res.json();
+        var container = document.getElementById('age-use-existing');
+        if (!Array.isArray(faces) || !faces.length) { container.innerHTML = ''; return; }
+        var personsWithPhotos = faces.filter(function(f) { return f.photo_count > 0; });
+        if (!personsWithPhotos.length) { container.innerHTML = ''; return; }
+        container.innerHTML = '<div style="font-size:.8em; color:#718096; margin-bottom:4px;">Or use existing project references:</div>';
+        personsWithPhotos.forEach(function(f) {
+            var btn = document.createElement('button');
+            btn.className = 'btn btn-secondary';
+            btn.style.cssText = 'font-size:.78em; padding:4px 10px; margin:0 4px 4px 0;';
+            btn.textContent = f.name + ' (' + f.photo_count + ' photos)';
+            btn.onclick = function() {
+                document.getElementById('age-ref-person-name').value = f.name;
+                ageRefVerified = false;
+                loadAgeRefThumbs(f.name);
+            };
+            container.appendChild(btn);
+        });
+    } catch(e) {}
+}
+
+async function uploadAgeRefPhotos(files) {
+    var personName = document.getElementById('age-ref-person-name').value.trim();
+    if (!personName) { alert('Please enter the person name first.'); return; }
+
+    var status = document.getElementById('age-ref-status');
+    status.textContent = 'Uploading ' + files.length + ' photos...';
+
+    var fd = new FormData();
+    fd.append('person', personName);
+    for (var i = 0; i < files.length; i++) {
+        fd.append('photos', files[i]);
+    }
+    try {
+        await fetch('/api/ref-faces/upload', { method: 'POST', body: fd });
+    } catch(e) {}
+    document.getElementById('age-ref-upload').value = '';
+    ageRefVerified = false;
+    await loadAgeRefThumbs(personName);
+}
+
+async function loadAgeRefThumbs(personName) {
+    var thumbs = document.getElementById('age-ref-thumbs');
+    var status = document.getElementById('age-ref-status');
+    thumbs.innerHTML = '';
+    try {
+        var res = await fetch('/api/ref-faces/' + encodeURIComponent(personName) + '/photos');
+        var photos = await res.json();
+        if (!photos.length) {
+            status.textContent = 'No photos uploaded yet.';
+            document.getElementById('btn-age-verify').style.display = 'none';
+            return;
+        }
+        status.innerHTML = photos.length + ' photo(s) for <strong>' + esc(personName) + '</strong>';
+        document.getElementById('btn-age-verify').style.display = '';
+
+        photos.forEach(function(p) {
+            var wrap = document.createElement('div');
+            wrap.style.cssText = 'position:relative; display:inline-flex; flex-direction:column; align-items:center; gap:2px;';
+            wrap.setAttribute('data-filename', p.filename);
+
+            var imgDiv = document.createElement('div');
+            imgDiv.style.cssText = 'position:relative;';
+
+            if (p.thumb) {
+                var img = document.createElement('img');
+                img.src = 'data:image/jpeg;base64,' + p.thumb;
+                img.style.cssText = 'width:60px; height:60px; object-fit:cover; border-radius:4px; border:2px solid #cbd5e0;';
+                imgDiv.appendChild(img);
+            } else {
+                var placeholder = document.createElement('div');
+                placeholder.style.cssText = 'width:60px; height:60px; background:#e2e8f0; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:.65em; color:#718096;';
+                placeholder.textContent = p.filename;
+                imgDiv.appendChild(placeholder);
+            }
+
+            // Remove button (X)
+            var xBtn = document.createElement('span');
+            xBtn.textContent = '\u2715';
+            xBtn.style.cssText = 'position:absolute; top:-4px; right:-4px; width:16px; height:16px; background:#e53e3e; color:#fff; border-radius:50%; font-size:10px; display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,.3);';
+            xBtn.title = 'Remove';
+            (function(fn) {
+                xBtn.onclick = function() { removeAgeRefPhoto(personName, fn); };
+            })(p.filename);
+            imgDiv.appendChild(xBtn);
+
+            wrap.appendChild(imgDiv);
+
+            // Replace label
+            var replaceId = 'age-replace-' + p.filename.replace(/[^a-zA-Z0-9]/g, '-');
+            var repLabel = document.createElement('label');
+            repLabel.style.cssText = 'font-size:.6em; color:#3182ce; cursor:pointer; padding:1px 4px; background:#ebf8ff; border-radius:3px;';
+            repLabel.textContent = 'Replace';
+            repLabel.setAttribute('for', replaceId);
+            var repInput = document.createElement('input');
+            repInput.type = 'file';
+            repInput.accept = 'image/*';
+            repInput.id = replaceId;
+            repInput.style.display = 'none';
+            (function(fn) {
+                repInput.onchange = function() { replaceAgeRefPhoto(personName, fn, this.files); };
+            })(p.filename);
+            wrap.appendChild(repLabel);
+            wrap.appendChild(repInput);
+
+            thumbs.appendChild(wrap);
+        });
+    } catch(e) {
+        status.textContent = 'Error loading photos.';
+    }
+}
+
+async function removeAgeRefPhoto(personName, filename) {
+    await fetch('/api/ref-faces/' + encodeURIComponent(personName) + '/photo/' + encodeURIComponent(filename), { method: 'DELETE' });
+    ageRefVerified = false;
+    loadAgeRefThumbs(personName);
+}
+
+async function replaceAgeRefPhoto(personName, oldFilename, files) {
+    if (!files || !files.length) return;
+    // Delete old, upload new
+    await fetch('/api/ref-faces/' + encodeURIComponent(personName) + '/photo/' + encodeURIComponent(oldFilename), { method: 'DELETE' });
+    var fd = new FormData();
+    fd.append('person', personName);
+    fd.append('photos', files[0]);
+    await fetch('/api/ref-faces/upload', { method: 'POST', body: fd });
+    ageRefVerified = false;
+    loadAgeRefThumbs(personName);
+}
+
+async function verifyAgeRefFaces() {
+    var personName = document.getElementById('age-ref-person-name').value.trim();
+    if (!personName) { alert('Enter person name first.'); return; }
+
+    var resultDiv = document.getElementById('age-verify-result');
+    resultDiv.style.display = 'block';
+    resultDiv.style.background = '#f7fafc';
+    resultDiv.style.color = '#4a5568';
+    resultDiv.textContent = 'Verifying faces...';
+
+    try {
+        var res = await fetch('/api/ref-faces/verify', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({person: personName})
+        });
+        var data = await res.json();
+        var personResult = (data.persons && data.persons.length) ? data.persons.find(function(p) { return p.person === personName; }) : null;
+
+        // Apply green/red borders to thumbnails based on per-photo results
+        if (personResult && personResult.photos) {
+            personResult.photos.forEach(function(ph) {
+                var thumbs = document.getElementById('age-ref-thumbs');
+                if (!thumbs) return;
+                var wraps = thumbs.children;
+                for (var i = 0; i < wraps.length; i++) {
+                    var imgEl = wraps[i].querySelector('img');
+                    var placeholderEl = wraps[i].querySelector('div[style*="60px"]');
+                    var target = imgEl || placeholderEl;
+                    if (!target) continue;
+                    // Match by data-filename attribute
+                    if (wraps[i].getAttribute('data-filename') === ph.filename) {
+                        var isOk = (ph.status === 'ok' || ph.status === 'ok_multi');
+                        target.style.border = '3px solid ' + (isOk ? '#38a169' : '#e53e3e');
+                        break;
+                    }
+                }
+            });
+        }
+
+        if (data.ready || (personResult && personResult.ready)) {
+            resultDiv.style.background = '#f0fff4';
+            resultDiv.style.color = '#276749';
+            resultDiv.innerHTML = '<strong>Faces verified successfully.</strong> Ready to run age assessment.';
+            ageRefVerified = true;
+        } else if (personResult) {
+            var msg = personResult.issues && personResult.issues.length ? personResult.issues.join('. ') : 'Some photos may not have detectable faces. Try replacing them.';
+            resultDiv.style.background = personResult.ok_count > 0 ? '#fffbeb' : '#fff5f5';
+            resultDiv.style.color = personResult.ok_count > 0 ? '#92400e' : '#c53030';
+            resultDiv.innerHTML = '<strong>' + personResult.ok_count + '/' + personResult.total_photos + ' photos verified.</strong> ' + esc(msg);
+            ageRefVerified = false;
+        } else {
+            resultDiv.style.background = '#fff5f5';
+            resultDiv.style.color = '#c53030';
+            resultDiv.innerHTML = '<strong>No face data found.</strong> Upload reference photos and try again.';
+            ageRefVerified = false;
+        }
+    } catch(e) {
+        resultDiv.style.background = '#fff5f5';
+        resultDiv.style.color = '#c53030';
+        resultDiv.textContent = 'Verification failed: ' + e.message;
+        ageRefVerified = false;
+    }
+}
+
+function buildAgeFolderList() {
+    var container = document.getElementById('age-folder-list');
+    container.innerHTML = '';
+
+    // Checkboxes area (above input)
+    var cbArea = document.createElement('div');
+    cbArea.id = 'age-folder-cbs';
+    cbArea.style.cssText = 'margin-bottom:6px;';
+    container.appendChild(cbArea);
+
+    // Add source folders from config if available
+    if (config && config.sources && config.sources.length) {
+        config.sources.forEach(function(src) {
+            if (src.path && src.path.trim()) {
+                addAgeFolderCheckbox(src.path, false);
+            }
+        });
+    }
+
+    // Manual folder input row
+    var addRow = document.createElement('div');
+    addRow.style.cssText = 'display:flex; gap:8px; align-items:center;';
+    var inp = document.createElement('input');
+    inp.type = 'text';
+    inp.id = 'age-folder-input';
+    inp.placeholder = 'Enter folder path and click Add';
+    inp.style.cssText = 'flex:1; padding:6px 10px; border:1px solid #e2e8f0; border-radius:6px; font-size:.85em;';
+    var addBtn = document.createElement('button');
+    addBtn.className = 'btn btn-secondary';
+    addBtn.style.cssText = 'font-size:.8em; padding:6px 12px; margin:0;';
+    addBtn.textContent = 'Add Folder';
+    addBtn.onclick = function() {
+        var val = inp.value.trim();
+        if (val) { addAgeFolderCheckbox(val, true); inp.value = ''; }
+    };
+    addRow.appendChild(inp);
+    addRow.appendChild(addBtn);
+    container.appendChild(addRow);
+}
+
+function addAgeFolderCheckbox(path, checked) {
+    var cbArea = document.getElementById('age-folder-cbs');
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex; align-items:center; gap:6px; margin-bottom:3px;';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'age-folder-cb';
+    cb.value = path;
+    cb.checked = checked;
+    cb.style.cssText = 'margin:0; flex-shrink:0;';
+    row.appendChild(cb);
+    var txt = document.createElement('span');
+    txt.textContent = path;
+    txt.style.cssText = 'font-size:.82em; color:#4a5568;';
+    row.appendChild(txt);
+    cbArea.appendChild(row);
+}
+
+async function runAgeAssessment() {
+    var folders = [...document.querySelectorAll('.age-folder-cb:checked')].map(function(cb) { return cb.value; });
+    if (!folders.length) { alert('Please select at least one folder.'); return; }
+
+    var faceMode = document.querySelector('input[name="age-face-mode"]:checked');
+    var mode = faceMode ? faceMode.value : 'all';
+    var personName = '';
+    if (mode === 'specific') {
+        personName = document.getElementById('age-ref-person-name').value.trim();
+        if (!personName) { alert('Please enter a person name and upload reference photos.'); return; }
+    }
+
+    document.getElementById('btn-run-age').disabled = true;
+    document.getElementById('btn-run-age').textContent = 'Running...';
+    document.getElementById('btn-stop-age').style.display = '';
+    document.getElementById('age-progress').style.display = 'block';
+    document.getElementById('age-progress').textContent = 'Starting age assessment...';
+
+    try {
+        var res = await fetch('/api/age-assess/start', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ folders: folders, face_mode: mode, person_name: personName })
+        });
+        var data = await res.json();
+        if (data.error) {
+            document.getElementById('age-progress').textContent = 'Error: ' + data.error;
+            document.getElementById('btn-run-age').disabled = false;
+            document.getElementById('btn-run-age').textContent = 'Run Age Assessment';
+            document.getElementById('btn-stop-age').style.display = 'none';
+            return;
+        }
+        pollAgeProgress();
+    } catch(e) {
+        document.getElementById('age-progress').textContent = 'Failed to start: ' + e.message;
+        document.getElementById('btn-run-age').disabled = false;
+        document.getElementById('btn-run-age').textContent = 'Run Age Assessment';
+        document.getElementById('btn-stop-age').style.display = 'none';
+    }
+}
+
+function pollAgeProgress() {
+    var interval = setInterval(async function() {
+        try {
+            var res = await fetch('/api/scan/status');
+            var st = await res.json();
+            var prog = document.getElementById('age-progress');
+            if (st.lines && st.lines.length) {
+                prog.textContent = st.lines[st.lines.length - 1];
+            } else if (st.progress) {
+                prog.textContent = st.progress;
+            }
+            if (!st.running || st.done || st.error || st.cancelled) {
+                clearInterval(interval);
+                document.getElementById('btn-run-age').disabled = false;
+                document.getElementById('btn-run-age').textContent = 'Run Age Assessment';
+                document.getElementById('btn-stop-age').style.display = 'none';
+                if (st.error) {
+                    prog.textContent = 'Error: ' + st.error;
+                } else if (st.cancelled) {
+                    prog.textContent = 'Cancelled.';
+                }
+                loadAgeResults();
+            }
+        } catch(e) {
+            clearInterval(interval);
+        }
+    }, 1000);
+}
+
+async function stopAgeAssessment() {
+    await fetch('/api/task/stop', { method: 'POST' });
+    document.getElementById('btn-stop-age').style.display = 'none';
+}
+
+async function loadAgeResults() {
+    try {
+        var res = await fetch('/api/age-assess/results');
+        ageResults = await res.json();
+        if (ageResults.length) {
+            document.getElementById('age-results').style.display = 'block';
+            // Populate person filter
+            var personSet = new Set();
+            ageResults.forEach(function(r) {
+                if (r.person) personSet.add(r.person);
+            });
+            var sel = document.getElementById('age-filter-person');
+            sel.innerHTML = '<option value="">All</option>';
+            [...personSet].sort().forEach(function(p) {
+                var opt = document.createElement('option');
+                opt.value = p; opt.textContent = p;
+                sel.appendChild(opt);
+            });
+            renderAgeResults();
+        }
+    } catch(e) {}
+}
+
+function renderAgeResults() {
+    var sort = document.getElementById('age-sort').value;
+    var filterPerson = document.getElementById('age-filter-person').value;
+
+    var filtered = ageResults;
+    if (filterPerson) {
+        filtered = filtered.filter(function(r) { return r.person === filterPerson; });
+    }
+
+    var sorted = filtered.slice();
+    if (sort === 'age-asc') sorted.sort(function(a, b) { return a.estimated_age - b.estimated_age; });
+    else if (sort === 'age-desc') sorted.sort(function(a, b) { return b.estimated_age - a.estimated_age; });
+    else if (sort === 'name') sorted.sort(function(a, b) { return (a.person || '').localeCompare(b.person || ''); });
+    else if (sort === 'date') sorted.sort(function(a, b) { return (a.date || '').localeCompare(b.date || ''); });
+
+    document.getElementById('age-result-count').textContent = '(' + sorted.length + ' images)';
+
+    var grid = document.getElementById('age-grid');
+    grid.innerHTML = '';
+    sorted.forEach(function(r) {
+        var card = document.createElement('div');
+        card.className = 'age-card';
+        var img = document.createElement('img');
+        img.src = r.thumb ? 'data:image/jpeg;base64,' + r.thumb : '';
+        img.alt = r.filename;
+        img.onerror = function() { this.style.background = '#edf2f7'; this.style.minHeight = '80px'; };
+        card.appendChild(img);
+        var info = document.createElement('div');
+        info.className = 'age-info';
+        var badge = document.createElement('span');
+        badge.className = 'age-badge';
+        badge.textContent = 'Age ~' + r.estimated_age;
+        info.appendChild(badge);
+        var fn = document.createElement('div');
+        fn.style.cssText = 'margin-top:4px; font-size:.9em; color:#718096; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;';
+        fn.textContent = r.filename;
+        fn.title = r.path || r.filename;
+        info.appendChild(fn);
+        if (r.folder) {
+            var fld = document.createElement('div');
+            fld.style.cssText = 'font-size:.85em; color:#a0aec0;';
+            fld.textContent = r.folder;
+            info.appendChild(fld);
+        }
+        card.appendChild(info);
+        grid.appendChild(card);
+    });
 }
 
 // ── Init ──

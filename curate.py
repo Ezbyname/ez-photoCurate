@@ -46,7 +46,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -429,6 +429,7 @@ def make_video_thumbnail_b64(filepath, size=120):
 def make_thumbnail_b64(filepath, size=120):
     try:
         img = Image.open(filepath)
+        img = ImageOps.exif_transpose(img)
         img.thumbnail((size, size))
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
