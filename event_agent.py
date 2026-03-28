@@ -217,6 +217,17 @@ def compute_image_vector(image_path):
         return None
 
 
+def compute_phash(image_path, hash_size=16):
+    """Compute difference-hash for near-duplicate detection. Returns binary array."""
+    try:
+        img = Image.open(image_path).convert("L").resize((hash_size + 1, hash_size), Image.LANCZOS)
+        pixels = np.array(img, dtype=np.float64)
+        diff = pixels[:, 1:] > pixels[:, :-1]
+        return diff.flatten().astype(np.uint8)
+    except Exception:
+        return None
+
+
 # ── Analysis ──────────────────────────────────────────────────────────────────
 
 def load_scan_db(path=None):
@@ -513,12 +524,13 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
         # Face distance filtering — reject false positives
         if face_names:
             age_days_to = cat.get("age_days_to", 99999)
+            thresholds = config.get("face_distance_thresholds", {})
             if age_days_to <= 365:
-                max_dist = 0.45
+                max_dist = thresholds.get("infant", 0.45)
             elif age_days_to <= 1095:
-                max_dist = 0.50
+                max_dist = thresholds.get("toddler", 0.50)
             else:
-                max_dist = 0.55
+                max_dist = thresholds.get("default", 0.55)
             pool = [i for i in pool
                     if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
 
@@ -533,9 +545,36 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
         # Sort by score descending
         pool.sort(key=lambda x: x["_score"], reverse=True)
 
+        # Temporal balancing: interleave from different time periods
+        if strategy in ("balanced", "diverse") and len(pool) > target * 2:
+            dated = [img for img in pool if img.get("date")]
+            undated = [img for img in pool if not img.get("date")]
+            if len(dated) > target:
+                from collections import defaultdict as _dd
+                time_buckets = _dd(list)
+                for img in dated:
+                    month_key = img["date"][:7]  # YYYY-MM
+                    time_buckets[month_key].append(img)
+                # Round-robin from time buckets (each bucket already sorted by score)
+                bucket_keys = sorted(time_buckets.keys())
+                bucket_iters = {k: iter(time_buckets[k]) for k in bucket_keys}
+                reordered = []
+                while len(reordered) < len(dated):
+                    added = False
+                    for k in bucket_keys:
+                        try:
+                            reordered.append(next(bucket_iters[k]))
+                            added = True
+                        except StopIteration:
+                            continue
+                    if not added:
+                        break
+                pool = reordered + undated
+
         # Select with diversity filter
         selected = []
         selected_vectors = []
+        selected_phashes = []
 
         print(f"  {cat.get('display', cid)}: {len(pool)} candidates, target {target}...")
 
@@ -543,21 +582,55 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
             if len(selected) >= target:
                 break
 
-            # Diversity check via image vectors
+            # Diversity check via image vectors + perceptual hash
             if sim_threshold < 1.0 and selected_vectors:
                 vec = _get_or_compute_vector(img)
+                too_similar = False
                 if vec is not None:
                     mat = np.array(selected_vectors, dtype=np.float32)
                     sims = mat @ vec
                     if np.max(sims) >= sim_threshold:
-                        continue
+                        too_similar = True
+
+                # Also check perceptual hash (catches near-duplicates that vectors miss)
+                if not too_similar and selected_phashes:
+                    img_path = img.get("path", "").replace("/", os.sep)
+                    phash = img.get("_phash")
+                    if phash is None and img_path and os.path.isfile(img_path):
+                        phash = compute_phash(img_path)
+                        img["_phash"] = phash
+                    if phash is not None:
+                        for sp in selected_phashes:
+                            hamming = float(np.sum(phash != sp)) / len(phash)
+                            if hamming < 0.12:
+                                too_similar = True
+                                break
+
+                if too_similar:
+                    continue
+
+                if vec is not None:
                     selected_vectors.append(vec)
                 else:
                     selected_vectors.append(np.zeros(VECTOR_SIZE * VECTOR_SIZE + 48))
+
+                # Cache phash
+                img_path = img.get("path", "").replace("/", os.sep)
+                phash = img.get("_phash")
+                if phash is None and img_path and os.path.isfile(img_path):
+                    phash = compute_phash(img_path)
+                if phash is not None:
+                    selected_phashes.append(phash)
+
             elif sim_threshold < 1.0:
                 vec = _get_or_compute_vector(img)
                 if vec is not None:
                     selected_vectors.append(vec)
+                img_path = img.get("path", "").replace("/", os.sep)
+                if img_path and os.path.isfile(img_path):
+                    phash = compute_phash(img_path)
+                    if phash is not None:
+                        selected_phashes.append(phash)
 
             selected.append(img)
             img_hash = img.get("hash", "")
@@ -591,12 +664,16 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
     # Clean up temp scores
     for img in images:
         img.pop("_score", None)
+        img.pop("_phash", None)
 
     return db, report
 
 
 def _get_or_compute_vector(img):
-    """Get image vector, computing from file if needed."""
+    """Get image vector, using pre-computed from scan if available."""
+    cached = img.get("image_vector")
+    if cached is not None:
+        return np.array(cached, dtype=np.float32)
     path = img.get("path", "")
     if not path or not os.path.isfile(path.replace("/", os.sep)):
         return None

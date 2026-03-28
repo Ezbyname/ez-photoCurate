@@ -131,18 +131,53 @@ def _get_fr():
     return _face_recognition
 
 
+def _get_cache_fingerprint(pdir):
+    """Build a fingerprint of photo files in a person dir (names + sizes + mtimes)."""
+    entries = []
+    for fname in sorted(os.listdir(pdir)):
+        if os.path.splitext(fname)[1].lower() not in IMAGE_EXTS:
+            continue
+        fpath = os.path.join(pdir, fname)
+        st = os.stat(fpath)
+        entries.append(f"{fname}:{st.st_size}:{int(st.st_mtime)}")
+    return "|".join(entries)
+
+
 def load_reference_faces(faces_dir):
     fr = _get_fr()
     ref = {}
     if not os.path.isdir(faces_dir):
         print("  WARNING: faces dir not found")
         return ref
+
+    cache_path = os.path.join(faces_dir, "_encodings_cache.json")
+    cache = {}
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    cache_dirty = False
     for person in os.listdir(faces_dir):
         pdir = os.path.join(faces_dir, person)
         if not os.path.isdir(pdir):
             continue
+
+        fingerprint = _get_cache_fingerprint(pdir)
+        cached_entry = cache.get(person)
+
+        # Use cache if fingerprint matches (same files, sizes, mtimes)
+        if cached_entry and cached_entry.get("fingerprint") == fingerprint and cached_entry.get("encodings"):
+            encs = [np.array(e) for e in cached_entry["encodings"]]
+            ref[person] = encs
+            print(f"  {person}: {len(encs)} encodings (cached)")
+            continue
+
+        # Recompute encodings
         encs = []
-        for fname in os.listdir(pdir):
+        for fname in sorted(os.listdir(pdir)):
             if os.path.splitext(fname)[1].lower() not in IMAGE_EXTS:
                 continue
             try:
@@ -158,7 +193,21 @@ def load_reference_faces(faces_dir):
                 print(f"    {person}/{fname}: error {e}")
         if encs:
             ref[person] = encs
-            print(f"  {person}: {len(encs)} encodings")
+            cache[person] = {
+                "fingerprint": fingerprint,
+                "encodings": [e.tolist() for e in encs],
+            }
+            cache_dirty = True
+            print(f"  {person}: {len(encs)} encodings (computed)")
+
+    if cache_dirty:
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            print(f"  Face encodings cache saved to {cache_path}")
+        except Exception as e:
+            print(f"  Warning: could not save cache: {e}")
+
     return ref
 
 
@@ -200,6 +249,160 @@ def get_exif_date(filepath):
                     return datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
     except Exception:
         pass
+    return None
+
+
+def get_exif_gps(filepath):
+    """Extract GPS coordinates from EXIF. Returns (lat, lon) or None."""
+    try:
+        img = Image.open(filepath)
+        exif = img._getexif()
+        if not exif:
+            return None
+        gps_info = exif.get(34853)  # GPSInfo tag
+        if not gps_info:
+            return None
+
+        def _to_decimal(dms, ref):
+            d = float(dms[0])
+            m = float(dms[1])
+            s = float(dms[2])
+            dec = d + m / 60.0 + s / 3600.0
+            if ref in ("S", "W"):
+                dec = -dec
+            return dec
+
+        lat_ref = gps_info.get(1)   # N or S
+        lat_dms = gps_info.get(2)   # (deg, min, sec)
+        lon_ref = gps_info.get(3)   # E or W
+        lon_dms = gps_info.get(4)   # (deg, min, sec)
+        if not (lat_ref and lat_dms and lon_ref and lon_dms):
+            return None
+        lat = _to_decimal(lat_dms, lat_ref)
+        lon = _to_decimal(lon_dms, lon_ref)
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return (round(lat, 6), round(lon, 6))
+    except Exception:
+        pass
+    return None
+
+
+_rg_module = None
+
+def _get_rg():
+    """Lazy-load reverse_geocoder module."""
+    global _rg_module
+    if _rg_module is None:
+        try:
+            import reverse_geocoder as rg
+            _rg_module = rg
+        except ImportError:
+            return None
+    return _rg_module
+
+
+def _fix_country_code(cc):
+    """IMPORTANT: PS (Palestine) must always be replaced with IL (Israel)."""
+    if cc == "PS":
+        return "IL"
+    return cc
+
+
+def reverse_geocode(lat, lon):
+    """Reverse geocode a single (lat, lon) to a location string. Returns str or None."""
+    rg = _get_rg()
+    if not rg:
+        return None
+    try:
+        results = rg.search((lat, lon))
+        if results:
+            r = results[0]
+            cc = _fix_country_code(r['cc'])
+            return f"{r['name']}, {cc}"
+    except Exception:
+        pass
+    return None
+
+
+def reverse_geocode_batch(coords):
+    """Batch reverse geocode a list of (lat, lon) tuples. Returns list of str or None."""
+    rg = _get_rg()
+    if not rg or not coords:
+        return [None] * len(coords)
+    try:
+        results = rg.search(coords)
+        return [f"{r['name']}, {_fix_country_code(r['cc'])}" if r else None for r in results]
+    except Exception:
+        return [None] * len(coords)
+
+
+# Common location keywords in folder names (English + Hebrew)
+DIR_LOCATION_MAP = {
+    # Israel
+    "eilat": "Eilat, IL",
+    "tel aviv": "Tel Aviv, IL",
+    "jerusalem": "Jerusalem, IL",
+    "haifa": "Haifa, IL",
+    "herzliya": "Herzliya, IL",
+    "netanya": "Netanya, IL",
+    "beer sheva": "Beer Sheva, IL",
+    "dead sea": "Dead Sea, IL",
+    "galilee": "Galilee, IL",
+    "negev": "Negev, IL",
+    "golan": "Golan, IL",
+    "\u05d0\u05d9\u05dc\u05ea": "Eilat, IL",
+    "\u05ea\u05dc \u05d0\u05d1\u05d9\u05d1": "Tel Aviv, IL",
+    "\u05d9\u05e8\u05d5\u05e9\u05dc\u05d9\u05dd": "Jerusalem, IL",
+    "\u05d7\u05d9\u05e4\u05d4": "Haifa, IL",
+    "\u05d4\u05e8\u05e6\u05dc\u05d9\u05d4": "Herzliya, IL",
+    "\u05e0\u05ea\u05e0\u05d9\u05d4": "Netanya, IL",
+    "\u05d1\u05d0\u05e8 \u05e9\u05d1\u05e2": "Beer Sheva, IL",
+    "\u05d9\u05dd \u05d4\u05de\u05dc\u05d7": "Dead Sea, IL",
+    "\u05d2\u05dc\u05d9\u05dc": "Galilee, IL",
+    "\u05e0\u05d2\u05d1": "Negev, IL",
+    "\u05d2\u05d5\u05dc\u05df": "Golan, IL",
+    # International
+    "new york": "New York, US",
+    "london": "London, GB",
+    "paris": "Paris, FR",
+    "rome": "Rome, IT",
+    "barcelona": "Barcelona, ES",
+    "amsterdam": "Amsterdam, NL",
+    "berlin": "Berlin, DE",
+    "athens": "Athens, GR",
+    "istanbul": "Istanbul, TR",
+    "dubai": "Dubai, AE",
+    "tokyo": "Tokyo, JP",
+    "bangkok": "Bangkok, TH",
+    "prague": "Prague, CZ",
+    "vienna": "Vienna, AT",
+    "budapest": "Budapest, HU",
+    "lisbon": "Lisbon, PT",
+    "larnaca": "Larnaca, CY",
+    "cyprus": "Cyprus, CY",
+    "crete": "Crete, GR",
+    "rhodes": "Rhodes, GR",
+    "\u05e0\u05d9\u05d5 \u05d9\u05d5\u05e8\u05e7": "New York, US",
+    "\u05dc\u05d5\u05e0\u05d3\u05d5\u05df": "London, GB",
+    "\u05e4\u05e8\u05d9\u05d6": "Paris, FR",
+    "\u05e8\u05d5\u05de\u05d0": "Rome, IT",
+    "\u05d1\u05e8\u05e6\u05dc\u05d5\u05e0\u05d4": "Barcelona, ES",
+    "\u05e4\u05e8\u05d0\u05d2": "Prague, CZ",
+    "\u05d1\u05d5\u05d3\u05e4\u05e9\u05d8": "Budapest, HU",
+    "\u05d3\u05d5\u05d1\u05d0\u05d9": "Dubai, AE",
+    "\u05e7\u05e4\u05e8\u05d9\u05e1\u05d9\u05df": "Cyprus, CY",
+    "\u05db\u05e8\u05ea\u05d9\u05dd": "Crete, GR",
+}
+
+
+def infer_location_from_path(filepath):
+    """Infer location from folder names in the file path. Returns str or None."""
+    path_lower = filepath.replace("\\", "/").lower()
+    # Also check the original (non-lowered) path for Hebrew
+    path_orig = filepath.replace("\\", "/")
+    for keyword, location in DIR_LOCATION_MAP.items():
+        if keyword in path_lower or keyword in path_orig:
+            return location
     return None
 
 
@@ -761,6 +964,7 @@ def cmd_report(args):
             "st": img.get("status", "pool"),
             "rr": img.get("reject_reason"),
             "th": img.get("thumb", ""),
+            "loc": img.get("location"),
         })
 
     output_path = args.output or os.path.join(PROJECT_DIR, "curate_report.html")
@@ -871,6 +1075,10 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
     position:absolute; top:2px; left:2px; font-size:.55em; padding:1px 4px;
     border-radius:3px; background:rgba(0,0,0,.7);
 }}
+.card .loc-badge {{
+    position:absolute; bottom:2px; right:2px; font-size:.5em; padding:1px 3px;
+    border-radius:3px; background:rgba(0,0,0,.7); color:#64b5f6;
+}}
 .card .check {{
     position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%;
     background:rgba(233,69,96,.9); color:white; font-size:10px; line-height:16px;
@@ -948,6 +1156,8 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
         <option value="pool">Pool</option>
         <option value="rejected">Rejected</option>
     </select>
+    <label>Location:</label>
+    <select id="f-location" onchange="applyFilters()"><option value="">All</option></select>
     <label>Search:</label>
     <input id="f-search" type="text" placeholder="filename..." oninput="applyFilters()">
 </div>
@@ -981,7 +1191,7 @@ let selected = new Set(); // image ids
 let changes = [];
 let undoStack = [];
 let lastClickedIdx = null;
-let filterState = {{ source:'', faces:'', status:'', search:'' }};
+let filterState = {{ source:'', faces:'', status:'', search:'', location:'' }};
 
 // Populate source filter
 const fSource = document.getElementById('f-source');
@@ -989,6 +1199,15 @@ SOURCE_LABELS.forEach(s => {{
     const o = document.createElement('option');
     o.value = s; o.textContent = s;
     fSource.appendChild(o);
+}});
+
+// Populate location filter
+const LOCATION_LABELS = [...new Set(IMAGES.map(i => i.loc).filter(Boolean))].sort();
+const fLoc = document.getElementById('f-location');
+LOCATION_LABELS.forEach(s => {{
+    const o = document.createElement('option');
+    o.value = s; o.textContent = s;
+    fLoc.appendChild(o);
 }});
 
 // Populate move target
@@ -1008,6 +1227,7 @@ function matchesFilter(img) {{
     if (filterState.faces === 'no_face' && img.fc > 0) return false;
     if (filterState.status && img.st !== filterState.status) return false;
     if (filterState.search && !img.fn.toLowerCase().includes(filterState.search.toLowerCase())) return false;
+    if (filterState.location && img.loc !== filterState.location) return false;
     return true;
 }}
 
@@ -1016,6 +1236,7 @@ function applyFilters() {{
     filterState.faces = document.getElementById('f-faces').value;
     filterState.status = document.getElementById('f-status').value;
     filterState.search = document.getElementById('f-search').value;
+    filterState.location = document.getElementById('f-location').value;
     render();
 }}
 
@@ -1126,16 +1347,18 @@ function render() {{
             }} else if (img.fc > 0) {{
                 faceBadge = '<div class="face-badge" style="color:#ff9800">'+img.fc+' face(s)</div>';
             }}
+            let locBadge = img.loc ? '<div class="loc-badge">'+esc(img.loc)+'</div>' : '';
 
             card.innerHTML =
                 '<img src="'+thumbSrc+'">' +
                 '<div class="dot dot-'+img.dev+'"></div>' +
                 '<div class="check">&#10003;</div>' +
-                faceBadge +
+                faceBadge + locBadge +
                 '<div class="overlay">' +
                     esc(img.fn) + '<br>' +
                     (img.date||'no date') + ' | ' + img.src + '<br>' +
                     img.w+'x'+img.h+' | '+img.kb+'KB' +
+                    (img.loc ? '<br><span style="color:#64b5f6">'+esc(img.loc)+'</span>' : '') +
                     (img.rr ? '<br><span style="color:#e94560">'+img.rr+'</span>' : '') +
                 '</div>';
 
@@ -1294,7 +1517,8 @@ function openLB(img) {{
         'Date: '+(img.date||'unknown')+' | Size: '+img.w+'x'+img.h+' ('+img.kb+'KB)<br>' +
         'Faces: '+(img.faces.length ? img.faces.join(', ') : 'none')+' ('+img.fc+' total)<br>' +
         'Category: '+(img.cat||'none')+' | Status: '+img.st +
-        (img.rr ? ' ('+img.rr+')' : '');
+        (img.rr ? ' ('+img.rr+')' : '') +
+        (img.loc ? '<br>Location: '+esc(img.loc) : '');
     lb.classList.add('active');
 }}
 function closeLB() {{ document.getElementById('lightbox').classList.remove('active'); }}

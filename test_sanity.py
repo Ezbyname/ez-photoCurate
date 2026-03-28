@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import sqlite3
 import pytest
+from PIL import Image
 
 # Ensure project dir is on path
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1515,6 +1516,198 @@ class TestCleanup:
 
     def test_cleanup_finish(self, authed_client):
         self._remove_test_image("cleanup_hash")
+
+
+# ── Geolocation: GPS extraction, reverse geocoding, and location tagging ─────
+
+class TestGeolocation:
+    """End-to-end geolocation tests using landmark GPS coordinates."""
+
+    @staticmethod
+    def _make_gps_image(path, lat, lon, color="yellow"):
+        """Create a JPEG with GPS EXIF coordinates embedded."""
+        import piexif
+        import numpy as np
+        # Use random pixels so the JPEG doesn't compress below min_size_kb (80KB)
+        arr = np.random.randint(0, 255, (800, 600, 3), dtype=np.uint8)
+        img = Image.fromarray(arr)
+        lat_ref = b"N" if lat >= 0 else b"S"
+        lon_ref = b"E" if lon >= 0 else b"W"
+        abs_lat, abs_lon = abs(lat), abs(lon)
+        lat_d = int(abs_lat)
+        lat_m = int((abs_lat - lat_d) * 60)
+        lat_s = int(((abs_lat - lat_d) * 60 - lat_m) * 60 * 100)
+        lon_d = int(abs_lon)
+        lon_m = int((abs_lon - lon_d) * 60)
+        lon_s = int(((abs_lon - lon_d) * 60 - lon_m) * 60 * 100)
+        gps_ifd = {
+            piexif.GPSIFD.GPSLatitudeRef: lat_ref,
+            piexif.GPSIFD.GPSLatitude: ((lat_d, 1), (lat_m, 1), (lat_s, 100)),
+            piexif.GPSIFD.GPSLongitudeRef: lon_ref,
+            piexif.GPSIFD.GPSLongitude: ((lon_d, 1), (lon_m, 1), (lon_s, 100)),
+        }
+        exif_bytes = piexif.dump({"GPS": gps_ifd})
+        img.save(str(path), exif=exif_bytes)
+        return str(path)
+
+    # ── GPS extraction ───────────────────────────────────────────────────────
+
+    def test_pyramids_gps_extracted(self, tmp_path):
+        """Pyramids of Giza: 29.9792°N, 31.1342°E."""
+        from curate import get_exif_gps
+        path = self._make_gps_image(tmp_path / "pyramids.jpg", 29.9792, 31.1342)
+        gps = get_exif_gps(path)
+        assert gps is not None, "GPS should be extracted from EXIF"
+        lat, lon = gps
+        assert abs(lat - 29.9792) < 0.01, f"Latitude ~29.98, got {lat}"
+        assert abs(lon - 31.1342) < 0.01, f"Longitude ~31.13, got {lon}"
+
+    def test_western_wall_gps_extracted(self, tmp_path):
+        """Western Wall, Jerusalem: 31.7767°N, 35.2345°E."""
+        from curate import get_exif_gps
+        path = self._make_gps_image(tmp_path / "western_wall.jpg", 31.7767, 35.2345)
+        gps = get_exif_gps(path)
+        assert gps is not None
+        lat, lon = gps
+        assert abs(lat - 31.7767) < 0.01, f"Latitude ~31.78, got {lat}"
+        assert abs(lon - 35.2345) < 0.01, f"Longitude ~35.23, got {lon}"
+
+    def test_eiffel_tower_gps_extracted(self, tmp_path):
+        """Eiffel Tower, Paris: 48.8584°N, 2.2945°E."""
+        from curate import get_exif_gps
+        path = self._make_gps_image(tmp_path / "eiffel.jpg", 48.8584, 2.2945)
+        gps = get_exif_gps(path)
+        assert gps is not None
+        lat, lon = gps
+        assert abs(lat - 48.8584) < 0.01, f"Latitude ~48.86, got {lat}"
+        assert abs(lon - 2.2945) < 0.01, f"Longitude ~2.29, got {lon}"
+
+    # ── Reverse geocoding to country ─────────────────────────────────────────
+
+    def test_pyramids_in_egypt(self, tmp_path):
+        """Pyramids GPS should resolve to Egypt (EG)."""
+        from curate import get_exif_gps, reverse_geocode
+        path = self._make_gps_image(tmp_path / "pyramids.jpg", 29.9792, 31.1342)
+        gps = get_exif_gps(path)
+        loc = reverse_geocode(*gps)
+        assert loc is not None
+        assert "EG" in loc, f"Pyramids should be in Egypt, got: {loc}"
+
+    def test_western_wall_in_israel(self, tmp_path):
+        """Western Wall GPS should resolve to Israel (IL), never PS."""
+        from curate import get_exif_gps, reverse_geocode
+        path = self._make_gps_image(tmp_path / "western_wall.jpg", 31.7767, 35.2345)
+        gps = get_exif_gps(path)
+        loc = reverse_geocode(*gps)
+        assert loc is not None
+        assert "IL" in loc, f"Western Wall must be tagged as Israel (IL), got: {loc}"
+        assert "PS" not in loc, f"PS must never appear in location tags, got: {loc}"
+
+    def test_eiffel_tower_in_france(self, tmp_path):
+        """Eiffel Tower GPS should resolve to France (FR)."""
+        from curate import get_exif_gps, reverse_geocode
+        path = self._make_gps_image(tmp_path / "eiffel.jpg", 48.8584, 2.2945)
+        gps = get_exif_gps(path)
+        loc = reverse_geocode(*gps)
+        assert loc is not None
+        assert "FR" in loc, f"Eiffel Tower should be in France, got: {loc}"
+
+    # ── Full pipeline: GPS → location tag → filter by location ───────────────
+
+    def test_scan_tags_images_with_location(self, authed_client, tmp_path):
+        """Scan a folder with GPS-tagged images and verify location is stored."""
+        import app as app_module
+        import time
+
+        # Wait for any running task
+        for _ in range(20):
+            status = authed_client.get("/api/scan/status").get_json()
+            if not status.get("running"):
+                break
+            time.sleep(0.5)
+
+        # Create source dir with three landmark images
+        src_dir = str(tmp_path / "landmarks")
+        os.makedirs(src_dir, exist_ok=True)
+        self._make_gps_image(os.path.join(src_dir, "pyramids.jpg"), 29.9792, 31.1342, "orange")
+        self._make_gps_image(os.path.join(src_dir, "jerusalem.jpg"), 31.7767, 35.2345, "gold")
+        self._make_gps_image(os.path.join(src_dir, "eiffel.jpg"), 48.8584, 2.2945, "skyblue")
+
+        authed_client.post("/api/config", json={
+            "event_type": "birthday",
+            "sources": [src_dir],
+            "template": "birthday",
+            "categories": [{"id": "all", "name": "All", "target": 10}],
+            "categorization": "manual",
+        })
+
+        resp = authed_client.post("/api/scan/start", json={"full": True})
+        assert resp.status_code == 200
+
+        # Wait for completion
+        for _ in range(60):
+            status = authed_client.get("/api/scan/status").get_json()
+            if not status.get("running"):
+                break
+            time.sleep(0.5)
+
+        assert not status.get("running"), "Scan should have completed"
+        assert not status.get("error"), f"Scan error: {status.get('error')} | {status.get('line')}"
+
+        # Check that location was tagged
+        db = app_module.load_scan_db()
+        images = db.get("images", [])
+        stats = db.get("stats", {})
+        assert len(images) == 3, f"Expected 3 images, got {len(images)}, stats={stats}, skipped={stats.get('skipped')}"
+
+        located = [img for img in images if img.get("location")]
+        assert len(located) == 3, f"All 3 images should have locations, got {len(located)}"
+
+        # Verify countries
+        locations = {img["filename"]: img["location"] for img in images}
+        assert "EG" in locations["pyramids.jpg"], f"Pyramids: {locations['pyramids.jpg']}"
+        assert "IL" in locations["jerusalem.jpg"], f"Jerusalem must be IL: {locations['jerusalem.jpg']}"
+        assert "PS" not in locations["jerusalem.jpg"], f"PS must never appear: {locations['jerusalem.jpg']}"
+        assert "FR" in locations["eiffel.jpg"], f"Eiffel: {locations['eiffel.jpg']}"
+
+    def test_filter_images_by_location(self, authed_client):
+        """After scan, filter images by location via API."""
+        import app as app_module
+        db = app_module.load_scan_db()
+        if not db or not db.get("images"):
+            pytest.skip("No scan data from previous test")
+
+        # Get locations summary
+        resp = authed_client.get("/api/locations/summary")
+        assert resp.status_code == 200
+        locs = resp.get_json()["locations"]
+        assert len(locs) >= 1, "Should have at least 1 location"
+
+        # Filter by the first location
+        loc_name = locs[0]["name"]
+        resp = authed_client.get(f"/api/images?location={loc_name}")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["total"] >= 1
+        for img in data["images"]:
+            assert img["location"] == loc_name, \
+                f"Filtered image should have location={loc_name}, got {img.get('location')}"
+
+    def test_gps_coordinates_stored_in_scan_db(self, authed_client):
+        """Verify gps_lat and gps_lon are persisted per image."""
+        import app as app_module
+        db = app_module.load_scan_db()
+        if not db or not db.get("images"):
+            pytest.skip("No scan data")
+
+        for img in db["images"]:
+            if img.get("location"):
+                assert img.get("gps_lat") is not None, \
+                    f"{img['filename']}: has location but no gps_lat"
+                assert img.get("gps_lon") is not None, \
+                    f"{img['filename']}: has location but no gps_lon"
+                assert -90 <= img["gps_lat"] <= 90
+                assert -180 <= img["gps_lon"] <= 180
 
 
 if __name__ == "__main__":

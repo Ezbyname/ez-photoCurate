@@ -52,29 +52,128 @@ def require_auth():
 # Lock for scan_db.json reads/writes
 _db_lock = threading.Lock()
 
-# ── Background task state ─────────────────────────────────────────────────────
+# ── Background task state (multi-job) ─────────────────────────────────────────
+import uuid as _uuid
 
+_jobs = {}  # job_id -> job dict
+_jobs_lock = threading.Lock()
+# _current_job_id tracks the "active" job for legacy single-task API compat
+_current_job_id = None
+
+# Legacy single-task shim — points to current job or a dummy
 _task = {"running": False, "type": None, "progress": "", "lines": [], "done": False, "error": None, "cancelled": False}
 _task_lock = threading.Lock()
 
 
-def _reset_task(task_type):
+def _create_job(task_type, project_name=None):
+    """Create a new background job and return its ID."""
+    global _current_job_id
+    job_id = _uuid.uuid4().hex[:8]
+    job = {
+        "id": job_id,
+        "running": True,
+        "type": task_type,
+        "project_name": project_name or "",
+        "progress": "Starting...",
+        "percent": 0,
+        "lines": [],
+        "done": False,
+        "error": None,
+        "cancelled": False,
+        "started_at": datetime.now().isoformat(),
+    }
+    with _jobs_lock:
+        _jobs[job_id] = job
+        _current_job_id = job_id
+    # Sync legacy _task
+    _sync_legacy_task(job)
+    return job_id
+
+
+def _get_job(job_id):
+    with _jobs_lock:
+        return _jobs.get(job_id)
+
+
+def _job_is_cancelled(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return job["cancelled"] if job else True
+
+
+def _update_job(job_id, line):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["progress"] = line
+        job["lines"].append(line)
+        if len(job["lines"]) > 200:
+            job["lines"] = job["lines"][-100:]
+    _sync_legacy_task(job)
+
+
+def _update_job_percent(job_id, percent):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            job["percent"] = min(100, max(0, int(percent)))
+
+
+def _finish_job(job_id, error=None):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["running"] = False
+        job["done"] = True
+        job["error"] = error
+        if not error or error == "Cancelled":
+            job["percent"] = 100
+    _sync_legacy_task(job)
+
+
+def _sync_legacy_task(job):
+    """Keep legacy _task in sync with the current job for backward compat."""
     with _task_lock:
-        _task["running"] = True
-        _task["type"] = task_type
-        _task["progress"] = "Starting..."
-        _task["lines"] = []
-        _task["done"] = False
-        _task["error"] = None
-        _task["cancelled"] = False
+        _task["running"] = job["running"]
+        _task["type"] = job["type"]
+        _task["progress"] = job["progress"]
+        _task["lines"] = job["lines"]
+        _task["done"] = job["done"]
+        _task["error"] = job["error"]
+        _task["cancelled"] = job["cancelled"]
+
+
+def _any_job_running():
+    with _jobs_lock:
+        return any(j["running"] for j in _jobs.values())
+
+
+# Legacy compat wrappers — used by existing scan/select/export code
+def _reset_task(task_type):
+    global _current_job_id
+    # If called directly (old-style), create a job
+    job_id = _current_job_id
+    if job_id and _get_job(job_id) and _get_job(job_id)["running"]:
+        # Already created via _create_job, just sync
+        return
+    job_id = _create_job(task_type)
 
 
 def _is_cancelled():
+    job_id = _current_job_id
+    if job_id:
+        return _job_is_cancelled(job_id)
     with _task_lock:
         return _task["cancelled"]
 
 
 def _update_task(line):
+    job_id = _current_job_id
+    if job_id:
+        _update_job(job_id, line)
+        return
     with _task_lock:
         _task["progress"] = line
         _task["lines"].append(line)
@@ -82,7 +181,17 @@ def _update_task(line):
             _task["lines"] = _task["lines"][-100:]
 
 
+def _update_task_percent(percent):
+    job_id = _current_job_id
+    if job_id:
+        _update_job_percent(job_id, percent)
+
+
 def _finish_task(error=None):
+    job_id = _current_job_id
+    if job_id:
+        _finish_job(job_id, error)
+        return
     with _task_lock:
         _task["running"] = False
         _task["done"] = True
@@ -158,16 +267,25 @@ def _estimate_age(fpath):
 
 
 def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
-    """Fast face detection: auto-rotate + resize to 800px max.
-    Returns (face_count, faces_found, ok, best_distance).
-    best_distance is the minimum distance across all ref encodings (lower = better match)."""
+    """Two-stage face detection: thumbnail pre-screen + full-res detection.
+    Returns (face_count, faces_found, ok, best_distance)."""
     import face_recognition as fr
     import numpy as np
     from PIL import Image, ImageOps
     try:
         pil_img = ImageOps.exif_transpose(Image.open(fpath)).convert("RGB")
         w, h = pil_img.size
-        max_dim = 800
+
+        # Stage A: Quick face check on 256px thumbnail
+        thumb = pil_img.copy()
+        thumb.thumbnail((256, 256), Image.LANCZOS)
+        thumb_arr = np.array(thumb)
+        thumb_locs = fr.face_locations(thumb_arr, model="hog")
+        if not thumb_locs:
+            return 0, [], True, None  # No faces at all — skip full detection
+
+        # Stage B: Full detection on larger image (only resize if > 1200px)
+        max_dim = 1200
         if w > max_dim or h > max_dim:
             pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
         arr = np.array(pil_img)
@@ -190,6 +308,18 @@ def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
         return len(locations), sorted(found), True, round(best_dist, 3) if best_dist < 999 else None
     except Exception:
         return 0, [], False, None
+
+
+def _should_skip_face_detect(entry):
+    """Pre-filter: skip face detection on images unlikely to contain usable faces."""
+    w, h = entry.get("width", 0), entry.get("height", 0)
+    if w < 200 or h < 200:
+        return True
+    if entry.get("is_screenshot"):
+        return True
+    if entry.get("size_kb", 0) < 50:
+        return True
+    return False
 
 
 def _verify_single_photo(fpath):
@@ -291,6 +421,16 @@ def api_save_config():
     return jsonify({"ok": True})
 
 
+@app.route("/api/config/sources", methods=["POST"])
+def api_save_sources():
+    """Update only sources in the config, preserving everything else."""
+    data = request.json
+    config = load_config() or {}
+    config["sources"] = data.get("sources", [])
+    save_config(config)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/init", methods=["POST"])
 def api_init():
     data = request.json
@@ -331,15 +471,21 @@ def api_init():
 
 @app.route("/api/scan/start", methods=["POST"])
 def api_scan_start():
-    if _task["running"]:
+    if _any_job_running():
         return jsonify({"error": "A task is already running"}), 409
 
     full = request.json.get("full", False) if request.json else False
     nsfw_filter = request.json.get("nsfw_filter", False) if request.json else False
     age_estimation = request.json.get("age_estimation", None) if request.json else None
 
+    config = load_config()
+    proj_name = (config.get("project_name") or config.get("event_name") or "") if config else ""
+    job_id = _create_job("scan", proj_name)
+
     def run_scan():
         try:
+            import time as _time
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             _reset_task("scan")
             _update_task("Loading config...")
 
@@ -356,11 +502,13 @@ def api_scan_start():
                 categorize_by_template, load_template as load_tpl,
                 age_days_to_bracket, IMAGE_EXTS, VIDEO_EXTS, MEDIA_EXTS, REEF_BIRTHDAY,
                 get_video_date, get_video_info, make_video_thumbnail_b64,
+                get_exif_gps, reverse_geocode_batch, infer_location_from_path,
             )
             from PIL import Image as PILImage
 
             sources = config.get("sources", [])
             face_names = config.get("face_names", [])
+            face_match_mode = config.get("face_match_mode", "any")
             face_dir = config.get("ref_faces_dir", "")
             tolerance = config.get("face_tolerance", 0.6)
             min_size_kb = config.get("min_size_kb", 80)
@@ -452,125 +600,198 @@ def api_scan_start():
                 _finish_task("Cancelled")
                 return
 
-            # Existing DB for incremental
+            # Existing DB for incremental — only reuse if same project config
             existing_db = {}
             if os.path.isfile(SCAN_DB_PATH) and not full:
                 old = load_scan_db()
                 if old:
-                    for img in old.get("images", []):
-                        existing_db[img["hash"]] = img
-                _update_task(f"Incremental mode: {len(existing_db)} cached images")
+                    old_cfg = old.get("config", {})
+                    old_sources = set()
+                    for s in old_cfg.get("sources", []):
+                        old_sources.add(s.get("path", s) if isinstance(s, dict) else s)
+                    new_sources = set()
+                    for s in sources:
+                        new_sources.add(s.get("path", s) if isinstance(s, dict) else s)
+                    old_faces = set(old_cfg.get("face_names", []))
+                    new_faces = set(face_names)
+                    if old_sources == new_sources and old_faces == new_faces:
+                        for img in old.get("images", []):
+                            existing_db[img["hash"]] = img
+                        _update_task(f"Incremental mode: {len(existing_db)} cached images")
+                    else:
+                        _update_task("Config changed — running fresh scan...")
 
             if _is_cancelled():
                 _update_task("Stopped by user.")
                 _finish_task("Cancelled")
                 return
 
-            all_images = []
-            seen_hashes = set()
-            scanned = 0
-            face_rechecked = 0
-            skipped = defaultdict(int)
+            # === PASS 1: Fast metadata extraction with parallel I/O ===
+            _update_task("Pass 1: Collecting file list...")
+            pass1_start = _time.monotonic()
 
+            def _extract_metadata(fpath, fname, fhash, is_video, src_label, rel_dir):
+                """Thread-safe metadata extraction (no face detection)."""
+                try:
+                    file_size = os.path.getsize(fpath)
+                    if not is_video and file_size < min_size_kb * 1024:
+                        return None, "too_small", fhash
+                    if is_video:
+                        w, h, duration = get_video_info(fpath)
+                    else:
+                        img = PILImage.open(fpath)
+                        w, h = img.size
+                        img.close()
+                        duration = 0
+                    if not is_video and w < min_dim and h < min_dim:
+                        return None, "low_res", fhash
+
+                    if is_video:
+                        img_date = get_video_date(fpath)
+                    else:
+                        img_date = get_image_date(fpath, rel_dir)
+
+                    age_days = None
+                    bracket = None
+                    if img_date:
+                        if use_template:
+                            bracket = categorize_by_template(template, config, img_date)
+                            bday_str = config.get("subject_birthday")
+                            if bday_str:
+                                from datetime import datetime as dt
+                                bday = dt.strptime(bday_str, "%Y-%m-%d")
+                                age_days = (img_date - bday).days
+                        else:
+                            age_days = (img_date - REEF_BIRTHDAY).days
+                            bracket = age_days_to_bracket(age_days)
+
+                    screenshot = False
+                    if not is_video and file_size < 500 * 1024:
+                        screenshot = is_screenshot(fpath)
+
+                    # GPS extraction (images only)
+                    gps_coords = None
+                    if not is_video:
+                        gps_coords = get_exif_gps(fpath)
+
+                    if is_video:
+                        thumb = make_video_thumbnail_b64(fpath, thumb_size)
+                    else:
+                        thumb = make_thumbnail_b64(fpath, thumb_size)
+                    device = guess_device_source(fname)
+
+                    entry = {
+                        "hash": fhash,
+                        "path": fpath.replace("\\", "/"),
+                        "filename": fname,
+                        "source_label": src_label,
+                        "device": device,
+                        "media_type": "video" if is_video else "image",
+                        "date": img_date.strftime("%Y-%m-%d") if img_date else None,
+                        "age_days": age_days,
+                        "category": bracket,
+                        "face_count": 0,
+                        "faces_found": [],
+                        "has_target_face": False,
+                        "face_distance": None,
+                        "width": w, "height": h,
+                        "duration": round(duration, 1) if is_video else 0,
+                        "size_kb": round(file_size / 1024),
+                        "is_screenshot": screenshot,
+                        "thumb": thumb,
+                        "gps_lat": gps_coords[0] if gps_coords else None,
+                        "gps_lon": gps_coords[1] if gps_coords else None,
+                        "location": None,  # resolved in batch after Pass 1
+                    }
+
+                    # For manual categorization
+                    if not bracket and config.get("categorization") == "manual" and config.get("categories"):
+                        bracket = config["categories"][0]["id"]
+                        entry["category"] = bracket
+
+                    # Preliminary status (will be updated after face detection in Pass 2)
+                    if screenshot:
+                        entry["status"] = "rejected"
+                        entry["reject_reason"] = "screenshot"
+                    elif not bracket:
+                        entry["status"] = "pool"
+                        entry["reject_reason"] = "no_date"
+                    else:
+                        entry["status"] = "qualified"
+                        entry["reject_reason"] = None
+
+                    return entry, None, fhash
+                except Exception:
+                    return None, "unreadable", fhash
+
+            # Collect all file paths first
+            all_file_info = []  # (fpath, fname, is_video, src_label, rel_dir, src_path)
             for source in sources:
-                if _is_cancelled():
-                    _update_task("Stopped by user.")
-                    _finish_task("Cancelled")
-                    return
                 if isinstance(source, str):
                     src_path = source
                     src_label = os.path.basename(source) or source
                 else:
                     src_path = source.get("path", "")
                     src_label = source.get("label", "Unknown")
-
                 if not os.path.isdir(src_path):
                     _update_task(f"Source not found: {src_label}")
                     continue
-
-                _update_task(f"Scanning: {src_label}...")
-                src_count = 0
-
                 for dirpath, dirnames, filenames in os.walk(src_path):
                     rel_dir = os.path.relpath(dirpath, src_path)
-
                     for fname in filenames:
-                        if _is_cancelled():
-                            _update_task("Stopped by user.")
-                            _finish_task("Cancelled")
-                            return
-
                         ext = os.path.splitext(fname)[1].lower()
                         if ext not in MEDIA_EXTS:
                             continue
-                        is_video = ext in VIDEO_EXTS
-
                         fpath = os.path.join(dirpath, fname)
-                        scanned += 1
+                        is_video = ext in VIDEO_EXTS
+                        all_file_info.append((fpath, fname, is_video, src_label, rel_dir, src_path))
 
-                        if scanned % 100 == 0:
-                            _update_task(f"Scanning {src_label}: {scanned} files, {len(all_images)} kept...")
+            total_media_files = len(all_file_info)
+            _update_task(f"Found {total_media_files} media files. Starting Pass 1 (metadata)...")
 
+            all_images = []
+            seen_hashes = set()
+            skipped = defaultdict(int)
+            scanned = 0
+            pass1_times = []
+
+            # Process in batches with ThreadPoolExecutor
+            BATCH_SIZE = 50
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                for batch_start in range(0, total_media_files, BATCH_SIZE):
+                    if _is_cancelled():
+                        if all_images:
+                            save_scan_db({"scan_date": datetime.now().isoformat(), "config": config,
+                                "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "partial": True},
+                                "images": all_images})
+                        _update_task(f"Stopped. Saved {len(all_images)} images.")
+                        _finish_task("Cancelled")
+                        return
+
+                    batch = all_file_info[batch_start:batch_start + BATCH_SIZE]
+                    batch_t0 = _time.monotonic()
+
+                    futures = {}
+                    for fpath, fname, is_video, src_label, rel_dir, src_path in batch:
+                        # Hash + dedup on main thread (shared state)
                         try:
                             fhash = file_hash(fpath)
                         except Exception:
                             skipped["unreadable"] += 1
+                            scanned += 1
                             continue
+
                         if fhash in seen_hashes:
                             skipped["duplicate"] += 1
+                            scanned += 1
                             continue
                         seen_hashes.add(fhash)
 
+                        # Reuse from existing DB
                         if fhash in existing_db:
                             entry = existing_db[fhash]
                             entry["path"] = fpath.replace("\\", "/")
                             entry["source_label"] = src_label
-
-                            # Re-run face detection on cached entries that weren't face-checked
-                            # Also backfill face_distance for entries that have faces but no distance
-                            needs_face_check = (use_faces
-                                and not entry.get("_face_checked")
-                                and entry.get("status") != "rejected")
-                            needs_distance_backfill = (use_faces
-                                and entry.get("has_target_face")
-                                and entry.get("face_distance") is None
-                                and entry.get("status") != "rejected")
-                            if needs_face_check or needs_distance_backfill:
-                                try:
-                                    fc, ff, ok, best_d = _fast_face_detect(
-                                        fpath, ref_encodings, face_names, tolerance)
-                                    entry["face_count"] = fc
-                                    entry["faces_found"] = ff
-                                    entry["has_target_face"] = any(n in ff for n in face_names) if face_names else (fc > 0)
-                                    if best_d is not None:
-                                        entry["face_distance"] = best_d
-                                    entry["_face_checked"] = True
-                                    face_rechecked += 1
-                                    if face_rechecked % 100 == 0:
-                                        found_so_far = sum(1 for e in all_images if e.get("has_target_face"))
-                                        _update_task(f"Face-checking: {face_rechecked} done, {found_so_far} with target face...")
-                                    # Periodic save every 500 face-checks
-                                    if face_rechecked % 500 == 0:
-                                        _interim_db = {"scan_date": datetime.now().isoformat(), "config": config,
-                                            "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "face_rechecked": face_rechecked},
-                                            "images": all_images + [existing_db[h] for h in existing_db if h not in seen_hashes]}
-                                        save_scan_db(_interim_db)
-                                        _update_task(f"Progress saved ({face_rechecked} face-checked)...")
-                                    if _is_cancelled():
-                                        _update_task("Stopped by user.")
-                                        _finish_task("Cancelled")
-                                        return
-                                    # Update status based on face results
-                                    if face_names and not entry["has_target_face"]:
-                                        if entry.get("status") in ("qualified", "selected"):
-                                            entry["status"] = "pool"
-                                            entry["reject_reason"] = "no_faces" if fc == 0 else "wrong_person"
-                                    elif entry.get("status") == "pool" and entry.get("reject_reason") in ("no_faces", "wrong_person"):
-                                        if entry.get("category"):
-                                            entry["status"] = "qualified"
-                                            entry["reject_reason"] = None
-                                except Exception:
-                                    entry["_face_checked"] = True
 
                             # NSFW check on cached entries if filter enabled and not yet checked
                             if nsfw_classifier and "nsfw" not in entry and entry.get("status") != "rejected":
@@ -580,6 +801,13 @@ def api_scan_start():
                                     entry["nsfw_labels"] = nsfw_labels
                                     entry["status"] = "rejected"
                                     entry["reject_reason"] = "nsfw"
+
+                            # GPS extraction on cached entries if not yet done
+                            if "gps_lat" not in entry and entry.get("media_type") != "video":
+                                gps = get_exif_gps(fpath)
+                                entry["gps_lat"] = gps[0] if gps else None
+                                entry["gps_lon"] = gps[1] if gps else None
+                                # location resolved in batch after Pass 1
 
                             # Age estimation on cached entries if enabled and not yet done
                             if (age_est_enabled
@@ -599,131 +827,209 @@ def api_scan_start():
                                         entry["estimated_age"] = est
 
                             all_images.append(entry)
-                            src_count += 1
+                            scanned += 1
                             continue
 
-                        try:
-                            file_size = os.path.getsize(fpath)
-                            if not is_video and file_size < min_size_kb * 1024:
-                                skipped["too_small"] += 1
-                                continue
-                            if is_video:
-                                w, h, duration = get_video_info(fpath)
-                            else:
-                                img = PILImage.open(fpath)
-                                w, h = img.size
-                                img.close()
-                                duration = 0
-                            if not is_video and w < min_dim and h < min_dim:
-                                skipped["low_res"] += 1
-                                continue
-                        except Exception:
-                            skipped["unreadable"] += 1
-                            continue
+                        # Submit for parallel metadata extraction (pass pre-computed hash)
+                        fut = executor.submit(_extract_metadata, fpath, fname, fhash, is_video, src_label, rel_dir)
+                        futures[fut] = (fpath, fname)
 
-                        if is_video:
-                            img_date = get_video_date(fpath)
+                    # Collect results
+                    for fut in as_completed(futures):
+                        entry, skip_reason, fhash = fut.result()
+                        scanned += 1
+                        if skip_reason:
+                            skipped[skip_reason] += 1
+                        elif entry:
+                            all_images.append(entry)
+
+                    batch_elapsed = _time.monotonic() - batch_t0
+                    pass1_times.append(batch_elapsed / max(len(batch), 1))
+
+                    # Progress + ETA
+                    pct = int(scanned * 50 / total_media_files) if total_media_files else 0  # Pass 1 = 0-50%
+                    _update_task_percent(pct)
+                    if len(pass1_times) >= 3:
+                        avg_per_file = sum(pass1_times[-20:]) / len(pass1_times[-20:])
+                        remaining = total_media_files - scanned
+                        eta_sec = int(avg_per_file * remaining)
+                        eta_str = f"{eta_sec // 60}m {eta_sec % 60}s" if eta_sec >= 60 else f"{eta_sec}s"
+                        _update_task(f"Pass 1: {scanned}/{total_media_files} files ({len(all_images)} kept) — ETA: {eta_str}")
+                    else:
+                        _update_task(f"Pass 1: {scanned}/{total_media_files} files ({len(all_images)} kept)...")
+
+                    # Periodic save every ~5% of total files
+                    save_interval = max(BATCH_SIZE, total_media_files // 20)
+                    if scanned % save_interval < BATCH_SIZE and all_images:
+                        save_scan_db({"scan_date": datetime.now().isoformat(), "config": config,
+                            "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "partial": True},
+                            "images": all_images})
+
+            pass1_elapsed = _time.monotonic() - pass1_start
+            _update_task(f"Pass 1 complete: {len(all_images)} images in {pass1_elapsed:.0f}s. Resolving locations...")
+
+            # Batch reverse-geocode GPS coordinates
+            coords_to_resolve = []
+            for i, img in enumerate(all_images):
+                if img.get("gps_lat") is not None and not img.get("location"):
+                    coords_to_resolve.append((i, (img["gps_lat"], img["gps_lon"])))
+            if coords_to_resolve:
+                _update_task(f"Reverse geocoding {len(coords_to_resolve)} GPS locations...")
+                try:
+                    loc_results = reverse_geocode_batch([c for _, c in coords_to_resolve])
+                    for (idx, _), loc in zip(coords_to_resolve, loc_results):
+                        if loc:
+                            all_images[idx]["location"] = loc
+                except Exception:
+                    pass
+
+            # Folder name fallback for images without GPS location
+            for img in all_images:
+                if not img.get("location"):
+                    loc = infer_location_from_path(img.get("path", ""))
+                    if loc:
+                        img["location"] = loc
+
+            gps_count = sum(1 for img in all_images if img.get("location"))
+            if gps_count:
+                _update_task(f"Located {gps_count} images. Starting face detection...")
+            else:
+                _update_task(f"Starting face detection...")
+
+            # NSFW check on new (non-cached) images
+            if nsfw_classifier:
+                nsfw_count = 0
+                for entry in all_images:
+                    if entry.get("status") == "rejected":
+                        continue
+                    if "nsfw" in entry:
+                        continue
+                    is_nsfw, nsfw_labels = _check_nsfw(entry["path"].replace("/", os.sep), nsfw_classifier)
+                    entry["nsfw"] = is_nsfw
+                    if is_nsfw:
+                        entry["nsfw_labels"] = nsfw_labels
+                        entry["status"] = "rejected"
+                        entry["reject_reason"] = "nsfw"
+                        nsfw_count += 1
+                if nsfw_count:
+                    _update_task(f"NSFW filter: {nsfw_count} images rejected")
+
+            # === PASS 2: Face detection (single-threaded, selective) ===
+            if use_faces:
+                need_face = [e for e in all_images
+                             if e.get("media_type") != "video"
+                             and not e.get("_face_checked")
+                             and e.get("status") != "rejected"
+                             and not _should_skip_face_detect(e)]
+
+                # Also include cached entries needing face-check or distance backfill
+                for e in all_images:
+                    if e in need_face:
+                        continue
+                    if e.get("media_type") == "video" or e.get("status") == "rejected":
+                        continue
+                    needs_face_check = not e.get("_face_checked")
+                    needs_distance_backfill = (e.get("has_target_face")
+                        and e.get("face_distance") is None)
+                    if (needs_face_check or needs_distance_backfill) and not _should_skip_face_detect(e):
+                        need_face.append(e)
+
+                total_face = len(need_face)
+                _update_task(f"Pass 2: Face detection on {total_face} images...")
+                pass2_start = _time.monotonic()
+                face_checked = 0
+                pass2_times = []
+
+                for entry in need_face:
+                    if _is_cancelled():
+                        if all_images:
+                            save_scan_db({"scan_date": datetime.now().isoformat(), "config": config,
+                                "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "partial": True},
+                                "images": all_images})
+                        _update_task(f"Stopped. Saved {len(all_images)} images ({face_checked} face-checked).")
+                        _finish_task("Cancelled")
+                        return
+
+                    t0 = _time.monotonic()
+                    fpath = entry["path"].replace("/", os.sep)
+                    try:
+                        fc, ff, ok, best_d = _fast_face_detect(fpath, ref_encodings, face_names, tolerance)
+                        entry["face_count"] = fc
+                        entry["faces_found"] = ff
+                        entry["has_target_face"] = (all(n in ff for n in face_names) if face_match_mode == "all" else any(n in ff for n in face_names)) if face_names else (fc > 0)
+                        if best_d is not None:
+                            entry["face_distance"] = best_d
+                        entry["_face_checked"] = True
+
+                        # Update status based on face results
+                        if face_names and not entry["has_target_face"]:
+                            if entry.get("status") in ("qualified", "selected"):
+                                entry["status"] = "pool"
+                                entry["reject_reason"] = "no_faces" if fc == 0 else "wrong_person"
+                        elif entry.get("status") == "pool" and entry.get("reject_reason") in ("no_faces", "wrong_person"):
+                            if entry.get("category"):
+                                entry["status"] = "qualified"
+                                entry["reject_reason"] = None
+                    except Exception:
+                        entry["_face_checked"] = True
+
+                    face_checked += 1
+                    elapsed = _time.monotonic() - t0
+                    pass2_times.append(elapsed)
+
+                    # Progress + ETA
+                    if face_checked % 10 == 0 or face_checked == total_face:
+                        pct = 50 + int(face_checked * 50 / total_face) if total_face else 100
+                        _update_task_percent(pct)
+                        if len(pass2_times) >= 5:
+                            avg = sum(pass2_times[-50:]) / len(pass2_times[-50:])
+                            remaining = total_face - face_checked
+                            eta_sec = int(avg * remaining)
+                            eta_str = f"{eta_sec // 60}m {eta_sec % 60}s" if eta_sec >= 60 else f"{eta_sec}s"
+                            found_faces = sum(1 for e in all_images if e.get("has_target_face"))
+                            _update_task(f"Pass 2: {face_checked}/{total_face} face-checked, {found_faces} matched — ETA: {eta_str}")
                         else:
-                            img_date = get_image_date(fpath, rel_dir)
-                        age_days = None
-                        bracket = None
-                        if img_date:
-                            if use_template:
-                                bracket = categorize_by_template(template, config, img_date)
-                                bday_str = config.get("subject_birthday")
-                                if bday_str:
-                                    from datetime import datetime as dt
-                                    bday = dt.strptime(bday_str, "%Y-%m-%d")
-                                    age_days = (img_date - bday).days
-                            else:
-                                age_days = (img_date - REEF_BIRTHDAY).days
-                                bracket = age_days_to_bracket(age_days)
+                            _update_task(f"Pass 2: {face_checked}/{total_face} face-checked...")
 
-                        screenshot = False
-                        if not is_video and file_size < 500 * 1024:
-                            screenshot = is_screenshot(fpath)
+                    # Periodic save every ~5% of face-checks
+                    face_save_interval = max(10, total_face // 20)
+                    if face_checked % face_save_interval == 0:
+                        save_scan_db({"scan_date": datetime.now().isoformat(), "config": config,
+                            "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "partial": True},
+                            "images": all_images})
 
-                        face_count = 0
-                        faces_found = []
-                        face_dist = None
-                        if use_faces and not is_video:
-                            face_count, faces_found, ok, face_dist = _fast_face_detect(
-                                fpath, ref_encodings, face_names, tolerance)
-
-                        if is_video:
-                            thumb = make_video_thumbnail_b64(fpath, thumb_size)
-                        else:
-                            thumb = make_thumbnail_b64(fpath, thumb_size)
-                        device = guess_device_source(fname)
-
-                        entry = {
-                            "hash": fhash,
-                            "path": fpath.replace("\\", "/"),
-                            "filename": fname,
-                            "source_label": src_label,
-                            "device": device,
-                            "media_type": "video" if is_video else "image",
-                            "date": img_date.strftime("%Y-%m-%d") if img_date else None,
-                            "age_days": age_days,
-                            "category": bracket,
-                            "face_count": face_count,
-                            "faces_found": faces_found,
-                            "has_target_face": any(n in faces_found for n in face_names) if face_names else (face_count > 0),
-                            "face_distance": face_dist,
-                            "width": w, "height": h,
-                            "duration": round(duration, 1) if is_video else 0,
-                            "size_kb": round(file_size / 1024),
-                            "is_screenshot": screenshot,
-                            "thumb": thumb,
-                        }
-
-                        # For manual categorization, assign all to first category
-                        if not bracket and config.get("categorization") == "manual" and config.get("categories"):
-                            bracket = config["categories"][0]["id"]
-                            entry["category"] = bracket
-
-                        # NSFW check
-                        if nsfw_classifier:
-                            is_nsfw, nsfw_labels = _check_nsfw(fpath, nsfw_classifier)
-                            entry["nsfw"] = is_nsfw
-                            if is_nsfw:
-                                entry["nsfw_labels"] = nsfw_labels
-
-                        # Age estimation
-                        if age_est_enabled and not is_video and entry["has_target_face"]:
-                            run_age = False
-                            if age_est_scope == "all":
-                                run_age = True
-                            elif age_est_scope == "folders":
-                                src_norm = src_path.replace("\\", "/")
-                                run_age = src_norm in age_est_folders
-                            if run_age:
-                                est = _estimate_age(fpath)
-                                if est is not None:
-                                    entry["estimated_age"] = est
-
-                        if nsfw_classifier and entry.get("nsfw"):
-                            entry["status"] = "rejected"
-                            entry["reject_reason"] = "nsfw"
-                        elif screenshot:
-                            entry["status"] = "rejected"
-                            entry["reject_reason"] = "screenshot"
-                        elif face_names and not entry["has_target_face"]:
+                # Mark skipped images as face-checked too
+                for entry in all_images:
+                    if not entry.get("_face_checked") and entry.get("media_type") != "video" and entry.get("status") != "rejected":
+                        entry["_face_checked"] = True
+                        if face_names:
                             entry["status"] = "pool"
-                            entry["reject_reason"] = "no_faces" if face_count == 0 else "wrong_person"
-                        elif not bracket:
-                            entry["status"] = "pool"
-                            entry["reject_reason"] = "no_date"
-                        else:
-                            entry["status"] = "qualified"
-                            entry["reject_reason"] = None
+                            entry["reject_reason"] = "no_faces"
 
-                        all_images.append(entry)
-                        src_count += 1
+                pass2_elapsed = _time.monotonic() - pass2_start
+                _update_task(f"Face detection complete: {face_checked} images in {pass2_elapsed:.0f}s")
 
-                _update_task(f"{src_label}: {src_count} images kept")
+            # Age estimation (if enabled, single-threaded)
+            if age_est_enabled:
+                age_count = 0
+                for entry in all_images:
+                    if (entry.get("has_target_face") and entry.get("media_type") != "video"
+                        and entry.get("status") != "rejected" and "estimated_age" not in entry):
+                        run_age = False
+                        if age_est_scope == "all":
+                            run_age = True
+                        elif age_est_scope == "folders":
+                            run_age = True  # simplified — folder check done during Pass 1 for cached
+                        if run_age:
+                            est = _estimate_age(entry["path"].replace("/", os.sep))
+                            if est is not None:
+                                entry["estimated_age"] = est
+                                age_count += 1
+                if age_count:
+                    _update_task(f"Age estimation: {age_count} images processed")
 
-            # Save
+            # Final save
+            total_elapsed = _time.monotonic() - pass1_start
             db = {
                 "scan_date": datetime.now().isoformat(),
                 "config": config,
@@ -732,14 +1038,23 @@ def api_scan_start():
             }
             save_scan_db(db)
 
-            _update_task(f"Done! {len(all_images)} images from {scanned} scanned.")
+            found_target = sum(1 for e in all_images if e.get("has_target_face"))
+            _update_task(f"Done! {len(all_images)} images, {found_target} with target face ({total_elapsed:.0f}s)")
             _finish_task()
 
         except Exception as e:
+            # Save whatever we have on crash
+            try:
+                if all_images:
+                    save_scan_db({"scan_date": datetime.now().isoformat(), "config": config,
+                        "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "partial": True},
+                        "images": all_images})
+            except Exception:
+                pass
             _finish_task(str(e))
 
     threading.Thread(target=run_scan, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.route("/api/scan/status")
@@ -758,11 +1073,94 @@ def api_scan_status():
 
 @app.route("/api/task/stop", methods=["POST"])
 def api_task_stop():
+    """Stop by job_id or legacy (current job)."""
+    job_id = (request.json or {}).get("job_id") if request.is_json else None
+    if not job_id:
+        job_id = _current_job_id
+    if job_id:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job and job["running"]:
+                job["cancelled"] = True
+                _sync_legacy_task(job)
+                return jsonify({"ok": True})
+    # Legacy fallback
     with _task_lock:
         if _task["running"]:
             _task["cancelled"] = True
             return jsonify({"ok": True})
-        return jsonify({"ok": False, "msg": "No task running"})
+    return jsonify({"ok": False, "msg": "No task running"})
+
+
+@app.route("/api/jobs")
+def api_jobs():
+    """Return all jobs (running + recently finished)."""
+    with _jobs_lock:
+        jobs_list = []
+        for j in _jobs.values():
+            jobs_list.append({
+                "id": j["id"],
+                "type": j["type"],
+                "project_name": j.get("project_name", ""),
+                "running": j["running"],
+                "done": j["done"],
+                "error": j["error"],
+                "cancelled": j["cancelled"],
+                "progress": j["progress"],
+                "percent": j.get("percent", 0),
+                "started_at": j.get("started_at", ""),
+            })
+        # Sort: running first, then by start time desc
+        jobs_list.sort(key=lambda x: (not x["running"], x["started_at"]), reverse=False)
+        return jsonify({"jobs": jobs_list})
+
+
+@app.route("/api/jobs/<job_id>")
+def api_job_detail(job_id):
+    """Get detailed status of a specific job."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify({
+            "id": job["id"],
+            "type": job["type"],
+            "project_name": job.get("project_name", ""),
+            "running": job["running"],
+            "done": job["done"],
+            "error": job["error"],
+            "cancelled": job["cancelled"],
+            "progress": job["progress"],
+            "percent": job.get("percent", 0),
+            "lines": job["lines"][-20:],
+            "started_at": job.get("started_at", ""),
+        })
+
+
+@app.route("/api/jobs/<job_id>/stop", methods=["POST"])
+def api_job_stop(job_id):
+    """Stop a specific job."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["running"]:
+            job["cancelled"] = True
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "msg": "Job not running"})
+
+
+@app.route("/api/jobs/<job_id>/dismiss", methods=["POST"])
+def api_job_dismiss(job_id):
+    """Remove a finished job from the list."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["running"]:
+            return jsonify({"error": "Cannot dismiss a running job"}), 400
+        del _jobs[job_id]
+        return jsonify({"ok": True})
 
 
 @app.route("/api/analyze")
@@ -787,12 +1185,15 @@ def api_analyze():
 
 @app.route("/api/auto-select", methods=["POST"])
 def api_auto_select():
-    if _task["running"]:
+    if _any_job_running():
         return jsonify({"error": "A task is already running"}), 409
 
     data = request.json or {}
     strategy = data.get("strategy", "balanced")
     threshold = data.get("sim_threshold", 0.85)
+    config = load_config()
+    proj_name = (config.get("project_name") or config.get("event_name") or "") if config else ""
+    job_id = _create_job("auto-select", proj_name)
 
     def run_select():
         try:
@@ -842,14 +1243,18 @@ def api_auto_select():
             _finish_task(str(e))
 
     threading.Thread(target=run_select, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.route("/api/quick-fill", methods=["POST"])
 def api_quick_fill():
     """Quick fill: select top images by quality score without vector diversity (fast)."""
-    if _task["running"]:
+    if _any_job_running():
         return jsonify({"error": "A task is already running"}), 409
+
+    config = load_config()
+    proj_name = (config.get("project_name") or config.get("event_name") or "") if config else ""
+    job_id = _create_job("auto-select", proj_name)
 
     def run_quick():
         try:
@@ -890,11 +1295,13 @@ def api_quick_fill():
 
             total_selected = 0
             total_videos = 0
-            for cat in categories:
+            total_cats = len(categories)
+            for cat_idx, cat in enumerate(categories):
                 if _is_cancelled():
                     _update_task("Stopped by user.")
                     _finish_task("Cancelled")
                     return
+                _update_task_percent(int(cat_idx * 100 / total_cats) if total_cats else 0)
 
                 cid = cat["id"]
                 img_target = cat.get("target", target_per_cat)
@@ -970,7 +1377,7 @@ def api_quick_fill():
             _finish_task(str(e))
 
     threading.Thread(target=run_quick, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.route("/api/images")
@@ -994,6 +1401,9 @@ def api_images():
         filtered = [i for i in filtered if i.get("status") == status]
     if source:
         filtered = [i for i in filtered if i.get("source_label") == source]
+    location = request.args.get("location")
+    if location:
+        filtered = [i for i in filtered if i.get("location") == location]
 
     total = len(filtered)
     page = filtered[offset:offset + limit]
@@ -1088,6 +1498,22 @@ def api_selections_reset():
     return jsonify({"ok": True, "reset": count})
 
 
+@app.route("/api/locations/summary")
+@login_required
+def api_locations_summary():
+    """Get distinct location values from scan_db."""
+    db = load_scan_db()
+    if not db:
+        return jsonify({"locations": []})
+    locs = sorted(set(img.get("location") for img in db.get("images", []) if img.get("location")))
+    counts = {}
+    for img in db.get("images", []):
+        loc = img.get("location")
+        if loc:
+            counts[loc] = counts.get(loc, 0) + 1
+    return jsonify({"locations": [{"name": loc, "count": counts.get(loc, 0)} for loc in locs]})
+
+
 @app.route("/api/categories/summary")
 def api_categories_summary():
     """Get per-category counts for selection UI."""
@@ -1146,13 +1572,17 @@ def api_categories_update_target():
 @app.route("/api/export", methods=["POST"])
 def api_export():
     """Export selected/qualified images to output folder."""
-    if _task["running"]:
+    if _any_job_running():
         return jsonify({"error": "A task is already running"}), 409
 
     data = request.json or {}
     default_downloads = os.path.join(os.path.expanduser("~"), "Downloads", "E-z Photo Collection")
     output_dir = data.get("output_dir", default_downloads)
     status_filter = data.get("status", "selected")
+
+    config = load_config()
+    proj_name = (config.get("project_name") or config.get("event_name") or "") if config else ""
+    job_id = _create_job("export", proj_name)
 
     def run_export():
         try:
@@ -1208,6 +1638,7 @@ def api_export():
                 exported += 1
 
                 if (i + 1) % 50 == 0:
+                    _update_task_percent(int((i + 1) * 100 / total) if total else 0)
                     _update_task(f"Exported {exported}/{total}...")
 
             msg = f"Done! {exported} files exported to {output_dir}"
@@ -1220,7 +1651,7 @@ def api_export():
             _finish_task(str(e))
 
     threading.Thread(target=run_export, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.route("/api/ref-faces")
@@ -1229,12 +1660,52 @@ def api_ref_faces():
     ref_dir = os.path.join(PROJECT_DIR, "ref_faces")
     if not os.path.isdir(ref_dir):
         return jsonify([])
+    # Check if encodings cache exists
+    cache_path = os.path.join(ref_dir, "_encodings_cache.json")
+    cached_persons = set()
+    if os.path.isfile(cache_path):
+        try:
+            import json as _json
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = _json.load(f)
+            cached_persons = set(cache.keys())
+        except Exception:
+            pass
+
+    # Also check library encoding files for diversity/verification info
+    lib_info = {}
+    for person_dir_name in os.listdir(ref_dir):
+        enc_file = os.path.join(ref_dir, person_dir_name, "_face_encodings.json")
+        if not os.path.isfile(enc_file):
+            # Check library
+            lib_enc = os.path.join(FACE_LIBRARY_DIR, person_dir_name, "_face_encodings.json")
+            if os.path.isfile(lib_enc):
+                enc_file = lib_enc
+            else:
+                continue
+        try:
+            import json as _json
+            with open(enc_file, "r", encoding="utf-8") as f:
+                edata = _json.load(f)
+            lib_info[person_dir_name] = {
+                "diversity_score": edata.get("diversity_score"),
+                "verified_photos": edata.get("verified_photos", []),
+                "encoding_count": len(edata.get("encodings", [])),
+            }
+        except Exception:
+            pass
+
     result = []
     for person in sorted(os.listdir(ref_dir)):
         pdir = os.path.join(ref_dir, person)
         if os.path.isdir(pdir):
             photos = [f for f in os.listdir(pdir) if os.path.splitext(f)[1].lower() in {".jpg", ".jpeg", ".png"}]
-            result.append({"name": person, "photo_count": len(photos)})
+            entry = {"name": person, "photo_count": len(photos), "has_encodings": person in cached_persons}
+            if person in lib_info:
+                entry["diversity_score"] = lib_info[person].get("diversity_score")
+                entry["verified_photos"] = lib_info[person].get("verified_photos", [])
+                entry["encoding_count"] = lib_info[person].get("encoding_count", 0)
+            result.append(entry)
     return jsonify(result)
 
 
@@ -1359,6 +1830,233 @@ def api_ref_faces_delete_photo(person, filename):
 def api_ref_faces_delete(person):
     """Delete all reference photos for a person."""
     pdir = os.path.join(PROJECT_DIR, "ref_faces", person)
+    if os.path.isdir(pdir):
+        shutil.rmtree(pdir)
+    return jsonify({"ok": True})
+
+
+# ── Face Library (global, persists across projects) ──────────────────────────
+
+FACE_LIBRARY_DIR = os.path.join(PROJECT_DIR, "face_library")
+
+
+@app.route("/api/face-library")
+def api_face_library():
+    """List all people in the global face library."""
+    if not os.path.isdir(FACE_LIBRARY_DIR):
+        return jsonify([])
+    result = []
+    for person in sorted(os.listdir(FACE_LIBRARY_DIR)):
+        pdir = os.path.join(FACE_LIBRARY_DIR, person)
+        if not os.path.isdir(pdir):
+            continue
+        photos = [f for f in os.listdir(pdir) if os.path.splitext(f)[1].lower() in {".jpg", ".jpeg", ".png"}]
+        result.append({"name": person, "photo_count": len(photos)})
+    return jsonify(result)
+
+
+@app.route("/api/face-library/save", methods=["POST"])
+def api_face_library_save():
+    """Save a person from the current project's ref_faces to the global library."""
+    data = request.json or {}
+    person = data.get("person", "").strip().lower()
+    if not person:
+        return jsonify({"error": "Person name required"}), 400
+
+    src_dir = os.path.join(PROJECT_DIR, "ref_faces", person)
+    if not os.path.isdir(src_dir):
+        return jsonify({"error": f"No reference photos for {person}"}), 404
+
+    # Verify each photo and only save ones with valid face encodings
+    try:
+        import face_recognition as fr
+        import numpy as np
+    except ImportError:
+        return jsonify({"error": "face_recognition library not installed"}), 500
+
+    dst_dir = os.path.join(FACE_LIBRARY_DIR, person)
+    # Clear old library photos for this person
+    if os.path.isdir(dst_dir):
+        shutil.rmtree(dst_dir)
+    os.makedirs(dst_dir, exist_ok=True)
+
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+    saved = 0
+    skipped = 0
+    encodings_list = []
+    saved_photo_names = []
+
+    for fname in sorted(os.listdir(src_dir)):
+        if os.path.splitext(fname)[1].lower() not in image_exts:
+            continue
+        fpath = os.path.join(src_dir, fname)
+        try:
+            from PIL import Image
+            pil_img = Image.open(fpath).convert("RGB")
+            max_dim = 1600
+            w, h = pil_img.size
+            if w > max_dim or h > max_dim:
+                pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            arr = np.array(pil_img)
+            locations = fr.face_locations(arr, model="hog")
+            if not locations:
+                skipped += 1
+                continue
+            if len(locations) > 1:
+                areas = [(b-t)*(r-l) for t, r, b, l in locations]
+                best = areas.index(max(areas))
+                enc = fr.face_encodings(arr, [locations[best]])
+            else:
+                enc = fr.face_encodings(arr, locations)
+            if not enc:
+                skipped += 1
+                continue
+            # Photo is validated — save it
+            shutil.copy2(fpath, os.path.join(dst_dir, fname))
+            encodings_list.append(enc[0].tolist())
+            saved_photo_names.append(fname)
+            saved += 1
+        except Exception:
+            skipped += 1
+
+    if not encodings_list:
+        # Clean up empty dir
+        if os.path.isdir(dst_dir):
+            shutil.rmtree(dst_dir)
+        return jsonify({"error": f"No valid face photos found for {person}. Verify faces first."}), 400
+
+    # Compute diversity score
+    import numpy as np
+    diversity_score = 0.0
+    if len(encodings_list) >= 3:
+        encs_np = [np.array(e) for e in encodings_list]
+        dists = []
+        for i in range(len(encs_np)):
+            for j in range(i+1, len(encs_np)):
+                dists.append(float(np.linalg.norm(encs_np[i] - encs_np[j])))
+        diversity_score = min(np.mean(dists) / 0.6, 1.0) if dists else 0.0
+    elif len(encodings_list) >= 1:
+        diversity_score = 0.3  # minimal with few photos
+
+    # Save encodings alongside the photos
+    import json as _json
+    enc_path = os.path.join(dst_dir, "_face_encodings.json")
+    with open(enc_path, "w", encoding="utf-8") as f:
+        _json.dump({
+            "person": person,
+            "encodings": encodings_list,
+            "photo_count": saved,
+            "diversity_score": round(diversity_score, 2),
+            "verified_photos": saved_photo_names,
+        }, f)
+
+    # Also update the global library cache
+    cache_path = os.path.join(FACE_LIBRARY_DIR, "_encodings_cache.json")
+    try:
+        cache = {}
+        if os.path.isfile(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cache = _json.load(f)
+        from curate import _get_cache_fingerprint
+        cache[person] = {
+            "fingerprint": _get_cache_fingerprint(dst_dir),
+            "encodings": encodings_list,
+        }
+        with open(cache_path, "w", encoding="utf-8") as f:
+            _json.dump(cache, f)
+    except Exception:
+        pass
+
+    return jsonify({"ok": True, "person": person, "photos_saved": saved, "photos_skipped": skipped,
+                     "encodings": len(encodings_list)})
+
+
+@app.route("/api/face-library/import", methods=["POST"])
+def api_face_library_import():
+    """Import a person from the global library into the current project's ref_faces.
+    Only copies validated photos (no re-detection needed) and their pre-computed encodings."""
+    data = request.json or {}
+    person = data.get("person", "").strip().lower()
+    if not person:
+        return jsonify({"error": "Person name required"}), 400
+
+    src_dir = os.path.join(FACE_LIBRARY_DIR, person)
+    if not os.path.isdir(src_dir):
+        return jsonify({"error": f"{person} not found in library"}), 404
+
+    dst_dir = os.path.join(PROJECT_DIR, "ref_faces", person)
+    os.makedirs(dst_dir, exist_ok=True)
+
+    # Copy only image files (not cache/encoding files)
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+    copied = 0
+    for fname in os.listdir(src_dir):
+        if os.path.splitext(fname)[1].lower() not in image_exts:
+            continue
+        src = os.path.join(src_dir, fname)
+        dst = os.path.join(dst_dir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+            copied += 1
+
+    # Copy _face_encodings.json into the project person dir
+    enc_src = os.path.join(src_dir, "_face_encodings.json")
+    if os.path.isfile(enc_src):
+        shutil.copy2(enc_src, os.path.join(dst_dir, "_face_encodings.json"))
+
+    # Copy encodings from library's stored encodings + cache
+    import json as _json
+
+    # Copy from per-person encoding file
+    enc_src = os.path.join(src_dir, "_face_encodings.json")
+    cache_dst = os.path.join(PROJECT_DIR, "ref_faces", "_encodings_cache.json")
+
+    encodings_data = None
+    # Try per-person encoding file first
+    if os.path.isfile(enc_src):
+        try:
+            with open(enc_src, "r", encoding="utf-8") as f:
+                enc_data = _json.load(f)
+            encodings_data = enc_data.get("encodings", [])
+        except Exception:
+            pass
+
+    # Fall back to global library cache
+    if not encodings_data:
+        cache_src = os.path.join(FACE_LIBRARY_DIR, "_encodings_cache.json")
+        if os.path.isfile(cache_src):
+            try:
+                with open(cache_src, "r", encoding="utf-8") as f:
+                    src_cache = _json.load(f)
+                if person in src_cache:
+                    encodings_data = src_cache[person].get("encodings", [])
+            except Exception:
+                pass
+
+    # Write encodings to project's cache
+    if encodings_data:
+        try:
+            from curate import _get_cache_fingerprint
+            dst_cache = {}
+            if os.path.isfile(cache_dst):
+                with open(cache_dst, "r", encoding="utf-8") as f:
+                    dst_cache = _json.load(f)
+            dst_cache[person] = {
+                "fingerprint": _get_cache_fingerprint(dst_dir),
+                "encodings": encodings_data,
+            }
+            with open(cache_dst, "w", encoding="utf-8") as f:
+                _json.dump(dst_cache, f)
+        except Exception:
+            pass
+
+    return jsonify({"ok": True, "person": person, "photos_imported": copied})
+
+
+@app.route("/api/face-library/<person>", methods=["DELETE"])
+def api_face_library_delete(person):
+    """Remove a person from the global library."""
+    pdir = os.path.join(FACE_LIBRARY_DIR, person)
     if os.path.isdir(pdir):
         shutil.rmtree(pdir)
     return jsonify({"ok": True})
@@ -1588,6 +2286,10 @@ def api_stats():
         stats["selected_videos"] = sum(1 for i in images if i.get("status") == "selected" and i.get("media_type") == "video")
         stats["pool"] = sum(1 for i in images if i.get("status") == "pool")
         stats["sources"] = list(set(i.get("source_label", "") for i in images))
+        db_stats = db.get("stats", {})
+        stats["partial"] = bool(db_stats.get("partial"))
+        stats["total_scanned"] = db_stats.get("total_scanned", len(images))
+        stats["scan_date"] = db.get("scan_date")
 
     stats["default_export_dir"] = os.path.join(os.path.expanduser("~"), "Downloads", "E-z Photo Collection")
     return jsonify(stats)
@@ -1840,6 +2542,9 @@ def api_cleanup_images():
         filtered = [i for i in filtered if i.get("category") == category]
     if media_type:
         filtered = [i for i in filtered if i.get("media_type", "image") == media_type]
+    location = request.args.get("location")
+    if location:
+        filtered = [i for i in filtered if i.get("location") == location]
 
     offset = int(request.args.get("offset", 0))
     limit = int(request.args.get("limit", 200))
@@ -1948,7 +2653,7 @@ def api_cleanup_confirm_trash():
 @app.route("/api/age-assess/start", methods=["POST"])
 def api_age_assess_start():
     """Run age assessment as a standalone background task on selected folders."""
-    if _task["running"]:
+    if _any_job_running():
         return jsonify({"error": "A task is already running"}), 409
 
     data = request.json or {}
@@ -1957,6 +2662,10 @@ def api_age_assess_start():
         return jsonify({"error": "No folders selected"}), 400
     face_mode = data.get("face_mode", "all")  # "all" or "specific"
     person_name = data.get("person_name", "")
+
+    config = load_config()
+    proj_name = (config.get("project_name") or config.get("event_name") or "") if config else ""
+    job_id = _create_job("age_assess", proj_name)
 
     def run_age_assess():
         try:
@@ -2031,6 +2740,7 @@ def api_age_assess_start():
                         processed += 1
 
                         if processed % 10 == 0:
+                            _update_task_percent(int(processed * 100 / total_files) if total_files else 0)
                             _update_task(f"Analyzing {processed}/{total_files} — {len(results)} faces aged...")
 
                         # If specific person, check face first
@@ -2083,7 +2793,7 @@ def api_age_assess_start():
             _finish_task(str(e))
 
     threading.Thread(target=run_age_assess, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "job_id": job_id})
 
 
 @app.route("/api/age-assess/results")
@@ -2130,14 +2840,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 }
 .step-dot:first-child { border-radius:8px 0 0 8px; }
 .step-dot:last-child { border-radius:0 8px 8px 0; }
-.step-dot.active { background:#ebf8ff; color:#2b6cb0; border-color:#90cdf4; }
 .step-dot.done { background:#f0fff4; color:#276749; border-color:#9ae6b4; }
+.step-dot.active { background:#2b6cb0; color:white; border-color:#2b6cb0; font-weight:600; }
 .step-dot .num {
     width:24px; height:24px; border-radius:50%; background:#e2e8f0; color:#a0aec0;
     display:flex; align-items:center; justify-content:center; font-size:.75em; font-weight:bold;
 }
-.step-dot.active .num { background:#2b6cb0; color:white; }
 .step-dot.done .num { background:#38a169; color:white; }
+.step-dot.active .num { background:white; color:#2b6cb0; }
 
 /* ── Panels ── */
 .panel { display:none; background:#fff; border-radius:12px; padding:30px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,.1); border:1px solid #e2e8f0; }
@@ -2262,6 +2972,32 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 #icon-rail .rail-btn:hover .rail-tip { display:block; }
 #icon-rail .rail-spacer { flex:1; }
 #icon-rail .rail-divider { width:24px; height:1px; background:#e2e8f0; margin:6px 0; }
+#icon-rail .rail-btn .job-badge { position:absolute; top:-2px; right:-2px; background:#e53e3e; color:#fff; font-size:10px; font-weight:700; width:16px; height:16px; border-radius:50%; display:flex; align-items:center; justify-content:center; line-height:1; }
+/* ── Jobs panel ── */
+#jobs-panel { display:none; position:fixed; bottom:60px; left:56px; width:360px; background:#fff; border-radius:10px; box-shadow:0 6px 24px rgba(0,0,0,.15); z-index:10001; max-height:400px; overflow:hidden; border:1px solid #e2e8f0; }
+#jobs-panel.open { display:flex; flex-direction:column; }
+#jobs-panel .jp-header { padding:12px 16px; border-bottom:1px solid #e2e8f0; font-weight:600; font-size:.9em; color:#2d3748; display:flex; justify-content:space-between; align-items:center; }
+#jobs-panel .jp-list { overflow-y:auto; max-height:340px; padding:6px 0; }
+#jobs-panel .jp-empty { padding:24px; text-align:center; color:#a0aec0; font-size:.85em; }
+#jobs-panel .jp-item { padding:10px 16px; border-bottom:1px solid #f7fafc; }
+#jobs-panel .jp-item:last-child { border-bottom:none; }
+#jobs-panel .jp-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
+#jobs-panel .jp-type { font-weight:600; font-size:.82em; color:#2d3748; }
+#jobs-panel .jp-proj { font-size:.72em; color:#a0aec0; margin-left:6px; }
+#jobs-panel .jp-status { font-size:.72em; color:#718096; }
+#jobs-panel .jp-bar-bg { height:5px; background:#e2e8f0; border-radius:3px; overflow:hidden; margin-bottom:4px; }
+#jobs-panel .jp-bar { height:100%; border-radius:3px; transition:width .5s ease; }
+#jobs-panel .jp-bar.running { background:linear-gradient(90deg, #3182ce, #63b3ed); animation:taskPulse 1.5s ease-in-out infinite; }
+#jobs-panel .jp-bar.done { background:#38a169; }
+#jobs-panel .jp-bar.error { background:#e53e3e; }
+#jobs-panel .jp-actions { display:flex; gap:6px; }
+#jobs-panel .jp-actions button { border:none; background:none; cursor:pointer; font-size:.75em; padding:2px 8px; border-radius:4px; }
+#jobs-panel .jp-actions .jp-stop { color:#e53e3e; }
+#jobs-panel .jp-actions .jp-stop:hover { background:#fed7d7; }
+#jobs-panel .jp-actions .jp-goto { color:#3182ce; }
+#jobs-panel .jp-actions .jp-goto:hover { background:#ebf8ff; }
+#jobs-panel .jp-actions .jp-dismiss { color:#a0aec0; }
+#jobs-panel .jp-actions .jp-dismiss:hover { background:#f7fafc; color:#718096; }
 .menu-btn { display:none; }
 /* ── Cleanup overlay ── */
 #cleanup-overlay { display:none; position:fixed; top:0; left:48px; width:calc(100% - 48px); height:100%; background:#f5f7fa; z-index:1300; overflow-y:auto; }
@@ -2385,6 +3121,10 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     </button>
     <div class="rail-spacer"></div>
     <div class="rail-divider"></div>
+    <button class="rail-btn" onclick="toggleJobsPanel()" title="Running Jobs" id="rail-jobs-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/><line x1="12" y1="12" x2="12" y2="12.01"/></svg>
+        <span class="rail-tip">Running Jobs</span>
+    </button>
     <button class="rail-btn" onclick="startTutorial()" title="Tutorial">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         <span class="rail-tip">Tutorial</span>
@@ -2393,6 +3133,15 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
         <span class="rail-tip">Sign Out</span>
     </button>
+</div>
+
+<!-- Jobs panel (popup from icon rail) -->
+<div id="jobs-panel">
+    <div class="jp-header">
+        <span>Running Jobs</span>
+        <button onclick="toggleJobsPanel()" style="background:none; border:none; cursor:pointer; color:#a0aec0; font-size:1.1em;">&times;</button>
+    </div>
+    <div class="jp-list" id="jp-list"></div>
 </div>
 
 <!-- Side drawer (slides from behind icon rail) -->
@@ -2609,7 +3358,10 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
         <div class="task-status" id="task-overlay-status"></div>
         <div class="task-bar-bg"><div class="task-bar indeterminate" id="task-overlay-bar"></div></div>
         <div class="task-lines" id="task-overlay-lines"></div>
-        <button class="btn-stop" onclick="stopTask()">Stop</button>
+        <div style="display:flex; gap:10px; justify-content:center;">
+            <button class="btn-stop" onclick="sendToBackground()" style="background:#3182ce;">Run in Background</button>
+            <button class="btn-stop" onclick="stopTask()">Stop</button>
+        </div>
     </div>
 </div>
 
@@ -2617,6 +3369,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
 <div class="header">
     <h1>E-z Photo Organizer</h1>
+    <div id="project-name-bar" style="display:none; font-size:1.6em; color:#2b6cb0; font-weight:700; margin-top:2px; margin-bottom:4px;">Project: <span id="project-name-text"></span></div>
     <p id="header-greeting">Build a meaningful photo collection for your special event</p>
 </div>
 
@@ -2750,7 +3503,10 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <div class="source-list" id="source-list"></div>
     <button class="btn btn-secondary" onclick="addSource()" style="margin-top:10px">+ Add Source</button>
 
-    <div style="margin-top:14px; padding:10px 14px; background:#fffff0; border:1px solid #fefcbf; border-radius:6px; font-size:.82em; color:#744210;">
+    <div style="margin-top:14px; padding:10px 14px; background:#fff5f5; border:1px solid #feb2b2; border-radius:6px; font-size:.82em; color:#9b2c2c;">
+        <strong>Important:</strong> Do not use paths inside ZIP files. Windows Explorer may let you browse ZIP contents, but the scanner cannot read them. Please <strong>extract the ZIP first</strong>, then add the extracted folder as a source.
+    </div>
+    <div style="margin-top:8px; padding:10px 14px; background:#fffff0; border:1px solid #fefcbf; border-radius:6px; font-size:.82em; color:#744210;">
         <strong>Tip:</strong> If your images are not properly rotated (e.g. sideways photos from phones), face detection may miss faces and scanning will take longer as it retries with rotation correction. For best results, make sure your source images have correct EXIF orientation.
     </div>
 
@@ -2767,9 +3523,17 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
     <div style="margin-bottom:20px;">
         <label>Person Name</label>
-        <div style="display:flex; gap:10px; align-items:center;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <input type="text" id="inp-face-name" placeholder="e.g. daniel" style="max-width:250px">
             <button class="btn btn-secondary" onclick="addPerson()" style="margin:0">Add Person</button>
+            <button class="btn btn-secondary" onclick="showFaceLibrary()" style="margin:0; background:#ebf8ff; color:#2b6cb0; border-color:#bee3f8;">Pick from Library</button>
+        </div>
+        <div id="face-library-panel" style="display:none; margin-top:12px; padding:14px; background:#f7fafc; border:1px solid #e2e8f0; border-radius:8px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <strong style="color:#2b6cb0; font-size:.9em;">Saved People</strong>
+                <span style="cursor:pointer; color:#a0aec0; font-size:1.2em;" onclick="document.getElementById('face-library-panel').style.display='none'">&times;</span>
+            </div>
+            <div id="face-library-list" style="color:#718096; font-size:.85em;">Loading...</div>
         </div>
     </div>
 
@@ -3044,6 +3808,215 @@ async function stopTask() {
         document.querySelector('#task-overlay .btn-stop').disabled = false;
     }, 2000);
 }
+
+function sendToBackground() {
+    // Dismiss overlay but keep task running
+    if (taskPoll) { clearInterval(taskPoll); taskPoll = null; }
+    document.getElementById('task-overlay').classList.remove('active');
+    // Open jobs panel so user sees progress there
+    if (!_jobsPanelOpen) toggleJobsPanel();
+}
+
+// ── Jobs panel ──
+var _jobsPanelOpen = false;
+var _jobsPoll = null;
+
+var JOB_TYPE_LABELS = {
+    scan: 'Scan',
+    'auto-select': 'Auto Select',
+    export: 'Export',
+    age_assess: 'Age Assessment'
+};
+
+var JOB_NEXT_STEP = {
+    scan: 5,
+    'auto-select': 6,
+    export: 8,
+    age_assess: null
+};
+
+function toggleJobsPanel() {
+    var panel = document.getElementById('jobs-panel');
+    _jobsPanelOpen = !_jobsPanelOpen;
+    if (_jobsPanelOpen) {
+        panel.classList.add('open');
+        refreshJobsPanel();
+        if (!_jobsPoll) _jobsPoll = setInterval(refreshJobsPanel, 2000);
+    } else {
+        panel.classList.remove('open');
+        if (_jobsPoll) { clearInterval(_jobsPoll); _jobsPoll = null; }
+        dismissFinishedJobs();
+    }
+}
+
+async function dismissFinishedJobs() {
+    try {
+        var res = await fetch('/api/jobs');
+        var data = await res.json();
+        var jobs = data.jobs || [];
+        for (var i = 0; i < jobs.length; i++) {
+            if (!jobs[i].running) {
+                await fetch('/api/jobs/' + jobs[i].id + '/dismiss', { method: 'POST' });
+            }
+        }
+        updateJobsBadge(jobs.filter(function(j) { return j.running; }).length);
+    } catch(e) {}
+}
+
+function updateJobsBadge(count) {
+    var btn = document.getElementById('rail-jobs-btn');
+    var badge = btn.querySelector('.job-badge');
+    if (count > 0) {
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'job-badge';
+            btn.appendChild(badge);
+        }
+        badge.textContent = count;
+    } else if (badge) {
+        badge.remove();
+    }
+}
+
+async function refreshJobsPanel() {
+    try {
+        var res = await fetch('/api/jobs');
+        var data = await res.json();
+        var jobs = data.jobs || [];
+        var runCount = jobs.filter(function(j) { return j.running; }).length;
+        updateJobsBadge(runCount);
+
+        var list = document.getElementById('jp-list');
+        if (!jobs.length) {
+            list.innerHTML = '<div class="jp-empty">No jobs running</div>';
+            return;
+        }
+        list.innerHTML = '';
+        jobs.forEach(function(j) {
+            var item = document.createElement('div');
+            item.className = 'jp-item';
+
+            var row = document.createElement('div');
+            row.className = 'jp-row';
+            var typeSpan = document.createElement('span');
+            typeSpan.className = 'jp-type';
+            typeSpan.textContent = JOB_TYPE_LABELS[j.type] || j.type;
+            if (j.project_name) {
+                var projSpan = document.createElement('span');
+                projSpan.className = 'jp-proj';
+                projSpan.textContent = j.project_name;
+                typeSpan.appendChild(projSpan);
+            }
+            row.appendChild(typeSpan);
+
+            var statusSpan = document.createElement('span');
+            statusSpan.className = 'jp-status';
+            if (j.running) {
+                var pct = j.percent || 0;
+                statusSpan.textContent = pct > 0 ? (pct + '%') : 'Starting...';
+            }
+            else if (j.cancelled) statusSpan.textContent = 'Cancelled';
+            else if (j.error && j.error !== 'Cancelled') statusSpan.textContent = 'Error';
+            else statusSpan.textContent = '100% - Done';
+            row.appendChild(statusSpan);
+            item.appendChild(row);
+
+            var barBg = document.createElement('div');
+            var barRow = document.createElement('div');
+            barRow.style.cssText = 'display:flex; align-items:center; gap:6px; margin-bottom:4px;';
+            var barBg = document.createElement('div');
+            barBg.className = 'jp-bar-bg';
+            barBg.style.flex = '1';
+            var bar = document.createElement('div');
+            bar.className = 'jp-bar';
+            if (j.running) {
+                var pctW = j.percent || 0;
+                bar.classList.add('running');
+                bar.style.width = pctW > 0 ? (pctW + '%') : '5%';
+                bar.style.animation = 'none';
+            } else if (j.error && j.error !== 'Cancelled') {
+                bar.classList.add('error');
+                bar.style.width = '100%';
+            } else {
+                bar.classList.add('done');
+                bar.style.width = '100%';
+            }
+            barBg.appendChild(bar);
+            barRow.appendChild(barBg);
+
+            if (j.running) {
+                var expandBtn = document.createElement('button');
+                expandBtn.style.cssText = 'background:none; border:none; cursor:pointer; color:#3182ce; padding:0; display:flex; align-items:center;';
+                expandBtn.title = 'Open task view';
+                expandBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>';
+                (function(jobType) {
+                    expandBtn.onclick = function() {
+                        toggleJobsPanel();
+                        showTaskOverlay(jobType);
+                    };
+                })(j.type);
+                barRow.appendChild(expandBtn);
+            }
+
+            item.appendChild(barRow);
+
+            var actions = document.createElement('div');
+            actions.className = 'jp-actions';
+            if (j.running) {
+                var stopBtn = document.createElement('button');
+                stopBtn.className = 'jp-stop';
+                stopBtn.textContent = 'Stop';
+                (function(jobId) {
+                    stopBtn.onclick = function() {
+                        fetch('/api/jobs/' + jobId + '/stop', { method: 'POST' });
+                    };
+                })(j.id);
+                actions.appendChild(stopBtn);
+            } else {
+                if (!j.error || j.error === 'Cancelled') {
+                    var nextStep = JOB_NEXT_STEP[j.type];
+                    if (nextStep !== null && nextStep !== undefined) {
+                        var gotoBtn = document.createElement('button');
+                        gotoBtn.className = 'jp-goto';
+                        gotoBtn.textContent = 'Go to next step';
+                        (function(step, jobId) {
+                            gotoBtn.onclick = function() {
+                                goStep(step);
+                                fetch('/api/jobs/' + jobId + '/dismiss', { method: 'POST' });
+                                refreshJobsPanel();
+                            };
+                        })(nextStep, j.id);
+                        actions.appendChild(gotoBtn);
+                    }
+                }
+                var dismissBtn = document.createElement('button');
+                dismissBtn.className = 'jp-dismiss';
+                dismissBtn.textContent = 'Dismiss';
+                (function(jobId) {
+                    dismissBtn.onclick = function() {
+                        fetch('/api/jobs/' + jobId + '/dismiss', { method: 'POST' }).then(function() {
+                            refreshJobsPanel();
+                        });
+                    };
+                })(j.id);
+                actions.appendChild(dismissBtn);
+            }
+            item.appendChild(actions);
+            list.appendChild(item);
+        });
+    } catch(e) {}
+}
+
+// Poll jobs badge even when panel is closed
+setInterval(async function() {
+    if (_jobsPanelOpen) return; // panel polling handles it
+    try {
+        var res = await fetch('/api/jobs');
+        var data = await res.json();
+        var runCount = (data.jobs || []).filter(function(j) { return j.running; }).length;
+        updateJobsBadge(runCount);
+    } catch(e) {}
+}, 5000);
 
 // ── Step navigation ──
 function goStep(n) {
@@ -3331,15 +4304,32 @@ function addSource() {
     if (!config.sources) config.sources = [];
     config.sources.push({ path: '', label: 'Source ' + (config.sources.length + 1) });
     renderSources();
+    saveSourcesConfig();
 }
 
 function removeSource(i) {
     config.sources.splice(i, 1);
     renderSources();
+    saveSourcesConfig();
 }
 
 function updateSource(i, field, value) {
     config.sources[i][field] = value;
+    saveSourcesConfig();
+}
+
+var _sourcesSaveTimer = null;
+function saveSourcesConfig() {
+    // Debounce: save 500ms after last change to avoid spamming during typing
+    if (_sourcesSaveTimer) clearTimeout(_sourcesSaveTimer);
+    _sourcesSaveTimer = setTimeout(function() {
+        if (!config || !config.sources) return;
+        config.sources.forEach(function(s, i) {
+            if (!s.label || !s.label.trim()) s.label = 'Source ' + (i + 1);
+        });
+        // Use PATCH-style: merge sources into existing config on server
+        fetch('/api/config/sources', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ sources: config.sources }) });
+    }, 500);
 }
 
 async function completeStep2() {
@@ -3365,8 +4355,24 @@ async function loadFaceStep() {
     // Show verify button if there are persons with photos
     const hasPhotos = faces.some(f => f.photo_count > 0);
     document.getElementById('face-verify-btn-group').style.display = hasPhotos ? 'flex' : 'none';
-    if (!facesVerified) document.getElementById('btn-next-3').disabled = hasPhotos;
+
+    // Auto-verify if all people have cached encodings and at least 1 photo each
+    var allHaveEncodings = hasPhotos && faces.every(f => f.has_encodings && f.photo_count > 0);
+    var anyEmpty = faces.some(f => f.photo_count === 0);
+    if (allHaveEncodings && !anyEmpty) {
+        facesVerified = true;
+    }
+    if (anyEmpty) {
+        facesVerified = false;
+    }
+
+    if (!facesVerified) document.getElementById('btn-next-3').disabled = true;
+    else document.getElementById('btn-next-3').disabled = false;
     document.getElementById('btn-skip-faces').style.display = facesVerified ? 'none' : '';
+    // Restore saved face match mode
+    var savedMode = config && config.face_match_mode ? config.face_match_mode : 'any';
+    var radio = document.querySelector('input[name="face-match"][value="' + savedMode + '"]');
+    if (radio) radio.checked = true;
 }
 
 function renderFacePersons(faces) {
@@ -3375,24 +4381,39 @@ function renderFacePersons(faces) {
         container.innerHTML = '<p style="color:#a0aec0; font-style:italic;">No reference faces added yet. Add a person above, or skip this step.</p>';
         return;
     }
-    container.innerHTML = faces.map(f => `
-        <div style="background:#f7fafc; border:1px solid #e2e8f0; border-radius:8px; padding:15px; margin-bottom:12px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                <h3 style="color:#2b6cb0; margin:0; text-transform:capitalize;">${esc(f.name)}</h3>
-                <div style="display:flex; gap:8px; align-items:center;">
-                    <span style="color:#718096;">${f.photo_count} photo(s)</span>
-                    <button class="btn btn-secondary" onclick="removePerson('${esc(f.name)}')" style="margin:0; padding:4px 10px; font-size:.8em; background:#fed7d7; color:#c53030;">Remove</button>
-                </div>
-            </div>
-            <div id="face-thumbs-${f.name}" style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;"></div>
-            <div style="display:flex; gap:8px; align-items:center;">
-                <label style="margin:0; cursor:pointer;" class="btn btn-secondary" for="upload-${f.name}">+ Add Photos</label>
-                <input type="file" id="upload-${f.name}" multiple accept="image/*" style="display:none" onchange="uploadFacePhotos('${esc(f.name)}', this.files)">
-                <button class="btn btn-secondary" onclick="verifyPerson('${esc(f.name)}')" style="margin:0">Verify Face</button>
-            </div>
-            <div id="face-status-${f.name}" style="margin-top:8px;"></div>
-        </div>
-    `).join('');
+
+    // Pre-populate faceVerifyCache for people with verified_photos from library
+    faces.forEach(function(f) {
+        if (f.verified_photos && f.verified_photos.length && !faceVerifyCache[f.name]) {
+            var statuses = {};
+            f.verified_photos.forEach(function(fn) { statuses[fn] = 'ok'; });
+            faceVerifyCache[f.name] = statuses;
+        }
+    });
+
+    container.innerHTML = faces.map(f => {
+        var divScore = f.diversity_score != null ? Math.round(f.diversity_score * 100) : null;
+        var divColor = divScore !== null ? (divScore >= 60 ? '#4caf50' : divScore >= 40 ? '#ff9800' : '#f44336') : '#a0aec0';
+        var divBadge = divScore !== null ? '<span style="font-size:.8em; font-weight:600; color:' + divColor + '; margin-left:8px;">Diversity: ' + divScore + '%</span>' : '';
+        var encBadge = f.has_encodings ? '<span style="font-size:.75em; color:#38a169; margin-left:6px;" title="Face encodings cached — no re-detection needed">&#10003; Verified</span>' : '';
+        return '<div style="background:#f7fafc; border:1px solid ' + (f.has_encodings ? '#9ae6b4' : '#e2e8f0') + '; border-radius:8px; padding:15px; margin-bottom:12px;">' +
+            '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">' +
+                '<h3 style="color:#2b6cb0; margin:0; text-transform:capitalize;">' + esc(f.name) + encBadge + '</h3>' +
+                '<div style="display:flex; gap:8px; align-items:center;">' +
+                    '<span style="color:#718096;">' + f.photo_count + ' photo(s)</span>' + divBadge +
+                    '<button class="btn btn-secondary" onclick="saveToLibrary(\\\'' + esc(f.name) + '\\\')" style="margin:0; padding:4px 10px; font-size:.8em; background:#ebf8ff; color:#2b6cb0;" title="Save to global face library for reuse in other projects">Save to Library</button>' +
+                    '<button class="btn btn-secondary" onclick="removePerson(\\\'' + esc(f.name) + '\\\')" style="margin:0; padding:4px 10px; font-size:.8em; background:#fed7d7; color:#c53030;">Remove</button>' +
+                '</div>' +
+            '</div>' +
+            '<div id="face-thumbs-' + f.name + '" style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;"></div>' +
+            '<div style="display:flex; gap:8px; align-items:center;">' +
+                '<label style="margin:0; cursor:pointer;" class="btn btn-secondary" for="upload-' + f.name + '">+ Add Photos</label>' +
+                '<input type="file" id="upload-' + f.name + '" multiple accept="image/*" style="display:none" onchange="uploadFacePhotos(\\\'' + esc(f.name) + '\\\', this.files)">' +
+                '<button class="btn btn-secondary" onclick="verifyPerson(\\\'' + esc(f.name) + '\\\')" style="margin:0">Verify Face</button>' +
+            '</div>' +
+            '<div id="face-status-' + f.name + '" style="margin-top:8px;"></div>' +
+        '</div>';
+    }).join('');
 
     // Load thumbnails for each person
     faces.forEach(f => loadFaceThumbs(f.name));
@@ -3623,12 +4644,121 @@ async function addPerson() {
         body: JSON.stringify({person: name, photos: []})
     });
     inp.value = '';
+    // New person has no encodings — force re-verification
+    facesVerified = false;
+    document.getElementById('btn-next-3').disabled = true;
     loadFaceStep();
+}
+
+async function showFaceLibrary() {
+    var panel = document.getElementById('face-library-panel');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    if (panel.style.display === 'none') return;
+    var listEl = document.getElementById('face-library-list');
+    listEl.innerHTML = 'Loading...';
+    try {
+        var res = await fetch('/api/face-library');
+        var people = await res.json();
+        if (!people.length) {
+            listEl.innerHTML = '<p style="color:#a0aec0; font-style:italic;">No saved people yet. Add reference photos and click "Save to Library" to build your library.</p>';
+            return;
+        }
+        listEl.innerHTML = '';
+        people.forEach(function(p) {
+            var row = document.createElement('div');
+            row.style.cssText = 'display:flex; align-items:center; justify-content:space-between; padding:8px 12px; border:1px solid #e2e8f0; border-radius:6px; margin-bottom:6px; background:white;';
+            var info = document.createElement('div');
+            info.style.cssText = 'display:flex; align-items:center; gap:10px;';
+            var nameEl = document.createElement('span');
+            nameEl.style.cssText = 'font-weight:600; color:#2d3748; text-transform:capitalize;';
+            nameEl.textContent = p.name;
+            var countEl = document.createElement('span');
+            countEl.style.cssText = 'font-size:.8em; color:#a0aec0;';
+            countEl.textContent = p.photo_count + ' photo(s)';
+            info.appendChild(nameEl);
+            info.appendChild(countEl);
+            var btns = document.createElement('div');
+            btns.style.cssText = 'display:flex; gap:6px;';
+            var useBtn = document.createElement('button');
+            useBtn.className = 'btn btn-secondary';
+            useBtn.style.cssText = 'margin:0; padding:4px 12px; font-size:.8em; background:#f0fff4; color:#276749; border-color:#9ae6b4;';
+            useBtn.textContent = 'Use in Project';
+            (function(name) {
+                useBtn.onclick = function() { importFromLibrary(name); };
+            })(p.name);
+            var delBtn = document.createElement('button');
+            delBtn.className = 'btn btn-secondary';
+            delBtn.style.cssText = 'margin:0; padding:4px 8px; font-size:.8em; background:#fed7d7; color:#c53030;';
+            delBtn.textContent = 'Delete';
+            (function(name) {
+                delBtn.onclick = function() { deleteFromLibrary(name); };
+            })(p.name);
+            btns.appendChild(useBtn);
+            btns.appendChild(delBtn);
+            row.appendChild(info);
+            row.appendChild(btns);
+            listEl.appendChild(row);
+        });
+    } catch(e) { listEl.innerHTML = 'Error loading library'; }
+}
+
+async function importFromLibrary(name) {
+    var res = await fetch('/api/face-library/import', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ person: name })
+    });
+    var data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    document.getElementById('face-library-panel').style.display = 'none';
+    // Library faces are pre-verified — enable Next button
+    facesVerified = true;
+    document.getElementById('btn-next-3').disabled = false;
+    document.getElementById('btn-skip-faces').style.display = 'none';
+    loadFaceStep();
+}
+
+async function saveToLibrary(name) {
+    var statusEl = document.getElementById('face-status-' + name);
+    if (statusEl) statusEl.innerHTML = '<span style="color:#dd6b20; font-size:.85em;">Verifying all photos before saving...</span>';
+
+    // First verify all photos have detectable faces
+    var vRes = await fetch('/api/ref-faces/verify', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ person: name })
+    });
+    var vData = await vRes.json();
+    var personResult = vData.persons && vData.persons[0];
+    if (!personResult) { alert('Verification failed'); return; }
+
+    if (personResult.fail_count > 0) {
+        var badPhotos = personResult.photos.filter(function(p) { return p.status !== 'ok' && p.status !== 'ok_multi'; });
+        var names = badPhotos.map(function(p) { return p.filename; }).join(', ');
+        if (statusEl) statusEl.innerHTML = '<span style="color:#e53e3e; font-size:.85em;">Cannot save: ' + personResult.fail_count + ' photo(s) have no detectable face (' + names + '). Remove or replace them first.</span>';
+        return;
+    }
+
+    // All photos verified — now save
+    if (statusEl) statusEl.innerHTML = '<span style="color:#dd6b20; font-size:.85em;">Saving to library...</span>';
+    var res = await fetch('/api/face-library/save', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ person: name })
+    });
+    var data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    if (statusEl) statusEl.innerHTML = '<span style="color:#38a169; font-size:.85em;">Saved to library (' + data.photos_saved + ' photos, ' + data.encodings + ' face encodings)</span>';
+}
+
+async function deleteFromLibrary(name) {
+    if (!confirm('Remove ' + name + ' from the global library?')) return;
+    await fetch('/api/face-library/' + encodeURIComponent(name), { method: 'DELETE' });
+    showFaceLibrary();
 }
 
 async function removePerson(name) {
     if (!confirm('Remove all reference photos for ' + name + '?')) return;
     await fetch('/api/ref-faces/' + encodeURIComponent(name), {method: 'DELETE'});
+    // Reset verification — loadFaceStep will re-check if all remaining have encodings
+    facesVerified = false;
     loadFaceStep();
 }
 
@@ -3817,12 +4947,43 @@ async function verifyAllFaces() {
 
 async function runVerifyAll() {
     const allReady = await verifyAllFaces();
-    facesVerified = true;
     document.getElementById('btn-skip-faces').style.display = 'none';
     if (allReady) {
+        facesVerified = true;
         document.getElementById('btn-next-3').disabled = false;
     } else {
-        document.getElementById('btn-next-3').disabled = false;  // allow proceed with warning
+        // Check specific issues — block if any person has no encodings, failed photos, or low diversity
+        var res = await fetch('/api/ref-faces/verify', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({})
+        });
+        var data = await res.json();
+        var canProceed = true;
+        var blockReasons = [];
+        for (var p of (data.persons || [])) {
+            if (p.encodings === 0) {
+                canProceed = false;
+                blockReasons.push(p.person + ': no faces detected');
+            } else if (p.fail_count > 0) {
+                canProceed = false;
+                blockReasons.push(p.person + ': ' + p.fail_count + ' photo(s) have no detectable face — remove or replace them');
+            } else if (p.diversity_score < 0.5) {
+                canProceed = false;
+                blockReasons.push(p.person + ': diversity too low (' + Math.round(p.diversity_score * 100) + '%) — add more varied photos');
+            }
+        }
+        if (canProceed) {
+            facesVerified = true;
+            document.getElementById('btn-next-3').disabled = false;
+        } else {
+            facesVerified = false;
+            document.getElementById('btn-next-3').disabled = true;
+            var resultsEl = document.getElementById('face-verify-results');
+            resultsEl.innerHTML += '<div style="margin-top:10px; padding:12px; background:#fff5f5; border:1px solid #feb2b2; border-radius:6px; font-size:.85em; color:#9b2c2c;">' +
+                '<strong>Cannot proceed:</strong><ul style="margin:6px 0 0 16px;">' +
+                blockReasons.map(function(r) { return '<li>' + r + '</li>'; }).join('') +
+                '</ul></div>';
+        }
     }
 }
 
@@ -3853,37 +5014,50 @@ function skipFaces() {
 }
 
 async function completeFacesStep() {
-    // Get list of persons with faces
-    const res = await fetch('/api/ref-faces');
-    const faces = await res.json();
-    const personsWithPhotos = faces.filter(f => f.photo_count > 0);
+    var btn = document.getElementById('btn-next-3');
+    btn.disabled = true;
+    btn.innerHTML = '<span style="display:inline-block;width:14px;height:14px;border:2px solid #bee3f8;border-top:2px solid #fff;border-radius:50%;animation:spinA .7s linear infinite;vertical-align:middle;margin-right:6px;"></span>Loading...';
 
-    var personNames = personsWithPhotos.map(f => f.name);
+    try {
+        // Get list of persons with faces
+        const res = await fetch('/api/ref-faces');
+        const faces = await res.json();
+        const personsWithPhotos = faces.filter(f => f.photo_count > 0);
 
-    if (personNames.length > 0) {
-        if (!facesVerified) {
-            // Force verify first
-            await runVerifyAll();
-            return;  // let user see results before proceeding
+        var personNames = personsWithPhotos.map(f => f.name);
+
+        if (personNames.length > 0) {
+            if (!facesVerified) {
+                btn.disabled = false;
+                btn.textContent = 'Next: Start Scan';
+                await runVerifyAll();
+                return;
+            }
+            const verifyRes = await fetch('/api/ref-faces/verify', {
+                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})
+            });
+            const verifyData = await verifyRes.json();
+            if (!verifyData.ready) {
+                if (!confirm('Some face references need more photos for reliable recognition. Proceed anyway?')) {
+                    btn.disabled = false;
+                    btn.textContent = 'Next: Start Scan';
+                    return;
+                }
+            }
+            config.face_names = personNames;
+            config.face_match_mode = personNames.length > 1 ? getFaceMatchMode() : 'any';
+        } else {
+            config.face_names = [];
+            config.face_match_mode = 'any';
         }
-        // Check if all ready
-        const verifyRes = await fetch('/api/ref-faces/verify', {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})
-        });
-        const verifyData = await verifyRes.json();
-        if (!verifyData.ready) {
-            if (!confirm('Some face references need more photos for reliable recognition. Proceed anyway?')) return;
-        }
-        config.face_names = personNames;
-        config.face_match_mode = personNames.length > 1 ? getFaceMatchMode() : 'any';
-    } else {
-        config.face_names = [];
-        config.face_match_mode = 'any';
+
+        await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
+        document.querySelectorAll('.step-dot')[3].classList.add('done');
+        goStep(4);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Next: Start Scan';
     }
-
-    await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(config) });
-    document.querySelectorAll('.step-dot')[3].classList.add('done');
-    goStep(4);
 }
 
 // ── Step 4: Scan ──
@@ -3894,10 +5068,29 @@ async function checkExistingScan() {
 
     const res = await fetch('/api/stats');
     const st = await res.json();
-    if (st.has_scan && st.total_images > 0) {
+    var scanBtn = document.getElementById('btn-start-scan');
+    if (st.has_scan && st.total_media > 0) {
         document.getElementById('btn-next-4').disabled = false;
         document.getElementById('scan-progress').style.display = 'block';
-        document.getElementById('scan-progress').innerHTML = '<div class="line" style="color:#38a169;">Existing scan found: ' + st.total_images + ' images from ' + (st.sources?.length || 0) + ' sources. You can proceed or rescan.</div>';
+        if (st.partial) {
+            document.getElementById('scan-progress').innerHTML =
+                '<div class="line" style="color:#dd6b20;">' +
+                '<strong>Partial scan saved:</strong> ' + st.total_scanned + ' files scanned, ' +
+                st.total_media + ' images saved (' + st.qualified + ' qualified). ' +
+                'Click <strong>Continue Scanning</strong> to resume from where you left off.</div>';
+            scanBtn.textContent = 'Continue Scanning';
+            scanBtn.onclick = function() { startScan(false); };
+        } else {
+            document.getElementById('scan-progress').innerHTML =
+                '<div class="line" style="color:#38a169;">' +
+                '<strong>Scan complete:</strong> ' + st.total_media + ' images from ' +
+                (st.sources?.length || 0) + ' sources (' + st.qualified + ' qualified). You can proceed or rescan.</div>';
+            scanBtn.textContent = 'Continue Scanning';
+            scanBtn.onclick = function() { startScan(false); };
+        }
+    } else {
+        scanBtn.textContent = 'Start Scan';
+        scanBtn.onclick = function() { startScan(false); };
     }
 }
 
@@ -3974,7 +5167,7 @@ async function startScan(full) {
     const ageEst = getAgeEstConfig();
     await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({full, nsfw_filter: nsfwFilter, age_estimation: ageEst}) });
     btn.disabled = false;
-    btn.textContent = 'Start Scan';
+    btn.textContent = 'Continue Scanning';
     showTaskOverlay('scan');
     // Override completion handler
     const origPoll = taskPoll;
@@ -3988,6 +5181,8 @@ async function startScan(full) {
                     document.getElementById('btn-next-4').disabled = false;
                     document.querySelectorAll('.step-dot')[4].classList.add('done');
                 }
+                // Refresh scan status display
+                checkExistingScan();
             }
         } catch(e) {}
     }, 2000);
@@ -4561,6 +5756,7 @@ async function saveCurrentProject() {
         var data = await res.json();
         if (data.error) { alert(data.error); return; }
         if (config) config.project_name = name;
+        updateProjectNameBar(name);
         await loadProjectList();
     } catch(e) { alert('Save failed: ' + e.message); }
 }
@@ -4586,6 +5782,13 @@ async function loadProject(dirName) {
             config = cfg;
             selectedTemplate = cfg.event_type;
         }
+        // Reset all step dots, then mark steps before saved step as done
+        var dots = document.querySelectorAll('.step-dot');
+        dots.forEach(function(d) { d.classList.remove('done'); });
+        for (var si = 0; si < savedStep && si < dots.length; si++) {
+            dots[si].classList.add('done');
+        }
+        updateProjectNameBar(config ? config.project_name || config.event_name : '');
         goStep(savedStep);
     } catch(e) { alert('Load failed: ' + e.message); }
 }
@@ -4601,6 +5804,8 @@ async function newProject() {
         faceVerifyCache = {};
         replacedPhotos = {};
         document.getElementById('inp-project-name').value = '';
+        document.querySelectorAll('.step-dot').forEach(function(d) { d.classList.remove('done'); });
+        updateProjectNameBar('');
         await loadTemplates();
         goStep(0);
     } catch(e) { alert('Error: ' + e.message); }
@@ -4811,6 +6016,19 @@ function endTutorial() {
 }
 
 // ── Personalized greeting ──
+function updateProjectNameBar(name) {
+    var bar = document.getElementById('project-name-bar');
+    var txt = document.getElementById('project-name-text');
+    if (name && name.trim()) {
+        txt.textContent = name.trim();
+        bar.style.display = '';
+        document.title = name.trim() + ' — E-z Photo Organizer';
+    } else {
+        bar.style.display = 'none';
+        document.title = 'E-z Photo Organizer';
+    }
+}
+
 async function loadGreeting() {
     try {
         var res = await fetch('/api/auth/me');
@@ -5511,7 +6729,28 @@ function renderAgeResults() {
 
 // ── Init ──
 document.getElementById('inp-birthday').max = new Date().toISOString().split('T')[0];
-loadTemplates();
+loadTemplates().then(function() {
+    // On initial load, show project name and check progress
+    if (config && (config.project_name || config.event_name)) {
+        updateProjectNameBar(config.project_name || config.event_name);
+    }
+    if (config && config.event_type) {
+        fetch('/api/stats').then(r => r.json()).then(function(st) {
+            var dots = document.querySelectorAll('.step-dot');
+            // Determine highest completed step based on what exists
+            var highest = 0;
+            if (config.event_type) highest = 1;  // Event done
+            if (config.categories && config.categories.length) highest = 2;  // Categories done
+            if (config.sources && config.sources.length) highest = 3;  // Sources done
+            if (config.face_names && config.face_names.length) highest = 4;  // Faces done
+            if (st.has_scan && st.total_media > 0) highest = 4;  // Scan at least started
+            if (st.has_scan && st.total_media > 0 && !st.partial) highest = 5;  // Scan complete
+            for (var si = 0; si < highest && si < dots.length; si++) {
+                dots[si].classList.add('done');
+            }
+        });
+    }
+});
 loadGreeting();
 </script>
 </body>
