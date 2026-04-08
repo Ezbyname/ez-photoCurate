@@ -39,3 +39,19 @@ final_collection_1/
 Thumbs.db
 desktop.ini
 analysis_report.json
+
+# Build output
+dist/
+build/
+*.spec
+*.iconset/
+
+# Logs
+*.log
+
+# Database
+auth.db
+
+# Large / personal files
+face_library/
+age_results.json

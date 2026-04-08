@@ -630,6 +630,164 @@ def api_scan_start():
             _update_task("Pass 1: Collecting file list...")
             pass1_start = _time.monotonic()
 
+            def _compute_photo_grade(fpath, w, h):
+                """
+                Comprehensive photo quality grading (0-100 each dimension).
+                Returns dict with sub-scores and composite grade.
+                Computes: resolution, sharpness, noise, compression, color,
+                exposure, focus, distortion + composite.
+                """
+                try:
+                    import cv2
+                    import numpy as np
+                    from PIL import ImageStat
+
+                    pil_img = PILImage.open(fpath)
+                    pil_rgb = pil_img.convert("RGB")
+                    file_size_kb = os.path.getsize(fpath) / 1024
+                    megapixels = (w * h) / 1_000_000
+
+                    # Resize for analysis (consistent measurement)
+                    measure_size = min(800, max(w, h))
+                    scale = measure_size / max(w, h)
+                    if scale < 1:
+                        pil_small = pil_rgb.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+                    else:
+                        pil_small = pil_rgb
+                    rgb_arr = np.array(pil_small)
+                    gray_arr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2GRAY)
+                    sh, sw = gray_arr.shape
+
+                    # ── 1. Resolution (0-100): megapixels scaled ──
+                    # 0.5MP=20, 2MP=50, 5MP=70, 12MP=90, 20MP+=100
+                    resolution = min(100, max(0, 20 + megapixels * 10))
+
+                    # ── 2. Sharpness (0-100): Laplacian variance ──
+                    laplacian = cv2.Laplacian(gray_arr, cv2.CV_64F)
+                    sharpness_var = laplacian.var()
+                    sharpness = min(100, max(0, sharpness_var / 8))
+
+                    # ── 3. Noise/Grain (0-100, higher=less noise=better) ──
+                    # Estimate noise via high-pass filter standard deviation
+                    # Median filter removes signal, difference = noise estimate
+                    median_filtered = cv2.medianBlur(gray_arr, 5)
+                    noise_diff = gray_arr.astype(np.float32) - median_filtered.astype(np.float32)
+                    noise_std = noise_diff.std()
+                    # noise_std: 0-3 = very clean, 5-10 = some noise, 15+ = noisy
+                    noise = min(100, max(0, 100 - noise_std * 5))
+
+                    # ── 4. Compression artifacts (0-100, higher=less artifacts) ──
+                    # KB per megapixel: higher = less compressed = better
+                    kb_per_mp = file_size_kb / max(megapixels, 0.01)
+                    # 200 KB/MP = heavy JPEG, 500 = normal, 1000+ = high quality
+                    compression = min(100, max(0, kb_per_mp / 15))
+
+                    # ── 5. Color accuracy & dynamic range (0-100) ──
+                    stat = ImageStat.Stat(pil_small)
+                    # Color saturation: convert to HSV, measure saturation channel
+                    hsv_arr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV)
+                    mean_sat = hsv_arr[:, :, 1].mean()  # 0-255
+                    sat_score = min(100, mean_sat / 1.5)  # ~170 sat = 100
+
+                    # Dynamic range: difference between darkest and brightest regions
+                    p5 = np.percentile(gray_arr, 5)
+                    p95 = np.percentile(gray_arr, 95)
+                    dyn_range = p95 - p5  # 0-255
+                    range_score = min(100, max(0, dyn_range / 2.0))  # 200+ range = 100
+
+                    color = sat_score * 0.4 + range_score * 0.6
+
+                    # ── 6. Exposure & lighting (0-100) ──
+                    mean_brightness = sum(stat.mean[:3]) / 3  # 0-255
+                    if 80 <= mean_brightness <= 180:
+                        exposure = 100
+                    elif mean_brightness < 40 or mean_brightness > 230:
+                        exposure = 20
+                    elif mean_brightness < 80:
+                        exposure = 20 + (mean_brightness - 40) * 2
+                    else:  # > 180
+                        exposure = 20 + (230 - mean_brightness) * 1.6
+
+                    # Bonus/penalty for contrast (std dev of brightness)
+                    brightness_std = np.std(gray_arr)
+                    # Good contrast: std 40-80, too flat: <20, too harsh: >100
+                    if 30 <= brightness_std <= 80:
+                        contrast_bonus = 0
+                    elif brightness_std < 15:
+                        contrast_bonus = -15  # flat/washed out
+                    elif brightness_std > 100:
+                        contrast_bonus = -10  # harsh
+                    else:
+                        contrast_bonus = -5
+                    exposure = max(0, min(100, exposure + contrast_bonus))
+
+                    # ── 7. Focus & depth of field (0-100) ──
+                    # Compare sharpness in center vs edges
+                    ch, cw = sh // 4, sw // 4
+                    center = gray_arr[ch:sh-ch, cw:sw-cw]
+                    center_lap = cv2.Laplacian(center, cv2.CV_64F).var()
+
+                    # Edge regions
+                    top = gray_arr[:ch, :]
+                    bottom = gray_arr[sh-ch:, :]
+                    edge_lap = (cv2.Laplacian(top, cv2.CV_64F).var() +
+                                cv2.Laplacian(bottom, cv2.CV_64F).var()) / 2
+
+                    # Good focus: center sharper than edges (subject in focus, bg bokeh ok)
+                    if center_lap > 20:
+                        focus_sharpness = min(100, center_lap / 8)
+                        # Slight bonus if center is sharper (good depth of field control)
+                        if edge_lap > 0 and center_lap / max(edge_lap, 1) > 1.5:
+                            focus_bonus = 5
+                        else:
+                            focus_bonus = 0
+                        focus = min(100, focus_sharpness + focus_bonus)
+                    else:
+                        focus = max(0, center_lap / 8 * 100)
+
+                    # ── 8. Lack of distortion (0-100) ──
+                    # Penalize extreme aspect ratios and very small images
+                    ratio = w / h if h > 0 else 1
+                    if 0.6 <= ratio <= 1.8:
+                        distortion = 100
+                    elif ratio < 0.4 or ratio > 3:
+                        distortion = 30
+                    else:
+                        distortion = 65
+                    # Small dimension penalty
+                    min_dim_val = min(w, h)
+                    if min_dim_val < 500:
+                        distortion = max(0, distortion - 20)
+
+                    pil_img.close()
+
+                    # ── Composite grade (weighted) ──
+                    composite = (
+                        resolution * 0.10 +
+                        sharpness * 0.20 +
+                        noise * 0.10 +
+                        compression * 0.05 +
+                        color * 0.10 +
+                        exposure * 0.15 +
+                        focus * 0.20 +
+                        distortion * 0.10
+                    )
+
+                    return {
+                        "resolution": round(resolution, 1),
+                        "sharpness": round(sharpness, 1),
+                        "noise": round(noise, 1),
+                        "compression": round(compression, 1),
+                        "color": round(color, 1),
+                        "exposure": round(exposure, 1),
+                        "focus": round(focus, 1),
+                        "distortion": round(distortion, 1),
+                        "composite": round(composite, 1),
+                        "blur_score": round(sharpness_var, 1),
+                    }
+                except Exception:
+                    return None
+
             def _extract_metadata(fpath, fname, fhash, is_video, src_label, rel_dir):
                 """Thread-safe metadata extraction (no face detection)."""
                 try:
@@ -645,6 +803,14 @@ def api_scan_start():
                         duration = 0
                     if not is_video and w < min_dim and h < min_dim:
                         return None, "low_res", fhash
+
+                    # Photo quality grading (images only)
+                    photo_grade = None
+                    blur_score = None
+                    if not is_video:
+                        photo_grade = _compute_photo_grade(fpath, w, h)
+                        if photo_grade:
+                            blur_score = photo_grade.get("blur_score")
 
                     if is_video:
                         img_date = get_video_date(fpath)
@@ -702,6 +868,8 @@ def api_scan_start():
                         "gps_lat": gps_coords[0] if gps_coords else None,
                         "gps_lon": gps_coords[1] if gps_coords else None,
                         "location": None,  # resolved in batch after Pass 1
+                        "blur_score": blur_score,
+                        "photo_grade": photo_grade,
                     }
 
                     # For manual categorization
@@ -710,9 +878,13 @@ def api_scan_start():
                         entry["category"] = bracket
 
                     # Preliminary status (will be updated after face detection in Pass 2)
+                    blur_threshold = config.get("blur_threshold", 50)
                     if screenshot:
                         entry["status"] = "rejected"
                         entry["reject_reason"] = "screenshot"
+                    elif blur_score is not None and blur_score < blur_threshold:
+                        entry["status"] = "rejected"
+                        entry["reject_reason"] = "blurry"
                     elif not bracket:
                         entry["status"] = "pool"
                         entry["reject_reason"] = "no_date"
@@ -1039,7 +1211,11 @@ def api_scan_start():
             save_scan_db(db)
 
             found_target = sum(1 for e in all_images if e.get("has_target_face"))
-            _update_task(f"Done! {len(all_images)} images, {found_target} with target face ({total_elapsed:.0f}s)")
+            blurry_count = sum(1 for e in all_images if e.get("reject_reason") == "blurry")
+            graded = [e["photo_grade"]["composite"] for e in all_images if e.get("photo_grade")]
+            grade_avg = round(sum(graded) / len(graded), 1) if graded else 0
+            _update_task(f"Done! {len(all_images)} images, {found_target} with target face, "
+                         f"{blurry_count} blurry rejected, avg grade {grade_avg}/100 ({total_elapsed:.0f}s)")
             _finish_task()
 
         except Exception as e:
@@ -1278,6 +1454,10 @@ def api_quick_fill():
             event_type = get_event_type(config)
             knowledge = EVENT_KNOWLEDGE.get(event_type, EVENT_KNOWLEDGE.get("photo_book"))
             weights = knowledge.get("quality_weights", {})
+            # Inject taste quiz so scoring can use it
+            taste_quiz = config.get("taste_quiz")
+            if taste_quiz:
+                weights["_taste_quiz"] = taste_quiz
 
             # Group by category (only face-matched when face names are configured)
             face_names = config.get("face_names", [])
@@ -1442,6 +1622,135 @@ def api_images_move():
 
     save_scan_db(db)
     return jsonify({"ok": True, "moved": moved})
+
+
+@app.route("/api/curate/save", methods=["POST"])
+def api_curate_save():
+    """Bulk-save gallery changes. Expects {changes: [{hash, category, status}, ...]}."""
+    data = request.json or {}
+    items = data.get("changes", [])
+    if not items:
+        return jsonify({"ok": True, "updated": 0})
+
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    lookup = {}
+    for item in items:
+        lookup[item["hash"]] = item
+
+    updated = 0
+    for img in db["images"]:
+        change = lookup.get(img["hash"])
+        if not change:
+            continue
+        img["category"] = change.get("category") or img.get("category")
+        img["status"] = change.get("status", img.get("status", "pool"))
+        if img["status"] == "pool":
+            img["reject_reason"] = img.get("reject_reason") or "manual_reject"
+        elif img["status"] == "qualified":
+            img["reject_reason"] = None
+        updated += 1
+
+    save_scan_db(db)
+
+    # Also persist to project dir if a project is loaded
+    config = load_config()
+    if config:
+        proj_name = config.get("project_name") or config.get("event_name") or ""
+        if proj_name:
+            pdir = os.path.join(PROJECTS_DIR, proj_name)
+            if os.path.isdir(pdir):
+                import shutil
+                shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
+
+    return jsonify({"ok": True, "updated": updated})
+
+
+@app.route("/api/images/preference", methods=["POST"])
+def api_images_preference():
+    """Set like/dislike preference for an image. Accepts {hash, preference} where
+    preference is 'like', 'dislike', or null to clear."""
+    data = request.json or {}
+    img_hash = data.get("hash")
+    preference = data.get("preference")  # 'like', 'dislike', or None
+
+    if not img_hash:
+        return jsonify({"error": "Missing hash"}), 400
+    if preference not in ("like", "dislike", None):
+        return jsonify({"error": "Invalid preference, must be 'like', 'dislike', or null"}), 400
+
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    found = False
+    for img in db["images"]:
+        if img["hash"] == img_hash:
+            if preference is None:
+                img.pop("preference", None)
+            else:
+                img["preference"] = preference
+            found = True
+            break
+
+    if not found:
+        return jsonify({"error": "Image not found"}), 404
+
+    save_scan_db(db)
+    return jsonify({"ok": True, "hash": img_hash, "preference": preference})
+
+
+@app.route("/api/preferences/summary")
+def api_preferences_summary():
+    """Return counts of liked/disliked/unrated images."""
+    db = load_scan_db()
+    if not db:
+        return jsonify({"error": "No scan data"}), 404
+
+    images = db.get("images", [])
+    liked = sum(1 for i in images if i.get("preference") == "like")
+    disliked = sum(1 for i in images if i.get("preference") == "dislike")
+    unrated = len(images) - liked - disliked
+
+    # Also collect per-image preference data for future model training
+    preferences = []
+    for img in images:
+        pref = img.get("preference")
+        if pref:
+            preferences.append({
+                "hash": img["hash"],
+                "preference": pref,
+                "category": img.get("category"),
+                "face_count": img.get("face_count", 0),
+                "has_target_face": img.get("has_target_face", False),
+                "size_kb": img.get("size_kb", 0),
+                "width": img.get("width", 0),
+                "height": img.get("height", 0),
+                "device": img.get("device"),
+                "source_label": img.get("source_label"),
+            })
+
+    return jsonify({
+        "liked": liked,
+        "disliked": disliked,
+        "unrated": unrated,
+        "total": len(images),
+        "preferences": preferences,
+    })
+
+
+@app.route("/api/preferences/quiz", methods=["POST"])
+def api_preferences_quiz():
+    """Save user taste quiz answers to the project config."""
+    data = request.json or {}
+    config = load_config()
+    if not config:
+        return jsonify({"error": "No config"}), 404
+    config["taste_quiz"] = data
+    save_config(config)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/images/serve/<img_hash>")
@@ -2285,6 +2594,13 @@ def api_stats():
         stats["selected"] = sum(1 for i in images if i.get("status") == "selected")
         stats["selected_videos"] = sum(1 for i in images if i.get("status") == "selected" and i.get("media_type") == "video")
         stats["pool"] = sum(1 for i in images if i.get("status") == "pool")
+        stats["rejected_blurry"] = sum(1 for i in images if i.get("reject_reason") == "blurry")
+        graded = [i.get("photo_grade", {}).get("composite", 0) for i in images if i.get("photo_grade")]
+        if graded:
+            stats["grade_avg"] = round(sum(graded) / len(graded), 1)
+            stats["grade_high"] = sum(1 for g in graded if g >= 70)
+            stats["grade_medium"] = sum(1 for g in graded if 40 <= g < 70)
+            stats["grade_low"] = sum(1 for g in graded if g < 40)
         stats["sources"] = list(set(i.get("source_label", "") for i in images))
         db_stats = db.get("stats", {})
         stats["partial"] = bool(db_stats.get("partial"))
@@ -2305,7 +2621,9 @@ def api_report():
 
     # Import report generation from curate.py
     sys.path.insert(0, PROJECT_DIR)
+    import importlib
     import curate
+    importlib.reload(curate)  # Ensure fresh module state
 
     class FakeArgs:
         output = os.path.join(PROJECT_DIR, "curate_report.html")
@@ -3079,6 +3397,54 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 #tour-tooltip .tour-next:hover { background:#5a67d8; }
 @keyframes tour-pulse { 0%,100% { box-shadow: 0 0 0 4000px rgba(0,0,0,.55); } 50% { box-shadow: 0 0 0 4000px rgba(0,0,0,.5), 0 0 0 8px rgba(102,126,234,.4); } }
 #tour-highlight.pulse { animation: tour-pulse 1.5s ease infinite; }
+
+/* ── Select page: hover like/dislike overlay ── */
+.sel-thumb .sel-hover-overlay {
+    position:absolute; top:0; left:0; width:100%; height:100%;
+    background:rgba(0,0,0,.45); display:flex; align-items:center;
+    justify-content:center; gap:12px; opacity:0; transition:opacity .18s;
+    pointer-events:none;
+}
+.sel-thumb:hover .sel-hover-overlay { opacity:1; pointer-events:auto; }
+.sel-pref-btn {
+    width:32px; height:32px; border-radius:50%; border:2px solid rgba(255,255,255,.5);
+    background:rgba(0,0,0,.5); font-size:16px; cursor:pointer; display:flex;
+    align-items:center; justify-content:center; transition:all .15s; padding:0;
+}
+.sel-pref-btn:hover { transform:scale(1.25); border-color:#fff; background:rgba(0,0,0,.7); }
+.sel-pref-active-like { background:#48bb78!important; border-color:#48bb78!important; }
+.sel-pref-active-dislike { background:#e53e3e!important; border-color:#e53e3e!important; }
+.sel-pred-badge { pointer-events:none; }
+
+/* ── Questionnaire modal ── */
+.pref-quiz-overlay {
+    position:fixed; top:0; left:0; width:100%; height:100%;
+    background:rgba(0,0,0,.6); z-index:9998; display:flex;
+    align-items:center; justify-content:center;
+}
+.pref-quiz {
+    background:#1e1e30; border-radius:12px; padding:28px 32px; max-width:560px;
+    width:90%; color:#e2e8f0; box-shadow:0 8px 40px rgba(0,0,0,.5);
+    max-height:85vh; overflow-y:auto;
+}
+.pref-quiz h3 { margin:0 0 16px; color:#667eea; font-size:1.1em; }
+.pref-quiz .q-group { margin-bottom:14px; }
+.pref-quiz label { display:block; font-size:.85em; color:#a0aec0; margin-bottom:4px; }
+.pref-quiz select, .pref-quiz input[type=range] { width:100%; }
+.pref-quiz .q-row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
+.pref-quiz .q-chip {
+    padding:4px 12px; border-radius:16px; border:1px solid #4a5568;
+    background:#2d3748; color:#cbd5e0; cursor:pointer; font-size:.8em;
+    transition:all .15s;
+}
+.pref-quiz .q-chip.active { background:#667eea; border-color:#667eea; color:white; }
+.pref-quiz .q-btns { display:flex; gap:10px; margin-top:18px; justify-content:flex-end; }
+.pref-quiz .q-btn {
+    padding:8px 20px; border:none; border-radius:6px; cursor:pointer;
+    font-size:.85em; font-weight:600;
+}
+.pref-quiz .q-btn-skip { background:#4a5568; color:#e2e8f0; }
+.pref-quiz .q-btn-save { background:#667eea; color:white; }
 </style>
 </head>
 <body>
@@ -3669,12 +4035,38 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
                 </label>
                 <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="selectAllVisible()">Select All</button>
                 <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" onclick="deselectAllVisible()">Deselect All</button>
+                <label style="margin-left:12px; font-size:.9em; color:#4a5568;">Sort:</label>
+                <select id="sel-sort" onchange="sortSelImages()" style="font-size:.85em; padding:2px 4px;">
+                    <option value="date">Date</option>
+                    <option value="grade">Best grade first</option>
+                    <option value="pref">Liked first</option>
+                    <option value="predicted">AI recommended</option>
+                </select>
+                <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em; margin-left:8px; background:#667eea; color:white; border-color:#667eea;" onclick="showPrefQuiz()">&#x2753; Taste Quiz</button>
+                <span id="sel-pref-stats" style="font-size:.8em; color:#718096; margin-left:8px;"></span>
             </div>
             <div id="sel-grid" style="display:flex; flex-wrap:wrap; gap:6px; max-height:55vh; overflow-y:auto; padding:4px;"></div>
             <div id="sel-grid-paging" style="margin-top:8px; display:none; font-size:.85em; color:#718096;">
                 <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" id="sel-prev" onclick="selPage(-1)">Prev</button>
                 <span id="sel-page-info"></span>
                 <button class="btn btn-secondary" style="padding:2px 10px; font-size:.85em;" id="sel-next" onclick="selPage(1)">Next</button>
+            </div>
+
+            <!-- Preference Library -->
+            <div id="pref-library" style="margin-top:16px; display:none;">
+                <div style="display:flex; gap:12px; align-items:center; margin-bottom:10px;">
+                    <button class="btn btn-secondary" id="pref-lib-toggle" style="padding:4px 14px; font-size:.85em;" onclick="togglePrefLibrary()">&#x2764; Show Liked &amp; Disliked Library</button>
+                </div>
+                <div id="pref-lib-content" style="display:none;">
+                    <div style="margin-bottom:12px;">
+                        <h4 style="color:#48bb78; margin:0 0 6px; font-size:.95em;">&#x1F44D; Liked Images (<span id="pref-lib-like-count">0</span>)</h4>
+                        <div id="pref-lib-liked" style="display:flex; flex-wrap:wrap; gap:6px; max-height:200px; overflow-y:auto; padding:4px; background:rgba(72,187,120,.08); border-radius:8px; min-height:40px;"></div>
+                    </div>
+                    <div>
+                        <h4 style="color:#e53e3e; margin:0 0 6px; font-size:.95em;">&#x1F44E; Disliked Images (<span id="pref-lib-dislike-count">0</span>)</h4>
+                        <div id="pref-lib-disliked" style="display:flex; flex-wrap:wrap; gap:6px; max-height:200px; overflow-y:auto; padding:4px; background:rgba(229,62,62,.08); border-radius:8px; min-height:40px;"></div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -5291,6 +5683,14 @@ async function loadSelCategories() {
     const res = await fetch('/api/categories/summary');
     selCats = await res.json();
     renderSelCatList();
+    // Load saved quiz preferences
+    try {
+        const cfgRes = await fetch('/api/config');
+        const cfg = await cfgRes.json();
+        if (cfg.taste_quiz) {
+            _prefPredictor._quizPrefs = cfg.taste_quiz;
+        }
+    } catch(e) {}
 }
 
 function renderSelCatList() {
@@ -5322,6 +5722,7 @@ function renderSelCatList() {
 }
 
 async function selectCategory(catId) {
+    if (catId === selActiveCat) return;
     selActiveCat = catId;
     selOffset = 0;
     renderSelCatList();
@@ -5330,6 +5731,7 @@ async function selectCategory(catId) {
     document.getElementById('sel-target-edit').style.display = 'flex';
     document.getElementById('sel-target-input').value = cat ? cat.target : 75;
     document.getElementById('sel-filter-bar').style.display = 'flex';
+    document.getElementById('pref-library').style.display = 'block';
     await loadSelImages();
 }
 
@@ -5348,8 +5750,11 @@ async function loadSelImages() {
         ...dSel.images.map(i => ({...i, _sel: true})),
         ...dQual.images.map(i => ({...i, _sel: false}))
     ];
+    // Train preference predictor from all rated images
+    _prefPredictor.train(selImages);
     renderSelGrid();
     updateSelCounter();
+    updatePrefStatsDisplay();
 }
 
 function updateSelCounter() {
@@ -5358,6 +5763,320 @@ function updateSelCounter() {
     const target = cat ? cat.target : 0;
     document.getElementById('sel-cat-counter').textContent =
         `${nSel} selected / ${target} target / ${selImages.length} available`;
+}
+
+// ── Preference Predictor (learns from user likes/dislikes) ──
+const _prefPredictor = {
+    // Feature extraction: turn image metadata into a numeric vector
+    _features(img) {
+        const g = img.photo_grade || {};
+        return [
+            (g.resolution || 50) / 100,
+            (g.sharpness || 50) / 100,
+            (g.noise || 50) / 100,
+            (g.compression || 50) / 100,
+            (g.color || 50) / 100,
+            (g.exposure || 50) / 100,
+            (g.focus || 50) / 100,
+            (g.distortion || 50) / 100,
+            (g.composite || 50) / 100,
+            img.face_count ? Math.min(img.face_count / 5, 1) : 0,
+            img.has_target_face ? 1 : 0,
+            img.face_distance != null ? (1 - img.face_distance) : 0.5,
+            (img.size_kb || 500) / 5000,
+            ((img.width || 1000) * (img.height || 1000)) / 20000000,
+            img.media_type === 'video' ? 1 : 0,
+        ];
+    },
+
+    // Learned weights (one per feature + bias), initialized to 0
+    _weights: null,
+    _bias: 0,
+    _trained: false,
+    _quizPrefs: null,  // from questionnaire
+
+    // Sigmoid
+    _sig(x) { return 1 / (1 + Math.exp(-Math.max(-10, Math.min(10, x)))); },
+
+    // Train from all rated images (logistic regression via gradient descent)
+    train(images) {
+        const rated = images.filter(i => i.preference === 'like' || i.preference === 'dislike');
+        if (rated.length < 5) { this._trained = false; return; }
+
+        const X = rated.map(i => this._features(i));
+        const Y = rated.map(i => i.preference === 'like' ? 1 : 0);
+        const nFeat = X[0].length;
+
+        // Initialize weights
+        let w = new Array(nFeat).fill(0);
+        let b = 0;
+        const lr = 0.5;
+        const epochs = 80;
+
+        for (let ep = 0; ep < epochs; ep++) {
+            let dw = new Array(nFeat).fill(0);
+            let db = 0;
+            for (let i = 0; i < X.length; i++) {
+                let z = b;
+                for (let j = 0; j < nFeat; j++) z += w[j] * X[i][j];
+                const pred = this._sig(z);
+                const err = pred - Y[i];
+                for (let j = 0; j < nFeat; j++) dw[j] += err * X[i][j];
+                db += err;
+            }
+            for (let j = 0; j < nFeat; j++) w[j] -= lr * dw[j] / X.length;
+            b -= lr * db / X.length;
+        }
+
+        this._weights = w;
+        this._bias = b;
+        this._trained = true;
+
+        // Apply quiz preferences as weight adjustments
+        if (this._quizPrefs) {
+            this._applyQuizBoosts();
+        }
+    },
+
+    _applyQuizBoosts() {
+        if (!this._weights || !this._quizPrefs) return;
+        const q = this._quizPrefs;
+        // Boost/penalize features based on quiz answers
+        // Index mapping: 0=resolution, 1=sharpness, 2=noise, 3=compression,
+        //   4=color, 5=exposure, 6=focus, 7=distortion, 8=composite,
+        //   9=face_count_norm, 10=has_target, 11=face_closeness, 12=size, 13=megapixels, 14=is_video
+        if (q.sharpness === 'high') { this._weights[1] += 0.3; this._weights[6] += 0.3; }
+        if (q.colorful === 'yes') { this._weights[4] += 0.4; }
+        if (q.faces === 'many') { this._weights[9] += 0.5; }
+        if (q.faces === 'few') { this._weights[9] -= 0.3; }
+        if (q.closeups === 'yes') { this._weights[11] += 0.3; }
+        if (q.resolution === 'high') { this._weights[0] += 0.3; this._weights[13] += 0.3; }
+        if (q.style === 'candid') { this._weights[10] -= 0.2; }
+        if (q.style === 'posed') { this._weights[10] += 0.3; }
+    },
+
+    // Predict preference for an unrated image
+    predict(img) {
+        if (!this._trained || !this._weights) return null;
+        const x = this._features(img);
+        let z = this._bias;
+        for (let j = 0; j < x.length; j++) z += this._weights[j] * x[j];
+        const p = this._sig(z);
+        if (p > 0.65) return 'like';
+        if (p < 0.35) return 'dislike';
+        return null;  // uncertain
+    },
+
+    // Get confidence score 0-100
+    confidence(img) {
+        if (!this._trained || !this._weights) return 0;
+        const x = this._features(img);
+        let z = this._bias;
+        for (let j = 0; j < x.length; j++) z += this._weights[j] * x[j];
+        const p = this._sig(z);
+        return Math.round(Math.abs(p - 0.5) * 200);  // 0=uncertain, 100=very confident
+    }
+};
+
+function setSelPref(img, pref) {
+    img.preference = pref;
+    fetch('/api/images/preference', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ hash: img.hash, preference: pref })
+    }).catch(err => console.warn('Preference save failed:', err));
+    // Retrain predictor with updated preferences
+    _prefPredictor.train(selImages);
+    renderSelGrid();
+    updateSelCounter();
+    updatePrefStatsDisplay();
+    // Refresh library if open
+    const libContent = document.getElementById('pref-lib-content');
+    if (libContent && libContent.style.display !== 'none') {
+        renderPrefLibrary();
+    }
+}
+
+// ── Preference Questionnaire ──
+let _quizShown = false;
+function showPrefQuiz() {
+    if (document.querySelector('.pref-quiz-overlay')) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'pref-quiz-overlay';
+    overlay.innerHTML = `
+    <div class="pref-quiz">
+        <h3>What kind of photos do you prefer? (optional)</h3>
+        <p style="font-size:.8em; color:#718096; margin:0 0 14px;">This helps us suggest images you'll like. Skip any question you're unsure about.</p>
+
+        <div class="q-group">
+            <label>Photo sharpness preference:</label>
+            <div class="q-row" data-field="sharpness">
+                <span class="q-chip" data-val="any">Don't mind</span>
+                <span class="q-chip" data-val="high">Must be sharp</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Color preference:</label>
+            <div class="q-row" data-field="colorful">
+                <span class="q-chip" data-val="any">No preference</span>
+                <span class="q-chip" data-val="yes">Vibrant &amp; colorful</span>
+                <span class="q-chip" data-val="muted">Soft / muted tones</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>People in photos:</label>
+            <div class="q-row" data-field="faces">
+                <span class="q-chip" data-val="any">Mix is fine</span>
+                <span class="q-chip" data-val="many">Prefer group shots</span>
+                <span class="q-chip" data-val="few">Prefer 1-2 people</span>
+                <span class="q-chip" data-val="none">Landscapes / objects too</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Close-ups of the subject:</label>
+            <div class="q-row" data-field="closeups">
+                <span class="q-chip" data-val="any">No preference</span>
+                <span class="q-chip" data-val="yes">Love close-up portraits</span>
+                <span class="q-chip" data-val="no">Prefer wider shots</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Photo style:</label>
+            <div class="q-row" data-field="style">
+                <span class="q-chip" data-val="any">Any style</span>
+                <span class="q-chip" data-val="candid">Candid / natural moments</span>
+                <span class="q-chip" data-val="posed">Posed / formal</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Image quality importance:</label>
+            <div class="q-row" data-field="resolution">
+                <span class="q-chip" data-val="any">Content matters more</span>
+                <span class="q-chip" data-val="high">High resolution preferred</span>
+            </div>
+        </div>
+
+        <hr style="border-color:#2d3748; margin:16px 0;">
+        <h3 style="margin:0 0 12px; font-size:1em; color:#a78bfa;">What types of images do you love?</h3>
+        <p style="font-size:.78em; color:#718096; margin:0 0 12px;">Pick all that apply — helps us prioritize the right moments.</p>
+
+        <div class="q-group">
+            <label>Moments you love (pick multiple):</label>
+            <div class="q-row" data-field="moments" data-multi="true">
+                <span class="q-chip" data-val="laughing">Laughing &amp; smiling</span>
+                <span class="q-chip" data-val="hugging">Hugs &amp; affection</span>
+                <span class="q-chip" data-val="playing">Playing &amp; action</span>
+                <span class="q-chip" data-val="eating">Meals &amp; celebrations</span>
+                <span class="q-chip" data-val="sleeping">Quiet / sleeping</span>
+                <span class="q-chip" data-val="milestone">Milestones (first steps, school, etc.)</span>
+                <span class="q-chip" data-val="silly">Funny / silly faces</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Scene types you prefer (pick multiple):</label>
+            <div class="q-row" data-field="scenes" data-multi="true">
+                <span class="q-chip" data-val="outdoor">Outdoors / nature</span>
+                <span class="q-chip" data-val="beach">Beach / pool</span>
+                <span class="q-chip" data-val="home">Home / everyday</span>
+                <span class="q-chip" data-val="travel">Travel / vacation</span>
+                <span class="q-chip" data-val="event">Events / parties</span>
+                <span class="q-chip" data-val="school">School / activities</span>
+                <span class="q-chip" data-val="sport">Sports / physical</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Who should be in the photos:</label>
+            <div class="q-row" data-field="subjects" data-multi="true">
+                <span class="q-chip" data-val="subject_alone">Just the subject</span>
+                <span class="q-chip" data-val="with_parents">With parents</span>
+                <span class="q-chip" data-val="with_siblings">With siblings</span>
+                <span class="q-chip" data-val="with_friends">With friends</span>
+                <span class="q-chip" data-val="with_grandparents">With grandparents</span>
+                <span class="q-chip" data-val="family_group">Whole family</span>
+                <span class="q-chip" data-val="pets">With pets</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Mood / energy:</label>
+            <div class="q-row" data-field="mood">
+                <span class="q-chip" data-val="any">Mix of everything</span>
+                <span class="q-chip" data-val="happy">Happy &amp; upbeat</span>
+                <span class="q-chip" data-val="calm">Calm &amp; intimate</span>
+                <span class="q-chip" data-val="dramatic">Dramatic &amp; artistic</span>
+            </div>
+        </div>
+
+        <div class="q-group">
+            <label>Anything to avoid?</label>
+            <div class="q-row" data-field="avoid" data-multi="true">
+                <span class="q-chip" data-val="messy_bg">Messy backgrounds</span>
+                <span class="q-chip" data-val="dark">Too dark images</span>
+                <span class="q-chip" data-val="selfies">Selfies</span>
+                <span class="q-chip" data-val="screenshots">Screenshots / memes</span>
+                <span class="q-chip" data-val="duplicates">Similar / near-duplicates</span>
+                <span class="q-chip" data-val="no_face">Photos without faces</span>
+            </div>
+        </div>
+
+        <div class="q-btns">
+            <button class="q-btn q-btn-skip" onclick="closePrefQuiz()">Skip</button>
+            <button class="q-btn q-btn-save" onclick="savePrefQuiz()">Apply Preferences</button>
+        </div>
+    </div>`;
+    document.body.appendChild(overlay);
+
+    // Chip toggle logic: single-select or multi-select
+    overlay.querySelectorAll('.q-chip').forEach(chip => {
+        chip.onclick = () => {
+            const row = chip.parentElement;
+            if (row.dataset.multi === 'true') {
+                // Multi-select: toggle individual chip
+                chip.classList.toggle('active');
+            } else {
+                // Single-select: deselect others, select this
+                row.querySelectorAll('.q-chip').forEach(c => c.classList.remove('active'));
+                chip.classList.add('active');
+            }
+        };
+    });
+}
+
+function closePrefQuiz() {
+    document.querySelector('.pref-quiz-overlay')?.remove();
+}
+
+function savePrefQuiz() {
+    const prefs = {};
+    document.querySelectorAll('.pref-quiz .q-row').forEach(row => {
+        const field = row.dataset.field;
+        if (row.dataset.multi === 'true') {
+            // Collect all active chips as array
+            const vals = [...row.querySelectorAll('.q-chip.active')].map(c => c.dataset.val);
+            if (vals.length) prefs[field] = vals;
+        } else {
+            const active = row.querySelector('.q-chip.active');
+            if (active) prefs[field] = active.dataset.val;
+        }
+    });
+    _prefPredictor._quizPrefs = prefs;
+    // Save to server for persistence
+    fetch('/api/preferences/quiz', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(prefs)
+    }).catch(() => {});
+    // Retrain with quiz applied
+    if (_prefPredictor._trained) _prefPredictor._applyQuizBoosts();
+    closePrefQuiz();
+    renderSelGrid();
 }
 
 function renderSelGrid() {
@@ -5380,22 +6099,150 @@ function renderSelGrid() {
     grid.innerHTML = '';
     paged.forEach(img => {
         const div = document.createElement('div');
+        div.className = 'sel-thumb';
         div.style.cssText = `width:100px; height:100px; border-radius:6px; overflow:hidden; cursor:pointer; position:relative;
-            border:3px solid ${img._sel ? '#3182ce' : '#e2e8f0'}; flex-shrink:0;`;
+            border:3px solid ${img._sel ? '#3182ce' : img.preference === 'like' ? '#48bb78' : img.preference === 'dislike' ? '#e53e3e' : '#e2e8f0'}; flex-shrink:0;`;
         if (img._sel) div.style.boxShadow = '0 0 0 2px #bee3f8';
         const thumbSrc = img.thumb ? 'data:image/jpeg;base64,' + img.thumb : '';
         const isVid = img.media_type === 'video';
         const vidBadge = isVid ? '<div style="position:absolute; bottom:2px; left:2px; background:rgba(0,0,0,.7); color:#fff; border-radius:4px; padding:1px 5px; font-size:10px; font-weight:600;">&#9654; VID</div>' : '';
+        const gc = img.photo_grade?.composite;
+        const gradeColor = gc >= 70 ? '#48bb78' : gc >= 40 ? '#ed8936' : gc != null ? '#e53e3e' : '';
+        const gradeBadge = gc != null ? `<div style="position:absolute; bottom:2px; right:2px; background:${gradeColor}; color:#fff; border-radius:4px; padding:1px 5px; font-size:10px; font-weight:700;">${Math.round(gc)}</div>` : '';
+        // Predicted preference indicator
+        const pred = _prefPredictor.predict(img);
+        const predBadge = (!img.preference && pred) ? `<div class="sel-pred-badge" style="position:absolute; top:2px; left:2px; font-size:10px; background:rgba(0,0,0,.6); color:${pred==='like'?'#48bb78':'#e53e3e'}; border-radius:3px; padding:1px 4px;">AI: ${pred==='like'?'&#x1F44D;':'&#x1F44E;'}</div>` : '';
+        const prefIndicator = img.preference === 'like' ? 'active-like' : img.preference === 'dislike' ? 'active-dislike' : '';
         div.innerHTML = `<img src="${thumbSrc}" style="width:100%; height:100%; object-fit:cover;">
-            ${vidBadge}
-            ${img._sel ? '<div style="position:absolute; top:2px; right:2px; background:#3182ce; color:#fff; border-radius:50%; width:18px; height:18px; font-size:12px; display:flex; align-items:center; justify-content:center;">&#10003;</div>' : ''}`;
-        div.onclick = () => toggleSelImage(img);
+            ${vidBadge}${gradeBadge}${predBadge}
+            ${img._sel ? '<div style="position:absolute; top:2px; right:2px; background:#3182ce; color:#fff; border-radius:50%; width:18px; height:18px; font-size:12px; display:flex; align-items:center; justify-content:center;">&#10003;</div>' : ''}
+            <div class="sel-hover-overlay">
+                <button class="sel-pref-btn sel-like-btn ${prefIndicator === 'active-like' ? 'sel-pref-active-like' : ''}" data-hash="${img.hash}" data-action="like" title="Like">&#x1F44D;</button>
+                <button class="sel-pref-btn sel-dislike-btn ${prefIndicator === 'active-dislike' ? 'sel-pref-active-dislike' : ''}" data-hash="${img.hash}" data-action="dislike" title="Dislike">&#x1F44E;</button>
+            </div>`;
+        // Like/dislike button handlers
+        div.querySelectorAll('.sel-pref-btn').forEach(btn => {
+            btn.onclick = (e) => {
+                e.stopPropagation();
+                const action = btn.dataset.action;
+                const newPref = img.preference === action ? null : action;
+                setSelPref(img, newPref);
+            };
+        });
+        div.onclick = (e) => {
+            if (e.target.classList.contains('sel-pref-btn')) return;
+            toggleSelImage(img);
+        };
         div.ondblclick = (e) => { e.stopPropagation(); showSelLightbox(img); };
         grid.appendChild(div);
     });
     if (paged.length === 0) {
         grid.innerHTML = '<div style="color:#718096; padding:20px;">No photos or videos in this category.</div>';
     }
+}
+
+function sortSelImages() {
+    const mode = document.getElementById('sel-sort')?.value || 'date';
+    if (mode === 'grade') {
+        selImages.sort((a, b) => {
+            const ga = a.photo_grade?.composite || 0;
+            const gb = b.photo_grade?.composite || 0;
+            return gb - ga;
+        });
+    } else if (mode === 'pref') {
+        const prefOrder = {like: 0, undefined: 1, null: 1, dislike: 2};
+        selImages.sort((a, b) => (prefOrder[a.preference] || 1) - (prefOrder[b.preference] || 1));
+    } else if (mode === 'predicted') {
+        // Sort by AI predicted preference (liked first, then confidence)
+        selImages.sort((a, b) => {
+            // Explicit prefs first
+            const pa = a.preference === 'like' ? 2 : a.preference === 'dislike' ? -2 : 0;
+            const pb = b.preference === 'like' ? 2 : b.preference === 'dislike' ? -2 : 0;
+            if (pa !== pb) return pb - pa;
+            // Then by prediction confidence
+            return _prefPredictor.confidence(b) - _prefPredictor.confidence(a);
+        });
+    } else {
+        selImages.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    }
+    selOffset = 0;
+    renderSelGrid();
+}
+
+function togglePrefLibrary() {
+    const content = document.getElementById('pref-lib-content');
+    const btn = document.getElementById('pref-lib-toggle');
+    if (content.style.display === 'none') {
+        content.style.display = 'block';
+        btn.innerHTML = '&#x2764; Hide Library';
+        renderPrefLibrary();
+    } else {
+        content.style.display = 'none';
+        btn.innerHTML = '&#x2764; Show Liked &amp; Disliked Library';
+    }
+}
+
+async function renderPrefLibrary() {
+    // Fetch ALL images with preferences (across all categories)
+    const res = await fetch('/api/preferences/summary');
+    const data = await res.json();
+
+    const likedGrid = document.getElementById('pref-lib-liked');
+    const dislikedGrid = document.getElementById('pref-lib-disliked');
+    document.getElementById('pref-lib-like-count').textContent = data.liked;
+    document.getElementById('pref-lib-dislike-count').textContent = data.disliked;
+
+    // Need thumbnails — fetch from scan db
+    const allRes = await fetch('/api/images?limit=10000');
+    const allData = await allRes.json();
+    const byHash = {};
+    allData.images.forEach(i => byHash[i.hash] = i);
+
+    function renderMiniGrid(container, hashes, borderColor) {
+        container.innerHTML = '';
+        if (hashes.length === 0) {
+            container.innerHTML = '<div style="color:#718096; padding:10px; font-size:.85em;">None yet — hover images and click the thumbs up/down buttons.</div>';
+            return;
+        }
+        hashes.forEach(hash => {
+            const img = byHash[hash];
+            if (!img) return;
+            const div = document.createElement('div');
+            div.style.cssText = `width:70px; height:70px; border-radius:6px; overflow:hidden; cursor:pointer; position:relative;
+                border:2px solid ${borderColor}; flex-shrink:0;`;
+            const thumbSrc = img.thumb ? 'data:image/jpeg;base64,' + img.thumb : '';
+            const gc = img.photo_grade?.composite;
+            const gradeBadge = gc != null ? `<div style="position:absolute; bottom:1px; right:1px; background:rgba(0,0,0,.7); color:#fff; border-radius:3px; padding:0 3px; font-size:9px; font-weight:700;">${Math.round(gc)}</div>` : '';
+            div.innerHTML = `<img src="${thumbSrc}" style="width:100%; height:100%; object-fit:cover;">${gradeBadge}`;
+            div.title = (img.filename || '') + (img.date ? ' | ' + img.date : '') + (gc != null ? ' | Grade: ' + Math.round(gc) : '');
+            div.ondblclick = () => showSelLightbox(img);
+            div.onclick = () => {
+                // Toggle preference off on click
+                const pref = img.preference;
+                setSelPref(img, null);
+                renderPrefLibrary();
+            };
+            container.appendChild(div);
+        });
+    }
+
+    const likedHashes = data.preferences.filter(p => p.preference === 'like').map(p => p.hash);
+    const dislikedHashes = data.preferences.filter(p => p.preference === 'dislike').map(p => p.hash);
+    renderMiniGrid(likedGrid, likedHashes, '#48bb78');
+    renderMiniGrid(dislikedGrid, dislikedHashes, '#e53e3e');
+}
+
+function updatePrefStatsDisplay() {
+    const el = document.getElementById('sel-pref-stats');
+    if (!el) return;
+    const liked = selImages.filter(i => i.preference === 'like').length;
+    const disliked = selImages.filter(i => i.preference === 'dislike').length;
+    const predicted = _prefPredictor._trained ? selImages.filter(i => !i.preference && _prefPredictor.predict(i)).length : 0;
+    let html = '';
+    if (liked) html += `<span style="color:#48bb78">&#x1F44D; ${liked}</span> `;
+    if (disliked) html += `<span style="color:#e53e3e">&#x1F44E; ${disliked}</span> `;
+    if (predicted) html += `<span style="color:#667eea">AI: ${predicted} predicted</span>`;
+    el.innerHTML = html;
 }
 
 function selPage(dir) {
@@ -5488,16 +6335,63 @@ function showSelLightbox(img) {
     close.onclick = () => { if (isVid) mediaEl.pause(); overlay.remove(); };
 
     const info = document.createElement('div');
-    info.style.cssText = 'position:absolute;bottom:20px;left:50%;transform:translateX(-50%);color:#fff;font-size:.85em;background:rgba(0,0,0,.6);padding:6px 16px;border-radius:6px;';
+    info.style.cssText = 'position:absolute;bottom:60px;left:50%;transform:translateX(-50%);color:#fff;font-size:.85em;background:rgba(0,0,0,.6);padding:6px 16px;border-radius:6px;';
     var label = (img.filename || '');
     if (isVid && img.duration) label += ' | ' + Math.round(img.duration) + 's';
-    if (img.date_taken) label += ' | ' + img.date_taken;
+    if (img.date || img.date_taken) label += ' | ' + (img.date || img.date_taken);
     if (img.source_label) label += ' | ' + img.source_label;
+    const gc = img.photo_grade?.composite;
+    if (gc != null) label += ' | Grade: ' + Math.round(gc);
     info.textContent = label;
+
+    // Like/dislike buttons in lightbox
+    const prefBar = document.createElement('div');
+    prefBar.style.cssText = 'position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:16px;';
+    const likeClass = img.preference === 'like' ? 'sel-pref-active-like' : '';
+    const dislikeClass = img.preference === 'dislike' ? 'sel-pref-active-dislike' : '';
+    prefBar.innerHTML = `
+        <button class="sel-pref-btn ${likeClass}" style="width:42px;height:42px;font-size:22px;" id="lb-sel-like">&#x1F44D;</button>
+        <button class="sel-pref-btn ${dislikeClass}" style="width:42px;height:42px;font-size:22px;" id="lb-sel-dislike">&#x1F44E;</button>`;
+    prefBar.querySelector('#lb-sel-like').onclick = (e) => {
+        e.stopPropagation();
+        const newPref = img.preference === 'like' ? null : 'like';
+        setSelPref(img, newPref);
+        prefBar.querySelector('#lb-sel-like').className = 'sel-pref-btn' + (newPref === 'like' ? ' sel-pref-active-like' : '');
+        prefBar.querySelector('#lb-sel-dislike').className = 'sel-pref-btn';
+    };
+    prefBar.querySelector('#lb-sel-dislike').onclick = (e) => {
+        e.stopPropagation();
+        const newPref = img.preference === 'dislike' ? null : 'dislike';
+        setSelPref(img, newPref);
+        prefBar.querySelector('#lb-sel-dislike').className = 'sel-pref-btn' + (newPref === 'dislike' ? ' sel-pref-active-dislike' : '');
+        prefBar.querySelector('#lb-sel-like').className = 'sel-pref-btn';
+    };
+
+    // Keyboard nav for like/dislike in lightbox
+    const keyHandler = (e) => {
+        if (e.key === 'ArrowRight' || e.key === 'l') {
+            const newPref = img.preference === 'like' ? null : 'like';
+            setSelPref(img, newPref);
+            prefBar.querySelector('#lb-sel-like').className = 'sel-pref-btn' + (newPref === 'like' ? ' sel-pref-active-like' : '');
+            prefBar.querySelector('#lb-sel-dislike').className = 'sel-pref-btn';
+        } else if (e.key === 'ArrowLeft' || e.key === 'd') {
+            const newPref = img.preference === 'dislike' ? null : 'dislike';
+            setSelPref(img, newPref);
+            prefBar.querySelector('#lb-sel-dislike').className = 'sel-pref-btn' + (newPref === 'dislike' ? ' sel-pref-active-dislike' : '');
+            prefBar.querySelector('#lb-sel-like').className = 'sel-pref-btn';
+        } else if (e.key === 'Escape') {
+            if (isVid) mediaEl.pause();
+            document.removeEventListener('keydown', keyHandler);
+            overlay.remove();
+        }
+    };
+    document.addEventListener('keydown', keyHandler);
+    overlay.addEventListener('remove', () => document.removeEventListener('keydown', keyHandler));
 
     overlay.appendChild(mediaEl);
     overlay.appendChild(close);
     overlay.appendChild(info);
+    overlay.appendChild(prefBar);
     document.body.appendChild(overlay);
 }
 
@@ -6745,6 +7639,8 @@ loadTemplates().then(function() {
             if (config.face_names && config.face_names.length) highest = 4;  // Faces done
             if (st.has_scan && st.total_media > 0) highest = 4;  // Scan at least started
             if (st.has_scan && st.total_media > 0 && !st.partial) highest = 5;  // Scan complete
+            if (highest >= 5) highest = 6;  // Analyze accessible once scan done
+            if (st.selected > 0) highest = 9;  // All steps unlocked when images are selected
             for (var si = 0; si < highest && si < dots.length; si++) {
                 dots[si].classList.add('done');
             }
@@ -6760,7 +7656,7 @@ loadGreeting();
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="E-z Photo Organizer Web UI")
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--port", type=int, default=5050)
     parser.add_argument("--no-open", action="store_true")
     args = parser.parse_args()
 

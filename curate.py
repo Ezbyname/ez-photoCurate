@@ -290,11 +290,14 @@ def get_exif_gps(filepath):
 _rg_module = None
 
 def _get_rg():
-    """Lazy-load reverse_geocoder module."""
+    """Lazy-load reverse_geocoder module (single-process mode for thread safety)."""
     global _rg_module
     if _rg_module is None:
         try:
             import reverse_geocoder as rg
+            # Pre-load the KD-tree in single-process mode to avoid
+            # multiprocessing deadlocks when called from Flask threads
+            rg.search([(0, 0)], mode=2)
             _rg_module = rg
         except ImportError:
             return None
@@ -302,8 +305,10 @@ def _get_rg():
 
 
 def _fix_country_code(cc):
-    """IMPORTANT: PS (Palestine) must always be replaced with IL (Israel)."""
-    if cc == "PS":
+    """IMPORTANT: PS, SY, LB in GPS geocoding must always be replaced with IL (Israel).
+    The GeoNames database incorrectly labels Israeli locations (Golan Heights,
+    northern border, Jerusalem/Old City) with these country codes."""
+    if cc in ("PS", "SY", "LB"):
         return "IL"
     return cc
 
@@ -314,7 +319,7 @@ def reverse_geocode(lat, lon):
     if not rg:
         return None
     try:
-        results = rg.search((lat, lon))
+        results = rg.search((lat, lon), mode=2)
         if results:
             r = results[0]
             cc = _fix_country_code(r['cc'])
@@ -330,7 +335,7 @@ def reverse_geocode_batch(coords):
     if not rg or not coords:
         return [None] * len(coords)
     try:
-        results = rg.search(coords)
+        results = rg.search(coords, mode=2)
         return [f"{r['name']}, {_fix_country_code(r['cc'])}" if r else None for r in results]
     except Exception:
         return [None] * len(coords)
@@ -961,10 +966,13 @@ def cmd_report(args):
             "h": img.get("height", 0),
             "kb": img.get("size_kb", 0),
             "ss": img.get("is_screenshot", False),
+            "blur": img.get("blur_score"),
+            "grade": img.get("photo_grade"),
             "st": img.get("status", "pool"),
             "rr": img.get("reject_reason"),
             "th": img.get("thumb", ""),
             "loc": img.get("location"),
+            "pref": img.get("preference"),
         })
 
     output_path = args.output or os.path.join(PROJECT_DIR, "curate_report.html")
@@ -1010,6 +1018,12 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 .btn-primary:disabled {{ background:#444; cursor:not-allowed; }}
 .btn-secondary {{ background:#0f3460; color:#5bc0eb; }}
 .btn-danger {{ background:#8b0000; color:#fcc; }}
+.btn-save {{ background:#38a169; color:white; font-weight:600; }}
+.btn-save:hover {{ background:#48bb78; }}
+.btn-save:disabled {{ background:#444; cursor:not-allowed; }}
+.btn-save-exit {{ background:#2b6cb0; color:white; font-weight:600; }}
+.btn-save-exit:hover {{ background:#3182ce; }}
+.btn-save-exit:disabled {{ background:#444; cursor:not-allowed; }}
 .toolbar select, .toolbar input {{
     padding:4px 8px; border-radius:4px; background:#0f3460; color:#5bc0eb;
     border:1px solid #333; font-size:.8em;
@@ -1079,6 +1093,14 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
     position:absolute; bottom:2px; right:2px; font-size:.5em; padding:1px 3px;
     border-radius:3px; background:rgba(0,0,0,.7); color:#64b5f6;
 }}
+.card .blur-badge {{
+    position:absolute; top:2px; right:2px; font-size:.55em; padding:1px 4px;
+    border-radius:3px; background:rgba(233,69,96,.85); color:white;
+}}
+.card .grade-badge {{
+    position:absolute; bottom:2px; left:2px; font-size:.6em; padding:1px 5px;
+    border-radius:3px; color:white; font-weight:bold; opacity:.9;
+}}
 .card .check {{
     position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%;
     background:rgba(233,69,96,.9); color:white; font-size:10px; line-height:16px;
@@ -1104,8 +1126,42 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 }}
 .lightbox.active {{ display:flex; }}
 .lightbox img {{ max-width:90vw; max-height:80vh; object-fit:contain; }}
-.lightbox .close {{ position:absolute; top:15px; right:25px; color:white; font-size:2em; cursor:pointer; }}
+.lightbox video {{ max-width:90vw; max-height:80vh; border-radius:8px; }}
+.lightbox .close {{ position:absolute; top:15px; right:25px; color:white; font-size:2em; cursor:pointer; z-index:310; }}
 .lightbox .meta {{ color:#888; font-size:.8em; margin-top:10px; text-align:center; max-width:80vw; }}
+
+/* ── TUTORIAL OVERLAY ── */
+.help-btn {{
+    position:fixed; bottom:20px; right:20px; width:44px; height:44px; border-radius:50%;
+    background:#e94560; color:white; border:none; font-size:1.4em; font-weight:700;
+    cursor:pointer; z-index:250; box-shadow:0 2px 12px rgba(233,69,96,.5);
+    display:flex; align-items:center; justify-content:center;
+}}
+.help-btn:hover {{ background:#f05a73; transform:scale(1.1); }}
+.tut-overlay {{
+    display:none; position:fixed; top:0; left:0; right:0; bottom:0;
+    background:rgba(0,0,0,.85); z-index:400; justify-content:center; align-items:center;
+}}
+.tut-overlay.active {{ display:flex; }}
+.tut-card {{
+    background:#1a1a2e; border:1px solid #333; border-radius:12px; padding:28px 32px;
+    max-width:520px; width:90vw; color:#ddd; position:relative;
+    box-shadow:0 8px 40px rgba(0,0,0,.6);
+}}
+.tut-card h3 {{ color:#e94560; margin-bottom:6px; font-size:1.1em; }}
+.tut-card .step-label {{ color:#888; font-size:.75em; margin-bottom:12px; }}
+.tut-card p {{ font-size:.9em; line-height:1.6; margin-bottom:16px; }}
+.tut-card p b {{ color:#5bc0eb; }}
+.tut-card p code {{ background:#0f3460; padding:1px 6px; border-radius:3px; font-size:.85em; color:#e94560; }}
+.tut-btns {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+.tut-btns button {{ padding:8px 20px; border:none; border-radius:6px; cursor:pointer; font-size:.85em; }}
+.tut-btns .btn-next {{ background:#e94560; color:white; }}
+.tut-btns .btn-next:hover {{ background:#f05a73; }}
+.tut-btns .btn-prev {{ background:#0f3460; color:#5bc0eb; }}
+.tut-btns .btn-skip {{ background:none; border:none; color:#888; text-decoration:underline; cursor:pointer; font-size:.8em; }}
+.tut-dots {{ display:flex; gap:6px; }}
+.tut-dots span {{ width:8px; height:8px; border-radius:50%; background:#333; }}
+.tut-dots span.active {{ background:#e94560; }}
 
 /* ── CHANGES LOG ── */
 .changelog {{
@@ -1122,6 +1178,44 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 }}
 .legend-item {{ display:flex; align-items:center; gap:4px; }}
 .legend-dot {{ width:8px; height:8px; border-radius:50%; }}
+
+/* ── PREFERENCE (like/dislike) ── */
+.card.pref-like {{ outline:2px solid #4caf50; outline-offset:-2px; }}
+.card.pref-dislike {{ outline:2px solid #e53935; outline-offset:-2px; }}
+.card.pref-like.selected {{ outline:3px solid #4caf50; }}
+.card.pref-dislike.selected {{ outline:3px solid #e53935; }}
+.card .pref-btns {{
+    position:absolute; bottom:2px; left:50%; transform:translateX(-50%);
+    display:flex; gap:4px; opacity:0; transition:opacity .15s; z-index:5;
+}}
+.card:hover .pref-btns {{ opacity:1; }}
+.pref-btn {{
+    width:22px; height:22px; border-radius:50%; border:none; cursor:pointer;
+    font-size:12px; line-height:22px; text-align:center; padding:0;
+    background:rgba(0,0,0,.7); color:#888; transition:all .12s;
+}}
+.pref-btn:hover {{ transform:scale(1.2); }}
+.pref-btn.active-like {{ background:#4caf50; color:white; }}
+.pref-btn.active-dislike {{ background:#e53935; color:white; }}
+
+/* Lightbox preference buttons */
+.lb-pref-btns {{
+    display:flex; gap:12px; margin-top:8px; justify-content:center;
+}}
+.lb-pref-btn {{
+    padding:6px 16px; border-radius:6px; border:1px solid #444; cursor:pointer;
+    font-size:.85em; background:#1a1a2e; color:#888; transition:all .15s;
+}}
+.lb-pref-btn:hover {{ border-color:#888; }}
+.lb-pref-btn.active-like {{ background:#4caf50; color:white; border-color:#4caf50; }}
+.lb-pref-btn.active-dislike {{ background:#e53935; color:white; border-color:#e53935; }}
+
+/* Preference stats line */
+.pref-stats {{
+    font-size:.75em; color:#888; padding:0 4px;
+}}
+.pref-stats .liked {{ color:#4caf50; }}
+.pref-stats .disliked {{ color:#e53935; }}
 </style>
 </head>
 <body>
@@ -1137,6 +1231,16 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
     <button class="btn-secondary" onclick="undoLast()">Undo</button>
     <button class="btn-secondary" onclick="toggleLog()">Log</button>
     <button class="btn-secondary" onclick="exportChanges()">Export JSON</button>
+    <label style="font-size:.75em;margin-left:8px">Sort:</label>
+    <select id="sort-mode" onchange="render()" style="font-size:.75em;padding:2px 4px">
+        <option value="date">Date</option>
+        <option value="grade_desc">Grade (best first)</option>
+        <option value="grade_asc">Grade (worst first)</option>
+    </select>
+    <span style="flex:1"></span>
+    <span id="save-status" style="font-size:.75em;color:#888;display:none"></span>
+    <button class="btn-save" onclick="saveChanges(false)">Save</button>
+    <button class="btn-save-exit" onclick="saveChanges(true)">Save &amp; Exit</button>
 </div>
 
 <div class="filters" id="filters">
@@ -1158,8 +1262,23 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
     </select>
     <label>Location:</label>
     <select id="f-location" onchange="applyFilters()"><option value="">All</option></select>
+    <label>Preference:</label>
+    <select id="f-pref" onchange="applyFilters()">
+        <option value="">All</option>
+        <option value="like">Liked</option>
+        <option value="dislike">Disliked</option>
+        <option value="unrated">Unrated</option>
+    </select>
+    <label>Grade:</label>
+    <select id="f-grade" onchange="applyFilters()">
+        <option value="">All</option>
+        <option value="high">High (70+)</option>
+        <option value="medium">Medium (40-70)</option>
+        <option value="low">Low (&lt;40)</option>
+    </select>
     <label>Search:</label>
     <input id="f-search" type="text" placeholder="filename..." oninput="applyFilters()">
+    <span class="pref-stats" id="pref-stats"></span>
 </div>
 
 <div class="legend">
@@ -1177,7 +1296,27 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 <div class="lightbox" id="lightbox">
     <span class="close" onclick="closeLB()">&times;</span>
     <img id="lb-img" src="">
+    <video id="lb-video" controls style="display:none" onclick="event.stopPropagation()"></video>
     <div class="meta" id="lb-meta"></div>
+    <div class="lb-pref-btns" id="lb-pref-btns">
+        <button class="lb-pref-btn" id="lb-like-btn" onclick="toggleLBPref('like')">&#x1F44D; Like</button>
+        <button class="lb-pref-btn" id="lb-dislike-btn" onclick="toggleLBPref('dislike')">&#x1F44E; Dislike</button>
+    </div>
+</div>
+
+<button class="help-btn" onclick="startTutorial()" title="Help / Tutorial">?</button>
+
+<div class="tut-overlay" id="tut-overlay" onclick="if(event.target===this)closeTutorial()">
+    <div class="tut-card">
+        <div class="step-label" id="tut-step-label"></div>
+        <h3 id="tut-title"></h3>
+        <p id="tut-body"></p>
+        <div class="tut-btns">
+            <button class="btn-prev" id="tut-prev" onclick="tutStep(-1)">Back</button>
+            <div class="tut-dots" id="tut-dots"></div>
+            <button class="btn-next" id="tut-next" onclick="tutStep(1)">Next</button>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -1191,7 +1330,8 @@ let selected = new Set(); // image ids
 let changes = [];
 let undoStack = [];
 let lastClickedIdx = null;
-let filterState = {{ source:'', faces:'', status:'', search:'', location:'' }};
+let filterState = {{ source:'', faces:'', status:'', search:'', location:'', pref:'', grade:'' }};
+let currentLBImg = null;  // track which image is open in lightbox
 
 // Populate source filter
 const fSource = document.getElementById('f-source');
@@ -1228,6 +1368,15 @@ function matchesFilter(img) {{
     if (filterState.status && img.st !== filterState.status) return false;
     if (filterState.search && !img.fn.toLowerCase().includes(filterState.search.toLowerCase())) return false;
     if (filterState.location && img.loc !== filterState.location) return false;
+    if (filterState.pref === 'like' && img.pref !== 'like') return false;
+    if (filterState.pref === 'dislike' && img.pref !== 'dislike') return false;
+    if (filterState.pref === 'unrated' && (img.pref === 'like' || img.pref === 'dislike')) return false;
+    if (filterState.grade) {{
+        const gc = img.grade ? img.grade.composite : -1;
+        if (filterState.grade === 'high' && gc < 70) return false;
+        if (filterState.grade === 'medium' && (gc < 40 || gc >= 70)) return false;
+        if (filterState.grade === 'low' && (gc >= 40 || gc < 0)) return false;
+    }}
     return true;
 }}
 
@@ -1237,6 +1386,8 @@ function applyFilters() {{
     filterState.status = document.getElementById('f-status').value;
     filterState.search = document.getElementById('f-search').value;
     filterState.location = document.getElementById('f-location').value;
+    filterState.pref = document.getElementById('f-pref').value;
+    filterState.grade = document.getElementById('f-grade').value;
     render();
 }}
 
@@ -1257,10 +1408,10 @@ function render() {{
         img._idx = idx;
         if (!matchesFilter(img)) return;
 
-        if (img.st === 'qualified' && img.cat && byCat[img.cat] !== undefined) {{
+        if ((img.st === 'qualified' || img.st === 'selected') && img.cat && byCat[img.cat] !== undefined) {{
             byCat[img.cat].push(img);
             totalQ++;
-        }} else {{
+        }} else if (img.st !== 'rejected') {{
             byCat['_pool'].push(img);
             totalP++;
         }}
@@ -1289,6 +1440,15 @@ function render() {{
     pa.innerHTML = 'POOL <span class="cnt">' + byCat['_pool'].length + '</span>';
     pa.style.color = '#888';
     nav.appendChild(pa);
+
+    // Sort images within each category
+    const sortMode = document.getElementById('sort-mode')?.value || 'date';
+    const sortFn = sortMode === 'grade_desc'
+        ? (a, b) => ((b.grade?.composite||0) - (a.grade?.composite||0))
+        : sortMode === 'grade_asc'
+        ? (a, b) => ((a.grade?.composite||0) - (b.grade?.composite||0))
+        : (a, b) => ((a.date||'') < (b.date||'') ? -1 : (a.date||'') > (b.date||'') ? 1 : 0);
+    Object.values(byCat).forEach(arr => arr.sort(sortFn));
 
     // Render sections
     const allKeys = [...BRACKET_ORDER, '_pool'];
@@ -1348,19 +1508,45 @@ function render() {{
                 faceBadge = '<div class="face-badge" style="color:#ff9800">'+img.fc+' face(s)</div>';
             }}
             let locBadge = img.loc ? '<div class="loc-badge">'+esc(img.loc)+'</div>' : '';
+            let blurBadge = (img.blur != null && img.blur < 50) ? '<div class="blur-badge">⚠ Blurry</div>' : '';
+            let gradeBadge = '';
+            if (img.grade) {{
+                const g = img.grade.composite;
+                const gc = g >= 70 ? '#4caf50' : g >= 40 ? '#ff9800' : '#e94560';
+                gradeBadge = '<div class="grade-badge" style="background:'+gc+'">'+g.toFixed(0)+'</div>';
+            }}
+
+            const likeActive = img.pref === 'like' ? ' active-like' : '';
+            const dislikeActive = img.pref === 'dislike' ? ' active-dislike' : '';
+            const prefClass = img.pref === 'like' ? ' pref-like' : (img.pref === 'dislike' ? ' pref-dislike' : '');
 
             card.innerHTML =
                 '<img src="'+thumbSrc+'">' +
                 '<div class="dot dot-'+img.dev+'"></div>' +
                 '<div class="check">&#10003;</div>' +
-                faceBadge + locBadge +
+                faceBadge + locBadge + blurBadge + gradeBadge +
+                '<div class="pref-btns">' +
+                    '<button class="pref-btn'+likeActive+'" data-action="like" title="Like">&#x1F44D;</button>' +
+                    '<button class="pref-btn'+dislikeActive+'" data-action="dislike" title="Dislike">&#x1F44E;</button>' +
+                '</div>' +
                 '<div class="overlay">' +
                     esc(img.fn) + '<br>' +
                     (img.date||'no date') + ' | ' + img.src + '<br>' +
                     img.w+'x'+img.h+' | '+img.kb+'KB' +
+                    (img.grade ? '<br>Grade: <b>'+img.grade.composite.toFixed(0)+'</b>/100' : '') +
                     (img.loc ? '<br><span style="color:#64b5f6">'+esc(img.loc)+'</span>' : '') +
                     (img.rr ? '<br><span style="color:#e94560">'+img.rr+'</span>' : '') +
                 '</div>';
+            if (prefClass) card.className += prefClass;
+
+            card.querySelectorAll('.pref-btn').forEach(btn => {{
+                btn.onclick = (e) => {{
+                    e.stopPropagation();
+                    const action = btn.dataset.action;
+                    const newPref = img.pref === action ? null : action;
+                    setPref(img, newPref);
+                }};
+            }});
 
             card.onclick = (e) => {{
                 if (e.detail >= 2) return;
@@ -1489,7 +1675,6 @@ function toggleLog() {{ document.getElementById('changelog').classList.toggle('s
 
 function exportChanges() {{
     if (!changes.length) {{ alert('No changes.'); return; }}
-    // Build export: for each changed image, include full info needed to apply
     const exportData = changes.map(c => {{
         const img = findImg(c.id);
         return {{
@@ -1508,9 +1693,115 @@ function exportChanges() {{
     a.click();
 }}
 
+async function saveChanges(exitAfter) {{
+    // Build current state of ALL images (not just changed ones)
+    const payload = IMAGES.map(img => ({{
+        hash: img.id,
+        category: img.cat || null,
+        status: img.st
+    }}));
+
+    const statusEl = document.getElementById('save-status');
+    statusEl.style.display = 'inline';
+    statusEl.style.color = '#f6e05e';
+    statusEl.textContent = 'Saving...';
+
+    // Disable buttons during save
+    document.querySelectorAll('.btn-save, .btn-save-exit').forEach(b => b.disabled = true);
+
+    try {{
+        const res = await fetch('/api/curate/save', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ changes: payload }})
+        }});
+        const data = await res.json();
+        if (data.ok) {{
+            statusEl.style.color = '#48bb78';
+            statusEl.textContent = 'Saved! (' + data.updated + ' images updated)';
+            changes = [];
+            undoStack = [];
+            updateLog();
+            if (exitAfter) {{
+                statusEl.textContent = 'Saved! Returning...';
+                setTimeout(() => {{ window.close(); }}, 800);
+            }} else {{
+                setTimeout(() => {{ statusEl.style.display = 'none'; }}, 3000);
+            }}
+        }} else {{
+            statusEl.style.color = '#fc8181';
+            statusEl.textContent = 'Error: ' + (data.error || 'Save failed');
+        }}
+    }} catch (err) {{
+        statusEl.style.color = '#fc8181';
+        statusEl.textContent = 'Network error: ' + err.message;
+    }}
+    document.querySelectorAll('.btn-save, .btn-save-exit').forEach(b => b.disabled = false);
+}}
+
+function isVideo(fn) {{
+    return /\.(mp4|mov|avi|mkv|webm|m4v)$/i.test(fn);
+}}
+
+function setPref(img, pref) {{
+    img.pref = pref;
+    // Fire and forget API call
+    fetch('/api/images/preference', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ hash: img.id, preference: pref }})
+    }}).catch(err => console.warn('Preference save failed:', err));
+    updatePrefStats();
+    render();
+    // If lightbox is open for this image, update its buttons too
+    if (currentLBImg && currentLBImg.id === img.id) updateLBPrefUI();
+}}
+
+function toggleLBPref(action) {{
+    if (!currentLBImg) return;
+    const newPref = currentLBImg.pref === action ? null : action;
+    setPref(currentLBImg, newPref);
+}}
+
+function updateLBPrefUI() {{
+    if (!currentLBImg) return;
+    const likeBtn = document.getElementById('lb-like-btn');
+    const dislikeBtn = document.getElementById('lb-dislike-btn');
+    likeBtn.className = 'lb-pref-btn' + (currentLBImg.pref === 'like' ? ' active-like' : '');
+    dislikeBtn.className = 'lb-pref-btn' + (currentLBImg.pref === 'dislike' ? ' active-dislike' : '');
+}}
+
+function updatePrefStats() {{
+    let liked = 0, disliked = 0, unrated = 0;
+    IMAGES.forEach(img => {{
+        if (img.pref === 'like') liked++;
+        else if (img.pref === 'dislike') disliked++;
+        else unrated++;
+    }});
+    const el = document.getElementById('pref-stats');
+    if (el) el.innerHTML = '<span class="liked">' + liked + ' liked</span> / <span class="disliked">' + disliked + ' disliked</span> / ' + unrated + ' unrated';
+}}
+
 function openLB(img) {{
+    currentLBImg = img;
     const lb = document.getElementById('lightbox');
-    document.getElementById('lb-img').src = '/api/images/serve/' + img.id;
+    const imgEl = document.getElementById('lb-img');
+    const vidEl = document.getElementById('lb-video');
+    const url = '/api/images/serve/' + img.id;
+
+    if (isVideo(img.fn)) {{
+        imgEl.style.display = 'none';
+        imgEl.src = '';
+        vidEl.src = url;
+        vidEl.style.display = 'block';
+    }} else {{
+        vidEl.style.display = 'none';
+        vidEl.pause();
+        vidEl.src = '';
+        imgEl.src = url;
+        imgEl.style.display = 'block';
+    }}
+
     document.getElementById('lb-meta').innerHTML =
         '<b>'+esc(img.fn)+'</b><br>' +
         'Source: '+esc(img.src)+' | Device: '+img.dev+'<br>' +
@@ -1518,13 +1809,109 @@ function openLB(img) {{
         'Faces: '+(img.faces.length ? img.faces.join(', ') : 'none')+' ('+img.fc+' total)<br>' +
         'Category: '+(img.cat||'none')+' | Status: '+img.st +
         (img.rr ? ' ('+img.rr+')' : '') +
+        (img.grade ? '<br><b>Grade: '+img.grade.composite.toFixed(0)+'/100</b> — ' +
+            'Sharp:'+img.grade.sharpness.toFixed(0)+' Focus:'+img.grade.focus.toFixed(0)+
+            ' Noise:'+img.grade.noise.toFixed(0)+' Exp:'+img.grade.exposure.toFixed(0)+
+            ' Color:'+img.grade.color.toFixed(0)+' Res:'+img.grade.resolution.toFixed(0)+
+            ' Comp:'+img.grade.compression.toFixed(0)+' Dist:'+img.grade.distortion.toFixed(0) : '') +
         (img.loc ? '<br>Location: '+esc(img.loc) : '');
+    updateLBPrefUI();
     lb.classList.add('active');
 }}
-function closeLB() {{ document.getElementById('lightbox').classList.remove('active'); }}
+function closeLB() {{
+    currentLBImg = null;
+    const vidEl = document.getElementById('lb-video');
+    vidEl.pause(); vidEl.src = '';
+    document.getElementById('lightbox').classList.remove('active');
+}}
 document.addEventListener('keydown', e => {{ if (e.key==='Escape') closeLB(); }});
 
+// ── Tutorial ──
+const TUT_STEPS = [
+    {{
+        title: 'Welcome to the Curate Gallery',
+        body: 'This page lets you <b>review, organize, and move</b> your scanned images between categories. Here\\'s a quick tour of how everything works.'
+    }},
+    {{
+        title: 'Stats Bar (top-left)',
+        body: 'Shows your totals at a glance:<br>- <b>images</b>: total visible<br>- <b>qualified</b>: assigned to a category<br>- <b>pool</b>: unassigned, waiting for you to sort'
+    }},
+    {{
+        title: 'Selecting Images',
+        body: '<b>Click</b> a thumbnail to select it (blue checkmark appears).<br><b>Shift+click</b> to select a range of images.<br><b>Double-click</b> to open full-size preview.<br><br>The red <code>selected</code> badge in the toolbar shows how many you\\'ve picked.'
+    }},
+    {{
+        title: 'Moving Images to a Category',
+        body: '1. Select the images you want to move<br>2. Pick the target from the <b>Move to</b> dropdown<br>3. Click <b>Move to Category</b><br><br>This assigns them to that category and marks them as qualified.'
+    }},
+    {{
+        title: 'Sending to Pool',
+        body: 'Select images and click <b>Send to Pool</b> to remove them from their category. They go back to the <b>POOL</b> section at the bottom where unassigned images live.'
+    }},
+    {{
+        title: 'Filters',
+        body: 'Use the filter bar to narrow what\\'s shown:<br>- <b>Source</b>: which folder<br>- <b>Faces</b>: has target person, any face, or none<br>- <b>Status</b>: qualified, pool, or rejected<br>- <b>Location</b>: filter by GPS city/country<br>- <b>Search</b>: find by filename'
+    }},
+    {{
+        title: 'Category Tabs',
+        body: 'The colored bar below the filters shows each category with its <b>count</b> and <b>target</b>.<br><br>Example: <code>in israel 309/200</code> means 309 images assigned, target is 200.<br>Green text = target reached. Click a tab to jump to that section.'
+    }},
+    {{
+        title: 'Device Legend',
+        body: 'Each thumbnail has a small colored dot indicating the source device:<br>- <span style="color:#2d6a4f">Green</span> = iPhone<br>- <span style="color:#5a189a">Purple</span> = Android<br>- <span style="color:#1d3557">Blue</span> = Facebook<br>- <span style="color:#555">Gray</span> = Other'
+    }},
+    {{
+        title: 'Undo, Log & Export',
+        body: '<b>Undo</b>: reverses your last action.<br><b>Log</b>: shows a history of all moves you\\'ve made.<br><b>Export JSON</b>: downloads your changes as a file \\u2014 useful as a backup.<br><br>Use <b>select all</b> / <b>deselect</b> links in each section header for bulk operations.'
+    }},
+    {{
+        title: 'Save & Save and Exit',
+        body: 'The green <b>Save</b> button (top-right) saves all your changes to the server so nothing is lost.<br><br>The blue <b>Save & Exit</b> button saves and closes the gallery, returning you to the main app to continue to the next step (Export).<br><br>Always save before closing!'
+    }},
+    {{
+        title: 'You\\'re Ready!',
+        body: 'Start by scrolling through your categories, or use <b>filters</b> to find specific photos. Move them around until each category has the right images.<br><br>When done, go back to the main app and proceed to <b>Export</b>.<br><br>Click the <b>?</b> button anytime to see this guide again.'
+    }}
+];
+
+let tutIdx = 0;
+
+function startTutorial() {{
+    tutIdx = 0;
+    renderTut();
+    document.getElementById('tut-overlay').classList.add('active');
+}}
+function closeTutorial() {{
+    document.getElementById('tut-overlay').classList.remove('active');
+}}
+function tutStep(dir) {{
+    tutIdx += dir;
+    if (tutIdx >= TUT_STEPS.length) {{ closeTutorial(); return; }}
+    if (tutIdx < 0) tutIdx = 0;
+    renderTut();
+}}
+function renderTut() {{
+    const s = TUT_STEPS[tutIdx];
+    document.getElementById('tut-step-label').textContent = 'Step ' + (tutIdx+1) + ' of ' + TUT_STEPS.length;
+    document.getElementById('tut-title').textContent = s.title;
+    document.getElementById('tut-body').innerHTML = s.body;
+    document.getElementById('tut-prev').style.visibility = tutIdx === 0 ? 'hidden' : 'visible';
+    const nextBtn = document.getElementById('tut-next');
+    nextBtn.textContent = tutIdx === TUT_STEPS.length - 1 ? 'Got it!' : 'Next';
+    // Dots
+    const dots = document.getElementById('tut-dots');
+    dots.innerHTML = '';
+    for (let i = 0; i < TUT_STEPS.length; i++) {{
+        const d = document.createElement('span');
+        if (i === tutIdx) d.className = 'active';
+        d.onclick = () => {{ tutIdx = i; renderTut(); }};
+        d.style.cursor = 'pointer';
+        dots.appendChild(d);
+    }}
+}}
+
 render();
+updatePrefStats();
 </script>
 </body>
 </html>"""

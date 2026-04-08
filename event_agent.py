@@ -168,20 +168,30 @@ EVENT_KNOWLEDGE = {
 # ── Image Scoring ─────────────────────────────────────────────────────────────
 
 def compute_quality_score(img, weights):
-    """Score an image based on weighted quality factors."""
+    """Score an image based on weighted quality factors.
+
+    Uses photo_grade (comprehensive multi-dimensional grading) when available,
+    with user preference as the most important signal.
+    """
     score = 0.0
 
-    # Resolution score (normalized to 12MP)
-    w = img.get("width") or img.get("w", 0)
-    h = img.get("height") or img.get("h", 0)
-    megapixels = (w * h) / 1_000_000
-    score += min(megapixels / 12.0, 1.0) * weights.get("resolution", 1.0)
+    # ── Photo grade composite (0-100 → 0-5 points) ──
+    grade = img.get("photo_grade")
+    if grade and isinstance(grade, dict):
+        composite = grade.get("composite", 0)
+        # Scale 0-100 grade to 0-5 points (major factor)
+        score += (composite / 100.0) * 5.0
+    else:
+        # Fallback: basic resolution + file size scoring
+        w = img.get("width") or img.get("w", 0)
+        h = img.get("height") or img.get("h", 0)
+        megapixels = (w * h) / 1_000_000
+        score += min(megapixels / 12.0, 1.0) * weights.get("resolution", 1.0)
 
-    # File size score (normalized to 3MB)
-    kb = img.get("size_kb") or img.get("kb", 0)
-    score += min(kb / 3000, 1.0) * weights.get("file_size", 0.5)
+        kb = img.get("size_kb") or img.get("kb", 0)
+        score += min(kb / 3000, 1.0) * weights.get("file_size", 0.5)
 
-    # Face scores
+    # ── Face scores ──
     has_target = img.get("has_target_face") or img.get("target", False)
     face_count = img.get("face_count") or img.get("fc", 0)
 
@@ -190,9 +200,49 @@ def compute_quality_score(img, weights):
     elif face_count > 0:
         score += weights.get("has_any_face", 1.0)
 
-    # Bonus for multiple faces (group shots)
     if face_count >= 3:
         score += 0.5
+
+    # ── User preference (MOST IMPORTANT signal) ──
+    pref = img.get("preference")
+    if pref == "like":
+        score += 8.0   # Massive boost — user taste overrides all
+    elif pref == "dislike":
+        score -= 6.0   # Strong penalty — push to bottom
+
+    # ── Taste quiz adjustments ──
+    quiz = weights.get("_taste_quiz") or {}
+    if quiz:
+        face_count = img.get("face_count") or img.get("fc", 0)
+        # "avoid" penalties
+        avoid = quiz.get("avoid", [])
+        if "no_face" in avoid and face_count == 0:
+            score -= 2.0
+        if "dark" in avoid:
+            g = img.get("photo_grade")
+            if g and g.get("exposure", 100) < 30:
+                score -= 1.5
+        # "faces" preference
+        faces_pref = quiz.get("faces")
+        if faces_pref == "many" and face_count >= 3:
+            score += 1.0
+        elif faces_pref == "few" and 1 <= face_count <= 2:
+            score += 0.5
+        # "closeups" — boost images with large face (low face_distance = close match)
+        if quiz.get("closeups") == "yes":
+            fd = img.get("face_distance")
+            if fd is not None and fd < 0.4:
+                score += 0.5
+        # "colorful" boost
+        if quiz.get("colorful") == "yes":
+            g = img.get("photo_grade")
+            if g and g.get("color", 0) > 70:
+                score += 0.5
+        # "sharpness" strict
+        if quiz.get("sharpness") == "high":
+            g = img.get("photo_grade")
+            if g and g.get("sharpness", 0) < 40:
+                score -= 1.0
 
     return score
 

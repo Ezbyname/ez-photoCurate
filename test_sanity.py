@@ -1603,6 +1603,28 @@ class TestGeolocation:
         assert "IL" in loc, f"Western Wall must be tagged as Israel (IL), got: {loc}"
         assert "PS" not in loc, f"PS must never appear in location tags, got: {loc}"
 
+    def test_golan_heights_in_israel(self, tmp_path):
+        """Golan Heights (Mas'adah) GPS should resolve to Israel (IL), never SY."""
+        from curate import get_exif_gps, reverse_geocode
+        # Mas'adah, Golan Heights: 33.14°N, 35.77°E
+        path = self._make_gps_image(tmp_path / "golan.jpg", 33.14, 35.77)
+        gps = get_exif_gps(path)
+        loc = reverse_geocode(*gps)
+        assert loc is not None
+        assert "IL" in loc, f"Golan Heights must be tagged as Israel (IL), got: {loc}"
+        assert "SY" not in loc, f"SY must never appear in location tags, got: {loc}"
+
+    def test_northern_border_in_israel(self, tmp_path):
+        """Rosh HaNikra area GPS should resolve to Israel (IL), never LB."""
+        from curate import get_exif_gps, reverse_geocode
+        # Rosh HaNikra area: 33.09°N, 35.11°E
+        path = self._make_gps_image(tmp_path / "north.jpg", 33.09, 35.11)
+        gps = get_exif_gps(path)
+        loc = reverse_geocode(*gps)
+        assert loc is not None
+        assert "IL" in loc, f"Northern border must be tagged as Israel (IL), got: {loc}"
+        assert "LB" not in loc, f"LB must never appear in location tags, got: {loc}"
+
     def test_eiffel_tower_in_france(self, tmp_path):
         """Eiffel Tower GPS should resolve to France (FR)."""
         from curate import get_exif_gps, reverse_geocode
