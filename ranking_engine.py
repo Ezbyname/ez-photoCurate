@@ -71,6 +71,7 @@ class RankingEngine:
 
         # Diversity state (built up as images are selected)
         self._selected_vectors = []
+        self._selected_clip_vectors = []  # CLIP 512-dim semantic vectors
         self._selected_times = []         # date strings of selected images
         self._selected_locations = []     # location strings of selected images
 
@@ -160,7 +161,8 @@ class RankingEngine:
     #  MAIN SCORING — call per image
     # ──────────────────────────────────────────────────────────────────────
 
-    def score(self, img, vector=None, dhash=None, quality_weights=None):
+    def score(self, img, vector=None, dhash=None, clip_vector=None,
+              quality_weights=None):
         """
         Compute final score with full breakdown.
         Returns (final_score, breakdown_dict).
@@ -176,7 +178,7 @@ class RankingEngine:
         breakdown["quality"] = qual
 
         # ── Component 3: Diversity Score (-100 to 100) ──
-        div = self._compute_diversity(img, vector)
+        div = self._compute_diversity(img, vector, clip_vector)
         breakdown["diversity"] = div
 
         # ── Component 4: Exploration Bonus (0-100) ──
@@ -210,10 +212,12 @@ class RankingEngine:
 
         return final, breakdown
 
-    def register_selected(self, img, vector=None, dhash=None):
+    def register_selected(self, img, vector=None, dhash=None, clip_vector=None):
         """Call after an image is selected, to update diversity/dedup state."""
         if vector is not None:
             self._selected_vectors.append(vector)
+        if clip_vector is not None:
+            self._selected_clip_vectors.append(clip_vector)
         if dhash is not None:
             self._selected_dhashes.append(dhash)
         date_str = img.get("date")
@@ -334,23 +338,34 @@ class RankingEngine:
 
         return max(0.0, min(100.0, score))
 
-    def _compute_diversity(self, img, vector=None):
+    def _compute_diversity(self, img, vector=None, clip_vector=None):
         """
         Diversity score on -100..100 scale.
         Penalizes images too similar to already-selected ones.
-        Considers: visual similarity, time clustering, location clustering.
+        Considers: pixel similarity, CLIP semantic similarity, time, location.
         """
-        if not self._selected_vectors and not self._selected_times:
+        if (not self._selected_vectors and not self._selected_clip_vectors
+                and not self._selected_times):
             return 50.0  # neutral — no selection context yet
 
         penalty = 0.0
 
-        # ── Visual similarity to already-selected ──
+        # ── Pixel visual similarity to already-selected ──
         if vector is not None and self._selected_vectors:
             max_sim = max(float(np.dot(vector, sv)) for sv in self._selected_vectors)
             if max_sim > 0.75:
                 # Graduated penalty: 0.75→0, 0.85→-25, 0.95→-50
                 penalty += (max_sim - 0.75) * 200.0
+
+        # ── CLIP semantic similarity to already-selected ──
+        # More conservative than pixel similarity — semantic overlap is broader
+        if clip_vector is not None and self._selected_clip_vectors:
+            max_clip_sim = max(
+                float(np.dot(clip_vector, sv))
+                for sv in self._selected_clip_vectors)
+            if max_clip_sim > 0.90:
+                # Graduated penalty: 0.90→0, 0.95→-10, 1.0→-20
+                penalty += (max_clip_sim - 0.90) * 200.0
 
         # ── Time clustering penalty ──
         date_str = img.get("date")

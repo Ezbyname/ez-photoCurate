@@ -55,3 +55,8 @@ auth.db
 # Large / personal files
 face_library/
 age_results.json
+
+# CLIP model files (downloaded on first use, ~350MB)
+models/clip/
+clip_vectors.npz
+face_encodings.npz

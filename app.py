@@ -16,9 +16,16 @@ import argparse
 from datetime import datetime
 from collections import defaultdict
 
+import time
 import base64
 import shutil
 import numpy as np
+
+
+try:
+    import clip_engine
+except ImportError:
+    clip_engine = None
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -39,6 +46,8 @@ sys.stdout.reconfigure(line_buffering=True)
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_DIR = os.path.join(PROJECT_DIR, "projects")
 SCAN_DB_PATH = os.path.join(PROJECT_DIR, "scan_db.json")
+CLIP_VECTORS_PATH = os.path.join(PROJECT_DIR, "clip_vectors.npz")
+FACE_ENCODINGS_PATH = os.path.join(PROJECT_DIR, "face_encodings.npz")
 CONFIG_PATH = os.path.join(PROJECT_DIR, "curate_config.json")
 
 app = Flask(__name__, static_folder=None)
@@ -220,9 +229,56 @@ def load_config():
     return None
 
 
+_active_project_dir = None   # cached path to active project folder
+_last_project_sync = 0       # timestamp of last scan_db sync
+
+
+def _set_active_project(config):
+    """Update cached project dir from config. Called only when config changes."""
+    global _active_project_dir
+    import re
+    name = (config or {}).get("project_name", "")
+    if not name:
+        _active_project_dir = None
+        return
+    safe = re.sub(r'[<>:"/\\|?*]', '_', name.strip())[:100]
+    pdir = os.path.join(PROJECTS_DIR, safe)
+    _active_project_dir = pdir if os.path.isdir(pdir) else None
+
+
+def _auto_save_to_project(config_only=False, scan_db_only=False):
+    """Sync working files to active project folder.
+    Hot path (scan_db): one timestamp check + throttled copy, no file reads.
+    Config saves always sync immediately (infrequent)."""
+    global _last_project_sync
+    pdir = _active_project_dir
+    if not pdir:
+        return
+    try:
+        if not scan_db_only:
+            shutil.copy2(CONFIG_PATH, os.path.join(pdir, "curate_config.json"))
+
+        if not config_only:
+            now = time.time()
+            if now - _last_project_sync < 30:
+                return
+            shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
+            if os.path.isfile(CLIP_VECTORS_PATH):
+                shutil.copy2(CLIP_VECTORS_PATH,
+                             os.path.join(pdir, "clip_vectors.npz"))
+            if os.path.isfile(FACE_ENCODINGS_PATH):
+                shutil.copy2(FACE_ENCODINGS_PATH,
+                             os.path.join(pdir, "face_encodings.npz"))
+            _last_project_sync = now
+    except Exception:
+        pass
+
+
 def save_config(config):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+    _set_active_project(config)
+    _auto_save_to_project(config_only=True)
 
 
 def load_scan_db():
@@ -242,6 +298,7 @@ def save_scan_db(db):
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, cls=NumpyEncoder)
         os.replace(tmp_path, SCAN_DB_PATH)
+    _auto_save_to_project(scan_db_only=True)
 
 
 def _check_nsfw(fpath, classifier):
@@ -283,7 +340,7 @@ def _estimate_age(fpath):
 
 def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
     """Two-stage face detection: thumbnail pre-screen + full-res detection.
-    Returns (face_count, faces_found, ok, best_distance)."""
+    Returns (face_count, faces_found, ok, best_distance, best_encoding)."""
     import face_recognition as fr
     import numpy as np
     from PIL import Image, ImageOps
@@ -297,7 +354,7 @@ def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
         thumb_arr = np.array(thumb)
         thumb_locs = fr.face_locations(thumb_arr, model="hog")
         if not thumb_locs:
-            return 0, [], True, None  # No faces at all — skip full detection
+            return 0, [], True, None, None
 
         # Stage B: Full detection on larger image (only resize if > 1200px)
         max_dim = 1200
@@ -306,12 +363,13 @@ def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
         arr = np.array(pil_img)
         locations = fr.face_locations(arr, model="hog")
         if not locations:
-            return 0, [], True, None
+            return 0, [], True, None, None
         encodings = fr.face_encodings(arr, locations)
         if not encodings:
-            return len(locations), [], True, None
+            return len(locations), [], True, None, None
         found = set()
         best_dist = 999.0
+        best_enc = encodings[0]  # largest face (first detected)
         for person, ref_encs in ref_encodings.items():
             for ref_enc in ref_encs:
                 dists = fr.face_distance(encodings, ref_enc)
@@ -320,9 +378,9 @@ def _fast_face_detect(fpath, ref_encodings, face_names, tolerance=0.6):
                     best_dist = min_d
                 if min_d <= tolerance:
                     found.add(person)
-        return len(locations), sorted(found), True, round(best_dist, 3) if best_dist < 999 else None
+        return len(locations), sorted(found), True, round(best_dist, 3) if best_dist < 999 else None, best_enc
     except Exception:
-        return 0, [], False, None
+        return 0, [], False, None, None
 
 
 def _should_skip_face_detect(entry):
@@ -892,6 +950,42 @@ def api_scan_start():
                         except Exception:
                             pass
 
+                    # CLIP semantic embedding + auto-tags.
+                    #
+                    # State machine (new images enter as NEVER PROCESSED):
+                    #   NEVER PROCESSED  → has_clip=False, tag_meta=None
+                    #   PROCESSED OK     → has_clip=True,  tag_meta has both versions
+                    #   FAILED           → has_clip=False,  tag_meta=None (same as never)
+                    #
+                    # Atomicity: _tags/_tag_meta stay empty unless BOTH embedding
+                    # AND tag generation succeed and the vector is persisted.
+                    # On failure the entry lands in NEVER PROCESSED / FAILED state
+                    # and will be retried on next scan.
+                    _tags = []
+                    _tag_meta = None
+                    if clip_ready:
+                        try:
+                            if is_video and thumb:
+                                from io import BytesIO as _BytesIO
+                                _pil = PILImage.open(
+                                    _BytesIO(base64.b64decode(thumb)))
+                                _cv = clip_engine.compute_embedding_pil(_pil)
+                            elif not is_video:
+                                _cv = clip_engine.compute_embedding(fpath)
+                            else:
+                                _cv = None
+                            if _cv is not None:
+                                _t, _m = clip_engine.generate_tags(_cv)
+                                # All succeeded — commit results atomically
+                                with _clip_lock_local:
+                                    _clip_vectors_local[fhash] = _cv
+                                _tags = _t
+                                _tag_meta = _m
+                        except Exception:
+                            # Embedding or tagging failed — leave defaults
+                            _tags = []
+                            _tag_meta = None
+
                     entry = {
                         "hash": fhash,
                         "path": fpath.replace("\\", "/"),
@@ -918,6 +1012,9 @@ def api_scan_start():
                         "photo_grade": photo_grade,
                         "image_vector": image_vector,
                         "dhash": dhash_val,
+                        "tags": _tags,
+                        "tag_meta": _tag_meta,
+                        "has_clip": bool(_tag_meta),
                     }
 
                     # For manual categorization: assign temporary category (will be refined after Pass 2)
@@ -980,6 +1077,42 @@ def api_scan_start():
 
             total_media_files = len(all_file_info)
             _update_task(f"Found {total_media_files} media files. Starting Pass 1 (metadata)...")
+
+            # Pre-flight: CLIP semantic embedding support
+            clip_ready = False
+            _clip_vectors_local = {}
+            _clip_lock_local = threading.Lock()
+            _clip_embed_ver = None   # e.g. "clip-vit-b32-onnx:1.0"
+            _clip_tagger_ver = None  # e.g. "a3f2c8e91b04"
+            if clip_engine is not None:
+                try:
+                    if not clip_engine.is_available():
+                        _update_task("Downloading CLIP model for image understanding...")
+                        clip_engine.ensure_models(
+                            progress_fn=lambda msg: _update_task(str(msg)))
+                    if clip_engine.is_available():
+                        _update_task("Loading CLIP model...")
+                        clip_engine._get_vision_session()
+                        clip_engine._get_tag_embeddings()
+                        clip_ready = True
+                        _clip_embed_ver = clip_engine.EMBED_VERSION
+                        _clip_tagger_ver = clip_engine.TAGGER_VERSION
+                        # Pre-load existing vectors so incremental backfill
+                        # merges with them (skip on full rescan to drop stale data)
+                        if not full and os.path.isfile(CLIP_VECTORS_PATH):
+                            _clip_vectors_local = clip_engine.load_vectors(
+                                CLIP_VECTORS_PATH)
+                            _update_task(
+                                f"CLIP ready (embed={_clip_embed_ver}, "
+                                f"tagger={_clip_tagger_ver}), "
+                                f"{len(_clip_vectors_local)} cached vectors loaded")
+                        else:
+                            _update_task(
+                                f"CLIP ready (embed={_clip_embed_ver}, "
+                                f"tagger={_clip_tagger_ver})")
+                except Exception as e:
+                    print(f"CLIP not available: {e}")
+                    import traceback; traceback.print_exc()
 
             all_images = []
             seen_hashes = set()
@@ -1057,6 +1190,78 @@ def api_scan_start():
                                     est = _estimate_age(fpath)
                                     if est is not None:
                                         entry["estimated_age"] = est
+
+                            # CLIP backfill on cached entries.
+                            #
+                            # Five entry states and their transitions:
+                            #
+                            #  NEVER PROCESSED   has_clip=False
+                            #    → needs_embed=True  → full recompute
+                            #
+                            #  PROCESSED CURRENT  has_clip=True, both versions match,
+                            #                     vector in sidecar
+                            #    → skip (no work)
+                            #
+                            #  OUTDATED EMBED     has_clip=True, embed_version !=
+                            #    → needs_embed=True  → full recompute
+                            #
+                            #  OUTDATED TAGGER    has_clip=True, embed_version ok,
+                            #                     tagger_version !=
+                            #    → needs_embed=False, needs_tags=True
+                            #    → re-tag from existing vector (no image I/O)
+                            #
+                            #  SANITY RECOVERY    has_clip=True, versions ok,
+                            #                     but vector missing from sidecar
+                            #                     (crash between periodic scan_db
+                            #                     save and sidecar write)
+                            #    → needs_embed=True  → full recompute, self-heals
+                            #
+                            # On any failure the except leaves the entry unchanged,
+                            # so it stays in its current state and will be retried.
+                            if clip_ready and entry.get("status") != "rejected":
+                                _tm = entry.get("tag_meta") or {}
+                                _has = entry.get("has_clip", False)
+                                _needs_embed = (
+                                    not _has
+                                    or _tm.get("embed_version") != _clip_embed_ver
+                                    or fhash not in _clip_vectors_local
+                                )
+                                _needs_tags = (
+                                    _needs_embed
+                                    or _tm.get("tagger_version") != _clip_tagger_ver
+                                )
+
+                                if _needs_tags:
+                                    try:
+                                        _cv = None
+                                        if _needs_embed:
+                                            _is_vid = entry.get("media_type") == "video"
+                                            if _is_vid and entry.get("thumbnail"):
+                                                from io import BytesIO as _BytesIO
+                                                _pil = PILImage.open(
+                                                    _BytesIO(base64.b64decode(
+                                                        entry["thumbnail"])))
+                                                _cv = clip_engine.compute_embedding_pil(
+                                                    _pil)
+                                            elif not _is_vid:
+                                                _cv = clip_engine.compute_embedding(
+                                                    fpath)
+                                        else:
+                                            # Embedding current — reuse from sidecar
+                                            _cv = _clip_vectors_local.get(fhash)
+
+                                        if _cv is not None:
+                                            _bt, _bm = clip_engine.generate_tags(_cv)
+                                            # All succeeded — commit atomically:
+                                            # vector first, then entry fields.
+                                            with _clip_lock_local:
+                                                _clip_vectors_local[fhash] = _cv
+                                            entry["tags"] = _bt
+                                            entry["tag_meta"] = _bm
+                                            entry["has_clip"] = True
+                                        # else: couldn't get embedding, leave as-is
+                                    except Exception:
+                                        pass  # failed — entry unchanged, retried next scan
 
                             all_images.append(entry)
                             scanned += 1
@@ -1146,6 +1351,25 @@ def api_scan_start():
                 if nsfw_count:
                     _update_task(f"NSFW filter: {nsfw_count} images rejected")
 
+            # Save CLIP vectors to sidecar file (not in scan_db — too large).
+            # Crash safety: save_vectors writes to .tmp then os.replace
+            # (atomic on NTFS/POSIX).  If crash happens between a periodic
+            # scan_db save (which may have has_clip=True) and this sidecar
+            # write, the sanity check (fhash not in _clip_vectors_local)
+            # in the backfill block will detect the missing vector on the
+            # next incremental scan and recompute it.
+            if _clip_vectors_local:
+                _clip_tagged = sum(1 for img in all_images if img.get("has_clip"))
+                try:
+                    clip_engine.save_vectors(
+                        _clip_vectors_local, CLIP_VECTORS_PATH)
+                    _update_task(
+                        f"CLIP: {_clip_tagged} images tagged, "
+                        f"{len(_clip_vectors_local)} vectors saved. "
+                        f"Starting face detection...")
+                except Exception as e:
+                    print(f"Failed to save CLIP vectors: {e}")
+
             # === PASS 2: Face detection (single-threaded, selective) ===
             if use_faces:
                 need_face = [e for e in all_images
@@ -1170,6 +1394,7 @@ def api_scan_start():
                 pass2_start = _time.monotonic()
                 face_checked = 0
                 pass2_times = []
+                _face_encs_local = {}  # hash → 128-dim encoding (best face per image)
 
                 for entry in need_face:
                     if _is_cancelled():
@@ -1206,9 +1431,11 @@ def api_scan_start():
                                 entry["face_count"] = 0
                                 entry["has_target_face"] = False
                         else:
-                            fc, ff, ok, best_d = _fast_face_detect(fpath, ref_encodings, face_names, tolerance)
+                            fc, ff, ok, best_d, best_enc = _fast_face_detect(fpath, ref_encodings, face_names, tolerance)
                             entry["face_count"] = fc
                             entry["faces_found"] = ff
+                            if best_enc is not None:
+                                _face_encs_local[entry["hash"]] = best_enc
                             entry["has_target_face"] = (all(n in ff for n in face_names) if face_match_mode == "all" else any(n in ff for n in face_names)) if face_names else (fc > 0)
                             if best_d is not None:
                                 entry["face_distance"] = best_d
@@ -1261,6 +1488,18 @@ def api_scan_start():
 
                 pass2_elapsed = _time.monotonic() - pass2_start
                 _update_task(f"Face detection complete: {face_checked} images in {pass2_elapsed:.0f}s")
+
+                # Persist face encodings for reuse
+                if _face_encs_local:
+                    try:
+                        np.savez_compressed(
+                            FACE_ENCODINGS_PATH + ".tmp",
+                            **{k: v for k, v in _face_encs_local.items()})
+                        os.replace(
+                            FACE_ENCODINGS_PATH + ".tmp",
+                            FACE_ENCODINGS_PATH)
+                    except Exception:
+                        pass
 
             # Age estimation (if enabled, single-threaded)
             if age_est_enabled:
@@ -1325,10 +1564,19 @@ def api_scan_start():
 
             # === PASS 3: Similarity clustering ===
             _update_task("Pass 3: Clustering similar images...")
+            # Load CLIP vectors for semantic clustering (if available)
+            _cluster_clip_vecs = None
+            if clip_engine is not None and os.path.isfile(CLIP_VECTORS_PATH):
+                try:
+                    _cluster_clip_vecs = clip_engine.load_vectors(
+                        CLIP_VECTORS_PATH)
+                except Exception:
+                    pass
             cluster_result = cluster_similar_images(
                 all_images,
                 vector_threshold=config.get("cluster_vector_threshold", 0.92),
                 dhash_threshold=config.get("cluster_dhash_threshold", 5),
+                clip_vectors=_cluster_clip_vecs,
                 progress_cb=_update_task,
             )
             if cluster_result["clusters"] > 0:
@@ -1696,6 +1944,21 @@ def api_quick_fill():
                     _dhash_cache[h] = dh
                 return dh
 
+            # Load CLIP vectors for diversity scoring
+            _clip_vec_data = {}
+            if clip_engine is not None and os.path.isfile(CLIP_VECTORS_PATH):
+                try:
+                    _clip_vec_data = clip_engine.load_vectors(CLIP_VECTORS_PATH)
+                except Exception:
+                    pass
+
+            def _get_clip_vector(img):
+                h = img.get("hash")
+                if h and h in _clip_vec_data:
+                    cv = _clip_vec_data[h]
+                    return np.array(cv, dtype=np.float32) if isinstance(cv, list) else cv
+                return None
+
             # Pre-compute vectors for rated images (for visual preference learning)
             _update_task("Building preference model...")
             vector_lookup = {}
@@ -1751,13 +2014,15 @@ def api_quick_fill():
                     for img in already:
                         v = _get_vector(img)
                         dh = _get_dhash(img)
-                        ranker.register_selected(img, v, dh)
+                        cv = _get_clip_vector(img)
+                        ranker.register_selected(img, v, dh, clip_vector=cv)
 
                     # Score all unselected with ranking engine
                     for img in unselected:
                         v = _get_vector(img)
                         dh = _get_dhash(img)
-                        ranker.score(img, vector=v, dhash=dh, quality_weights=weights)
+                        cv = _get_clip_vector(img)
+                        ranker.score(img, vector=v, dhash=dh, clip_vector=cv, quality_weights=weights)
 
                     unselected.sort(key=lambda x: x.get("_score", 0), reverse=True)
 
@@ -1779,7 +2044,8 @@ def api_quick_fill():
                         picked += 1
                         v = _get_vector(img)
                         dh = _get_dhash(img)
-                        ranker.register_selected(img, v, dh)
+                        cv = _get_clip_vector(img)
+                        ranker.register_selected(img, v, dh, clip_vector=cv)
 
                     return len(already) + picked, picked
 
@@ -2019,15 +2285,28 @@ def api_preferences_quiz():
 
 @app.route("/api/images/serve/<img_hash>")
 def api_images_serve(img_hash):
-    """Serve a full-size image by hash."""
+    """Serve a full-size image or video by hash."""
     db = load_scan_db()
     if not db:
         return jsonify({"error": "No scan data"}), 404
+    # MIME types for video formats Flask may not auto-detect
+    _VIDEO_MIMES = {
+        ".mp4": "video/mp4", ".m4v": "video/mp4",
+        ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+        ".mkv": "video/x-matroska", ".webm": "video/webm",
+        ".wmv": "video/x-ms-wmv", ".mpg": "video/mpeg",
+        ".mpeg": "video/mpeg", ".3gp": "video/3gpp",
+    }
     for img in db["images"]:
         if img["hash"] == img_hash:
             fpath = img["path"].replace("/", os.sep)
             if os.path.isfile(fpath):
-                return send_file(fpath)
+                ext = os.path.splitext(fpath)[1].lower()
+                mime = _VIDEO_MIMES.get(ext)
+                # conditional=True enables Range requests (required for video seeking/playback)
+                if mime:
+                    return send_file(fpath, mimetype=mime, conditional=True)
+                return send_file(fpath, conditional=True)
             break
     return jsonify({"error": "Not found"}), 404
 
@@ -2995,6 +3274,16 @@ def api_projects_save():
         with _db_lock:
             shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
 
+    # Copy CLIP vectors sidecar
+    if os.path.isfile(CLIP_VECTORS_PATH):
+        shutil.copy2(CLIP_VECTORS_PATH,
+                     os.path.join(pdir, "clip_vectors.npz"))
+
+    # Copy face encodings sidecar
+    if os.path.isfile(FACE_ENCODINGS_PATH):
+        shutil.copy2(FACE_ENCODINGS_PATH,
+                     os.path.join(pdir, "face_encodings.npz"))
+
     # Copy ref_faces
     ref_src = os.path.join(PROJECT_DIR, "ref_faces")
     ref_dst = os.path.join(pdir, "ref_faces")
@@ -3036,6 +3325,20 @@ def api_projects_load():
         elif os.path.isfile(SCAN_DB_PATH):
             os.remove(SCAN_DB_PATH)
 
+    # Restore CLIP vectors sidecar
+    src_clip = os.path.join(pdir, "clip_vectors.npz")
+    if os.path.isfile(src_clip):
+        shutil.copy2(src_clip, CLIP_VECTORS_PATH)
+    elif os.path.isfile(CLIP_VECTORS_PATH):
+        os.remove(CLIP_VECTORS_PATH)
+
+    # Restore face encodings sidecar
+    src_face = os.path.join(pdir, "face_encodings.npz")
+    if os.path.isfile(src_face):
+        shutil.copy2(src_face, FACE_ENCODINGS_PATH)
+    elif os.path.isfile(FACE_ENCODINGS_PATH):
+        os.remove(FACE_ENCODINGS_PATH)
+
     # Restore ref_faces
     ref_dst = os.path.join(PROJECT_DIR, "ref_faces")
     ref_src = os.path.join(pdir, "ref_faces")
@@ -3045,6 +3348,9 @@ def api_projects_load():
         shutil.copytree(ref_src, ref_dst)
     else:
         os.makedirs(ref_dst, exist_ok=True)
+
+    # Activate auto-save for this project
+    _set_active_project(load_config())
 
     return jsonify({"ok": True, "step": meta.get("step", 0), "project": meta})
 
@@ -3327,7 +3633,7 @@ def api_age_assess_start():
 
                         # If specific person, check face first
                         if use_face_filter:
-                            fc, ff, ok, dist = _fast_face_detect(
+                            fc, ff, ok, dist, _enc = _fast_face_detect(
                                 fpath, ref_encodings, [person_name], 0.6)
                             if person_name not in ff:
                                 continue
@@ -7926,6 +8232,7 @@ if __name__ == "__main__":
 
     url = f"http://localhost:{args.port}"
     print(f"E-z Photo Organizer running at {url}")
+    _set_active_project(load_config())
 
     if not args.no_open:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()

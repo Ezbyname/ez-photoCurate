@@ -2425,108 +2425,858 @@ def categorize_by_template(template, config, img_date, fpath=None):
     return None
 
 
-def categorize_sports_heuristic(entry, categories):
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATEGORY CLASSIFICATION RULES ENGINE
+#
+#  Each event type maps to a dict of category_id → rule.
+#  A rule contains:
+#    path_keywords: words in folder/filename path that strongly signal this category
+#    path_exclude:  words that disqualify from this category
+#    face_range:    (min, max) face count — None means no constraint
+#    min_sharpness: minimum sharpness score (0-100)
+#    max_sharpness: maximum sharpness score (0-100)
+#    orientation:   "landscape", "portrait", or None
+#    priority:      higher = checked first (default 0)
+#    is_default:    True = fallback category when nothing else matches
+#    min_tag_hits:  minimum tag keyword matches required (prevents false positives)
+# ══════════════════════════════════════════════════════════════════════════════
+
+CATEGORY_RULES = {
+
+    # ── WEDDING ──────────────────────────────────────────────────────────────
+    "wedding": {
+        "01_prep_bride": {
+            "path_keywords": ["bride", "bridal", "getting ready", "makeup", "hair", "dress",
+                              "bridesmaids", "bouquet", "veil", "mirror"],
+            "path_exclude": ["groom"],
+            "face_range": (1, 6),
+            "priority": 5,
+        },
+        "02_prep_groom": {
+            "path_keywords": ["groom", "groomsmen", "getting ready", "suit", "tie",
+                              "cufflinks", "boutonniere", "best man"],
+            "path_exclude": ["bride"],
+            "face_range": (1, 6),
+            "priority": 5,
+        },
+        "03_first_look": {
+            "path_keywords": ["first look", "pre-ceremony", "pre ceremony", "reveal",
+                              "before ceremony", "outdoor", "garden"],
+            "face_range": (1, 3),
+            "min_sharpness": 40,
+        },
+        "04_ceremony": {
+            "path_keywords": ["ceremony", "altar", "chuppah", "vows", "rings", "aisle",
+                              "officiant", "rabbi", "priest", "church", "chapel", "synagogue"],
+            "priority": 3,
+        },
+        "05_couple_portraits": {
+            "path_keywords": ["couple", "portrait", "posed", "romantic", "sunset",
+                              "golden hour", "bride groom", "formal"],
+            "face_range": (2, 2),
+            "min_sharpness": 50,
+            "priority": 2,
+        },
+        "06_family_portraits": {
+            "path_keywords": ["family", "parents", "grandparents", "siblings", "formal",
+                              "group portrait", "family photo"],
+            "face_range": (3, 30),
+            "min_sharpness": 40,
+        },
+        "07_cocktail": {
+            "path_keywords": ["cocktail", "hour", "appetizer", "drinks", "mingling",
+                              "hors d'oeuvres", "reception start"],
+        },
+        "08_reception_entry": {
+            "path_keywords": ["entrance", "first dance", "grand entrance", "introduction",
+                              "dance floor", "opening dance"],
+            "priority": 2,
+        },
+        "09_speeches": {
+            "path_keywords": ["speech", "toast", "best man", "maid of honor",
+                              "microphone", "podium", "tribute"],
+            "face_range": (1, 3),
+        },
+        "10_party": {
+            "path_keywords": ["dancing", "party", "dance floor", "dj", "band",
+                              "celebration", "reception"],
+            "max_sharpness": 60,
+            "is_default": True,
+        },
+        "11_cake": {
+            "path_keywords": ["cake", "cutting", "dessert", "sweet", "confetti",
+                              "bouquet toss", "garter"],
+            "priority": 4,
+        },
+        "12_candids": {
+            "path_keywords": ["candid", "guest", "laugh", "fun", "moment", "reaction",
+                              "emotion", "hug", "kiss"],
+        },
+        "13_details": {
+            "path_keywords": ["detail", "decor", "flower", "centerpiece", "table",
+                              "ring", "invitation", "venue", "setup", "decoration",
+                              "sign", "menu", "place card"],
+            "face_range": (0, 0),
+            "priority": 3,
+        },
+    },
+
+    # ── BIRTHDAY PARTY ───────────────────────────────────────────────────────
+    # Keywords are aligned with CLIP TAG_VOCABULARY tags where possible.
+    # Tag matching uses exact tokens (not substrings).
+    "birthday": {
+        "01_setup": {
+            "path_keywords": ["setup", "decoration", "decor", "banner",
+                              "table", "venue", "before",
+                              "flowers", "indoors"],
+            "face_range": (0, 2),
+            "priority": 3,
+        },
+        "02_arrivals": {
+            "path_keywords": ["arrival", "greeting", "welcome", "door",
+                              "entrance", "outdoors"],
+        },
+        "03_activities": {
+            "path_keywords": ["game", "activity", "playing sports",
+                              "playing basketball", "swimming",
+                              "swimming pool", "playground", "trampoline",
+                              "running", "jumping", "dancing", "bouncing",
+                              "eating", "food"],
+            "max_sharpness": 70,
+        },
+        "04_cake": {
+            "path_keywords": ["birthday cake", "blowing candles", "cake",
+                              "candles", "singing", "wish", "happy birthday"],
+            "min_tag_hits": 2,
+            "priority": 3,
+        },
+        "05_gifts": {
+            "path_keywords": ["gift", "opening gifts", "present", "unwrap",
+                              "box", "bag", "surprise"],
+        },
+        "06_group_shots": {
+            "path_keywords": ["group photo", "team photo", "group",
+                              "everyone", "together", "family", "crowd"],
+            "face_range": (4, 50),
+            "priority": 2,
+        },
+        "07_candids": {
+            "path_keywords": ["candid", "fun", "moment", "laughing",
+                              "smiling", "happy", "casual"],
+            "is_default": True,
+        },
+        "08_portrait": {
+            "path_keywords": ["portrait", "selfie", "close up", "posed",
+                              "birthday boy", "birthday girl", "formal"],
+            "face_range": (1, 2),
+            "min_sharpness": 50,
+            "priority": 2,
+        },
+    },
+
+    # ── SPORTS SEASON ────────────────────────────────────────────────────────
+    "sports_season": {
+        "01_team": {
+            "path_keywords": ["team", "squad", "roster", "lineup", "group photo",
+                              "team photo", "together"],
+            "path_exclude": ["family", "birthday", "vacation", "home", "dinner",
+                             "selfie", "restaurant", "beach", "pool"],
+            "face_range": (5, 50),
+            "orientation": "landscape",
+            "priority": 3,
+        },
+        "02_practice": {
+            "path_keywords": ["practice", "training", "warmup", "drill", "workout",
+                              "stretching", "conditioning"],
+        },
+        "03_games": {
+            "path_keywords": ["game", "match", "playing sports",
+                              "playing basketball", "action", "basketball",
+                              "basketball court", "gym", "sports field",
+                              "league", "tournament", "competition",
+                              "running", "jumping", "action shot"],
+            "orientation": "landscape",
+            "max_sharpness": 50,
+        },
+        "04_celebrations": {
+            "path_keywords": ["win", "celebration", "cheer", "victory", "champion",
+                              "trophy", "medal", "high five", "hug"],
+            "face_range": (2, 6),
+        },
+        "05_portraits": {
+            "path_keywords": ["portrait", "headshot", "profile", "posed", "jersey"],
+            "face_range": (1, 1),
+            "min_sharpness": 50,
+            "priority": 2,
+        },
+        "06_awards": {
+            "path_keywords": ["award", "trophy", "medal", "ceremony", "mvp",
+                              "champion", "plaque", "certificate"],
+            "priority": 5,
+        },
+        "07_off_field": {
+            "path_keywords": ["fun", "party", "off", "trip", "outing", "birthday",
+                              "vacation", "holiday", "beach", "pool", "dinner",
+                              "restaurant", "family", "home", "selfie", "bus",
+                              "travel", "hotel"],
+            "orientation": "portrait",
+            "is_default": True,
+        },
+    },
+
+    # ── VACATION / TRIP ──────────────────────────────────────────────────────
+    "vacation": {
+        "01_departure": {
+            "path_keywords": ["airport", "departure", "flight", "plane", "travel",
+                              "packing", "suitcase", "taxi", "terminal", "boarding"],
+            "priority": 4,
+        },
+        # Days 1-7 are date-based, no keyword rules needed
+        "20_landscapes": {
+            "path_keywords": ["landscape", "scenery", "view", "mountain", "ocean",
+                              "beach", "sunset", "sunrise", "panorama", "nature",
+                              "sky", "lake", "river", "forest", "cliff", "valley"],
+            "face_range": (0, 0),
+            "orientation": "landscape",
+            "priority": 3,
+        },
+        "21_food": {
+            "path_keywords": ["food", "restaurant", "dinner", "lunch", "breakfast",
+                              "coffee", "meal", "dish", "cuisine", "market", "menu",
+                              "wine", "cocktail", "bar", "cafe"],
+            "face_range": (0, 3),
+            "priority": 4,
+        },
+        "22_people": {
+            "path_keywords": ["portrait", "people", "selfie", "family", "group",
+                              "together", "smile", "pose"],
+            "face_range": (1, 10),
+            "min_sharpness": 40,
+        },
+        "23_details": {
+            "path_keywords": ["detail", "architecture", "building", "street", "sign",
+                              "art", "museum", "culture", "souvenir", "shop", "door",
+                              "texture", "pattern", "close"],
+            "face_range": (0, 1),
+        },
+    },
+
+    # ── PHOTO BOOK / YEAR IN REVIEW ──────────────────────────────────────────
+    "photo_book": {
+        # Seasons are date-based (month ranges), no keyword rules needed
+        "05_family": {
+            "path_keywords": ["family", "portrait", "together", "group", "pose",
+                              "formal", "studio"],
+            "face_range": (2, 15),
+            "min_sharpness": 40,
+        },
+        "06_travel": {
+            "path_keywords": ["travel", "vacation", "trip", "flight", "hotel",
+                              "beach", "mountain", "tour", "abroad", "overseas"],
+        },
+        "07_celebrations": {
+            "path_keywords": ["birthday", "holiday", "christmas", "hanukkah",
+                              "thanksgiving", "easter", "new year", "party",
+                              "celebration", "anniversary", "passover"],
+            "priority": 3,
+        },
+        "08_everyday": {
+            "path_keywords": ["home", "garden", "park", "walk", "school", "morning",
+                              "cooking", "backyard", "playground"],
+            "is_default": True,
+        },
+        "09_pets": {
+            "path_keywords": ["dog", "cat", "pet", "puppy", "kitten", "animal",
+                              "vet", "walk"],
+            "face_range": (0, 2),
+            "priority": 4,
+        },
+        "10_favorites": {
+            "path_keywords": ["best", "favorite", "highlight", "star", "top",
+                              "special"],
+            "min_sharpness": 60,
+        },
+    },
+
+    # ── BABY'S FIRST YEAR ────────────────────────────────────────────────────
+    "baby_first_year": {
+        # Months are age-bracket based, only special categories need rules
+        "13_first_bday": {
+            "path_keywords": ["birthday", "first birthday", "party", "cake", "candle",
+                              "smash", "one year", "1 year"],
+            "priority": 5,
+        },
+        "14_milestones": {
+            "path_keywords": ["first", "milestone", "crawling", "walking", "standing",
+                              "sitting", "tooth", "step", "word", "smile", "laugh",
+                              "bath", "swimming", "solid food"],
+        },
+    },
+
+    # ── GRADUATION ───────────────────────────────────────────────────────────
+    "graduation": {
+        "01_getting_ready": {
+            "path_keywords": ["getting ready", "dress", "gown", "cap", "mirror",
+                              "preparation", "outfit", "morning"],
+        },
+        "02_ceremony": {
+            "path_keywords": ["ceremony", "stage", "diploma", "commencement",
+                              "auditorium", "procession", "march", "dean"],
+            "priority": 3,
+        },
+        "03_cap_toss": {
+            "path_keywords": ["cap toss", "toss", "throw", "jubilation", "stage walk",
+                              "diploma hand", "handshake"],
+            "priority": 4,
+        },
+        "04_family_photos": {
+            "path_keywords": ["family", "parents", "mom", "dad", "grandparents",
+                              "siblings", "formal", "portrait"],
+            "face_range": (2, 15),
+            "min_sharpness": 40,
+        },
+        "05_friends": {
+            "path_keywords": ["friend", "classmate", "buddy", "squad", "group",
+                              "yearbook", "selfie"],
+            "face_range": (2, 20),
+        },
+        "06_celebration": {
+            "path_keywords": ["dinner", "restaurant", "party", "celebration",
+                              "toast", "champagne", "cheers"],
+            "is_default": True,
+        },
+        "07_candids": {
+            "path_keywords": ["candid", "moment", "laugh", "hug", "emotion",
+                              "tear", "joy"],
+        },
+    },
+
+    # ── ANNIVERSARY ──────────────────────────────────────────────────────────
+    "anniversary": {
+        "01_early_years": {
+            "path_keywords": ["early", "young", "dating", "engagement", "wedding",
+                              "first", "beginning", "old photo", "throwback"],
+        },
+        "02_milestones": {
+            "path_keywords": ["milestone", "baby", "house", "career", "achievement",
+                              "promotion", "move", "graduation"],
+        },
+        "03_family": {
+            "path_keywords": ["family", "kids", "children", "growing", "together",
+                              "holiday", "vacation"],
+            "face_range": (3, 15),
+        },
+        "04_preparation": {
+            "path_keywords": ["setup", "preparation", "decoration", "venue", "flowers",
+                              "table", "before"],
+            "face_range": (0, 2),
+        },
+        "05_celebration": {
+            "path_keywords": ["celebration", "party", "toast", "dinner", "dance",
+                              "cake", "speech"],
+            "is_default": True,
+        },
+        "06_guests": {
+            "path_keywords": ["guest", "group", "friends", "colleague", "everyone",
+                              "crowd", "table"],
+            "face_range": (3, 50),
+        },
+        "07_portraits": {
+            "path_keywords": ["portrait", "couple", "posed", "romantic", "embrace",
+                              "kiss", "hug"],
+            "face_range": (1, 2),
+            "min_sharpness": 50,
+        },
+    },
+
+    # ── FAMILY REUNION ───────────────────────────────────────────────────────
+    "family_reunion": {
+        "01_arrivals": {
+            "path_keywords": ["arrival", "greeting", "welcome", "hug", "door",
+                              "driveway", "entrance"],
+        },
+        "02_group_shots": {
+            "path_keywords": ["group", "everyone", "family photo", "branch",
+                              "generations", "whole family", "lineup"],
+            "face_range": (5, 50),
+            "orientation": "landscape",
+            "priority": 3,
+        },
+        "03_activities": {
+            "path_keywords": ["game", "activity", "play", "sport", "ball", "swim",
+                              "hike", "craft", "water", "football", "volleyball"],
+            "is_default": True,
+        },
+        "04_food": {
+            "path_keywords": ["food", "meal", "bbq", "barbecue", "grill", "table",
+                              "eating", "kitchen", "cooking", "potluck", "picnic"],
+            "priority": 3,
+        },
+        "05_kids": {
+            "path_keywords": ["kid", "child", "children", "play", "young", "baby",
+                              "toddler", "running"],
+            "face_range": (1, 6),
+        },
+        "06_elders": {
+            "path_keywords": ["grandma", "grandpa", "elder", "grandfather",
+                              "grandmother", "nana", "papa", "senior", "generation"],
+            "priority": 4,
+        },
+        "07_candids": {
+            "path_keywords": ["candid", "fun", "moment", "laugh", "silly",
+                              "spontaneous"],
+        },
+    },
+
+    # ── BABY SHOWER / GENDER REVEAL ──────────────────────────────────────────
+    "baby_shower": {
+        "01_setup": {
+            "path_keywords": ["decoration", "setup", "decor", "balloon", "banner",
+                              "table", "venue", "theme", "centerpiece"],
+            "face_range": (0, 1),
+            "priority": 3,
+        },
+        "02_arrivals": {
+            "path_keywords": ["arrival", "greeting", "welcome", "door", "entrance",
+                              "hello"],
+        },
+        "03_games": {
+            "path_keywords": ["game", "activity", "play", "quiz", "trivia",
+                              "contest", "diaper", "bottle"],
+            "is_default": True,
+        },
+        "04_gifts": {
+            "path_keywords": ["gift", "present", "opening", "unwrap", "box",
+                              "clothes", "toy", "onesie"],
+            "priority": 3,
+        },
+        "05_reveal": {
+            "path_keywords": ["reveal", "gender", "boy", "girl", "pink", "blue",
+                              "surprise", "pop", "confetti", "smoke", "balloon pop"],
+            "priority": 5,
+        },
+        "06_group": {
+            "path_keywords": ["group", "everyone", "together", "photo"],
+            "face_range": (4, 50),
+        },
+        "07_candids": {
+            "path_keywords": ["candid", "fun", "moment", "laugh", "belly",
+                              "bump", "mama"],
+        },
+    },
+
+    # ── QUINCEAÑERA / SWEET 16 ───────────────────────────────────────────────
+    "quinceanera": {
+        "01_getting_ready": {
+            "path_keywords": ["getting ready", "makeup", "hair", "dress", "mirror",
+                              "preparation", "tiara", "crown"],
+        },
+        "02_ceremony": {
+            "path_keywords": ["ceremony", "church", "mass", "blessing", "religious",
+                              "chapel", "altar"],
+            "priority": 3,
+        },
+        "03_portraits": {
+            "path_keywords": ["portrait", "posed", "formal", "studio", "outdoor",
+                              "quinceañera", "princess"],
+            "face_range": (1, 2),
+            "min_sharpness": 50,
+            "priority": 2,
+        },
+        "04_reception": {
+            "path_keywords": ["reception", "entrance", "grand entrance", "arrival",
+                              "venue", "hall", "ballroom"],
+        },
+        "05_dances": {
+            "path_keywords": ["dance", "waltz", "vals", "chambelan", "father daughter",
+                              "first dance", "choreography"],
+            "priority": 4,
+        },
+        "06_cake": {
+            "path_keywords": ["cake", "toast", "champagne", "dessert", "cutting",
+                              "candle", "last doll"],
+            "priority": 4,
+        },
+        "07_party": {
+            "path_keywords": ["party", "dancing", "dj", "music", "crowd",
+                              "dance floor", "celebration"],
+            "is_default": True,
+        },
+        "08_guests": {
+            "path_keywords": ["guest", "group", "friends", "family", "table",
+                              "posed", "everyone"],
+            "face_range": (3, 50),
+        },
+    },
+
+    # ── MEMORIAL / TRIBUTE ───────────────────────────────────────────────────
+    "memorial": {
+        "01_childhood": {
+            "path_keywords": ["child", "baby", "kid", "young", "toddler", "infant",
+                              "school", "elementary", "playground"],
+            "priority": 2,
+        },
+        "02_youth": {
+            "path_keywords": ["teen", "youth", "high school", "college", "university",
+                              "prom", "graduation", "student"],
+        },
+        "03_family": {
+            "path_keywords": ["family", "wedding", "children", "kids", "spouse",
+                              "husband", "wife", "parent", "home"],
+            "face_range": (2, 15),
+            "is_default": True,
+        },
+        "04_career": {
+            "path_keywords": ["work", "career", "office", "job", "professional",
+                              "business", "achievement", "award", "retirement"],
+            "face_range": (0, 3),
+        },
+        "05_friends": {
+            "path_keywords": ["friend", "buddy", "colleague", "community", "club",
+                              "neighbor", "group", "social"],
+            "face_range": (2, 20),
+        },
+        "06_hobbies": {
+            "path_keywords": ["hobby", "garden", "fishing", "cooking", "travel",
+                              "music", "art", "sport", "reading", "craft", "golf",
+                              "hiking", "camping"],
+        },
+        "07_recent": {
+            "path_keywords": ["recent", "last", "final", "later", "senior",
+                              "elder", "grandparent"],
+        },
+        "08_legacy": {
+            "path_keywords": ["legacy", "special", "memorable", "best", "favorite",
+                              "love", "joy", "moment", "smile"],
+            "min_sharpness": 50,
+        },
+    },
+
+    # ── PET TIMELINE ─────────────────────────────────────────────────────────
+    "pet_timeline": {
+        "01_first_day": {
+            "path_keywords": ["first day", "adoption", "rescue", "shelter", "new home",
+                              "welcome", "arrive", "puppy mill"],
+            "priority": 5,
+        },
+        "02_puppy": {
+            "path_keywords": ["puppy", "kitten", "baby", "tiny", "small", "young",
+                              "little", "newborn", "pup"],
+            "priority": 3,
+        },
+        "03_growing": {
+            "path_keywords": ["growing", "bigger", "training", "learn", "sit",
+                              "fetch", "walk", "leash"],
+            "is_default": True,
+        },
+        "04_adventures": {
+            "path_keywords": ["adventure", "outdoor", "park", "beach", "hike",
+                              "trail", "swim", "lake", "mountain", "snow", "camp",
+                              "run", "fetch", "woods", "field"],
+        },
+        "05_family": {
+            "path_keywords": ["family", "kid", "child", "cuddle", "couch", "bed",
+                              "sofa", "lap", "together", "friend", "play"],
+            "face_range": (1, 10),
+        },
+        "06_silly": {
+            "path_keywords": ["silly", "funny", "derp", "costume", "halloween",
+                              "hat", "tongue", "mess", "destroy", "oops", "guilty"],
+            "priority": 3,
+        },
+        "07_portraits": {
+            "path_keywords": ["portrait", "close", "face", "eyes", "pose", "beauty",
+                              "headshot", "profile", "studio"],
+            "face_range": (0, 1),
+            "min_sharpness": 50,
+        },
+    },
+
+    # ── RETIREMENT PARTY ─────────────────────────────────────────────────────
+    "retirement": {
+        "01_career": {
+            "path_keywords": ["career", "work", "office", "job", "professional",
+                              "desk", "workplace", "years of service", "old photo"],
+        },
+        "02_colleagues": {
+            "path_keywords": ["colleague", "coworker", "team", "department", "staff",
+                              "boss", "manager", "work friend"],
+            "face_range": (2, 20),
+        },
+        "03_setup": {
+            "path_keywords": ["setup", "decoration", "decor", "venue", "banner",
+                              "balloon", "sign", "table"],
+            "face_range": (0, 1),
+            "priority": 3,
+        },
+        "04_speeches": {
+            "path_keywords": ["speech", "tribute", "toast", "microphone", "podium",
+                              "presentation", "award", "plaque", "gift"],
+            "priority": 3,
+        },
+        "05_celebration": {
+            "path_keywords": ["celebration", "dinner", "party", "cake", "champagne",
+                              "cheers", "dance"],
+            "is_default": True,
+        },
+        "06_group": {
+            "path_keywords": ["group", "everyone", "photo", "together",
+                              "family", "crowd"],
+            "face_range": (4, 50),
+        },
+        "07_candids": {
+            "path_keywords": ["candid", "fun", "moment", "laugh", "hug",
+                              "emotion", "tear", "joy"],
+        },
+    },
+}
+
+# ── Tag-family lookup for per-family score caps ─────────────────────────────
+_TAG_FAMILY_CACHE = None
+
+def _get_tag_family():
+    """Lazy lookup: tag name → family.  Graceful fallback if clip_engine absent."""
+    global _TAG_FAMILY_CACHE
+    if _TAG_FAMILY_CACHE is not None:
+        return _TAG_FAMILY_CACHE
+    try:
+        from clip_engine import TAG_VOCABULARY
+        _TAG_FAMILY_CACHE = {t: f for f, ts in TAG_VOCABULARY.items() for t in ts}
+    except ImportError:
+        _TAG_FAMILY_CACHE = {}
+    return _TAG_FAMILY_CACHE
+
+
+def score_category_rules(entry, event_type, categories):
     """
-    Heuristic categorization for sports_season (manual) templates.
-    Uses face count, sharpness, folder path, image dimensions to guess category.
-    Returns a category ID string.
+    Score an image against all category rules for the given event type.
+    Returns the best-matching category ID, or None if no rules exist.
+
+    Scoring (tags = primary signal, filename/path = fallback):
+      Tags:  +10 per keyword match (first 2 per tag-family at full weight,
+             additional same-family hits at +3 — diminishing returns)
+      Path:  +2  per keyword match against filename/path (if tags exist)
+             +10 per keyword match against filename/path (if no tags — full fallback)
+      -20 per exclusion match (both signals, full strength)
+      +5  if face_count in range (with keyword evidence), +2 without
+      -8  if face_count outside range
+      +3  if orientation matches (keyword evidence required)
+      +3  if sharpness in range (keyword evidence required)
+      +priority bonus (keyword evidence required)
+      +3  for is_default (fallback for unrecognized images)
     """
+    rules = CATEGORY_RULES.get(event_type)
+    if not rules:
+        return None
+
+    cat_ids = {c["id"] for c in categories}
     face_count = entry.get("face_count", 0)
     grade = entry.get("photo_grade") or {}
     sharpness = grade.get("sharpness", 50)
-    focus = grade.get("focus", 50)
-    path_lower = entry.get("path", "").lower().replace("\\", "/")
     w = entry.get("width", 0)
     h = entry.get("height", 0)
+    is_landscape = w > h * 1.2 if w and h else False
 
-    # Build a set of available category IDs for flexible matching
-    cat_ids = {c["id"] for c in categories}
+    path_lower = entry.get("path", "").lower().replace("\\", "/")
+    fname_lower = entry.get("filename", "").lower()
+    tags = entry.get("tags") or []
+    has_tags = len(tags) > 0
+    tags_text = " ".join(tags)
+    path_text = path_lower + " " + fname_lower
 
-    # Folder-name hints
-    folder_hints_action = ("game", "match", "play", "action", "basket", "sport")
-    folder_hints_practice = ("practice", "training", "warmup", "drill")
-    folder_hints_award = ("award", "trophy", "medal", "ceremony")
-    folder_hints_fun = ("fun", "party", "off", "trip", "outing")
+    # Scoring weights:
+    #   Tags are the primary signal (10 pts/hit).
+    #   Filename/path is a fallback — full weight when no tags, reduced when
+    #   tags exist so they don't compete with actual image understanding.
+    TAG_WEIGHT = 10
+    PATH_WEIGHT = 2 if has_tags else 10
 
-    # Check folder name for strong hints
-    parts = path_lower.split("/")
-    folder_parts = " ".join(parts[:-1])  # everything except filename
+    best_score = -999
+    best_cat = None
+    _debug_scores = {}  # cat_id → {score, tag_hits, path_hits, ...}
 
-    for hint in folder_hints_award:
-        if hint in folder_parts and "06_awards" in cat_ids:
-            return "06_awards"
-    for hint in folder_hints_practice:
-        if hint in folder_parts and "02_practice" in cat_ids:
-            return "02_practice"
-    for hint in folder_hints_fun:
-        if hint in folder_parts and "07_off_field" in cat_ids:
-            return "07_off_field"
+    for cat_id, rule in rules.items():
+        if cat_id not in cat_ids:
+            continue
 
-    # Face-count based heuristics
-    # Group shots (4+ faces) → Team Photos
-    if face_count >= 4 and "01_team" in cat_ids:
-        return "01_team"
+        score = 0
+        keywords = rule.get("path_keywords", [])
+        excludes = rule.get("path_exclude", [])
 
-    # Single face, high sharpness + focus → Player Portraits
-    if face_count == 1 and sharpness > 50 and focus > 50 and "05_portraits" in cat_ids:
-        return "05_portraits"
+        # Tag keyword matches (primary signal).
+        # Exact matching: keyword must equal the full tag or one of its
+        # space-separated tokens.  Prevents substring inflation (e.g.,
+        # "play" no longer matches "playground" or "playing basketball").
+        # Per-TAG counting: each tag contributes at most 1 hit.
+        _tag_kw_matched = []    # keyword that matched
+        _tag_kw_source = []     # tag that produced the match
+        for tag in tags:
+            tag_tokens = tag.split()
+            for kw in keywords:
+                if kw == tag or kw in tag_tokens:
+                    _tag_kw_matched.append(kw)
+                    _tag_kw_source.append(tag)
+                    break  # one hit per tag
+        tag_hits = len(_tag_kw_matched)
 
-    # Low sharpness / focus → likely action / motion blur → Game Action
-    if sharpness < 35 and "03_games" in cat_ids:
-        return "03_games"
+        # min_tag_hits gate: if the rule requires N tag hits and we have
+        # fewer, skip this category entirely (prevents false positives
+        # from a single weak signal, e.g., 04_cake on a non-cake image).
+        min_th = rule.get("min_tag_hits")
+        if min_th and has_tags and tag_hits < min_th:
+            _debug_scores[cat_id] = {
+                "score": -999, "tag_hits": _tag_kw_matched,
+                "path_hits": [], "excl": 0, "face_adj": 0, "bonus": 0,
+                "gated": f"min_tag_hits={min_th}, got {tag_hits}",
+            }
+            continue
 
-    # 2-3 faces, decent quality → Celebrations or Team
-    if face_count in (2, 3):
-        if "04_celebrations" in cat_ids:
-            return "04_celebrations"
+        # Per-family diminishing returns:  first TAG_FAM_CAP hits from
+        # each tag family score at full weight; additional same-family
+        # hits score at TAG_OVERFLOW_WEIGHT.  Prevents related tags
+        # (e.g., "playing sports" + "playing basketball" + "jumping")
+        # from inflating a category's score beyond the evidence.
+        TAG_FAM_CAP = 2
+        TAG_OVERFLOW_WEIGHT = 3
+        tag_fam = _get_tag_family()
+        _fam_counts = {}
+        tag_score = 0
+        for src_tag in _tag_kw_source:
+            fam = tag_fam.get(src_tag)
+            n = _fam_counts.get(fam, 0) + 1
+            _fam_counts[fam] = n
+            tag_score += TAG_WEIGHT if n <= TAG_FAM_CAP else TAG_OVERFLOW_WEIGHT
+        score += tag_score
 
-    # No faces detected → likely wide-angle action shot
-    if face_count == 0 and "03_games" in cat_ids:
-        return "03_games"
+        # Path/filename keyword matches (fallback signal)
+        _path_kw_matched = [kw for kw in keywords if kw in path_text]
+        path_hits = len(_path_kw_matched)
+        score += path_hits * PATH_WEIGHT
 
-    # Folder contains sport-related keywords → Game Action
-    for hint in folder_hints_action:
-        if hint in folder_parts and "03_games" in cat_ids:
-            return "03_games"
+        kw_hits = tag_hits + path_hits
 
-    # Default: distribute among less-filled categories (caller handles this)
-    # Return Game Action as safest default for sports template
-    if "03_games" in cat_ids:
-        return "03_games"
+        # Exclusions — exact token matching, per-tag
+        tag_excl = sum(1 for tag in tags
+                       if any(kw == tag or kw in tag.split()
+                              for kw in excludes))
+        path_excl = sum(1 for kw in excludes if kw in path_text)
+        excl_hits = tag_excl + path_excl
+        if excl_hits > 0:
+            score -= excl_hits * 20
 
-    # Absolute fallback: first category
-    return categories[0]["id"] if categories else None
+        # Face range — evidence, but weaker without keyword support
+        fr = rule.get("face_range")
+        face_adj = 0
+        if fr:
+            if fr[0] <= face_count <= fr[1]:
+                face_adj = 5 if kw_hits > 0 else 2
+            else:
+                face_adj = -8
+            score += face_adj
+
+        # Orientation, sharpness, priority — only with keyword evidence
+        bonus = 0
+        if kw_hits > 0:
+            orient = rule.get("orientation")
+            if orient == "landscape" and is_landscape:
+                bonus += 3
+            elif orient == "portrait" and not is_landscape and w and h:
+                bonus += 3
+
+            min_s = rule.get("min_sharpness")
+            max_s = rule.get("max_sharpness")
+            if min_s is not None and sharpness >= min_s:
+                bonus += 3
+            if max_s is not None and sharpness <= max_s:
+                bonus += 3
+
+            bonus += rule.get("priority", 0)
+        score += bonus
+
+        # Default fallback — wins over incidental face-range matches
+        if rule.get("is_default"):
+            score += 3
+
+        # Developer inspection: per-category breakdown
+        _debug_scores[cat_id] = {
+            "score": score,
+            "tag_score": tag_score,
+            "tag_hits": _tag_kw_matched,
+            "fam_counts": dict(_fam_counts),
+            "path_hits": _path_kw_matched,
+            "excl": excl_hits,
+            "face_adj": face_adj,
+            "bonus": bonus,
+        }
+
+        if score > best_score:
+            best_score = score
+            best_cat = cat_id
+
+    # Store inspection data on the entry for developer tooling.
+    # Top 3 candidates + winner, sorted by score descending.
+    _ranked = sorted(_debug_scores.items(), key=lambda x: -x[1]["score"])
+    entry["_cat_debug"] = {
+        "winner": best_cat,
+        "winner_score": best_score,
+        "has_tags": has_tags,
+        "tag_weight": TAG_WEIGHT,
+        "path_weight": PATH_WEIGHT,
+        "top_tags": tags[:5],
+        "candidates": {cid: info for cid, info in _ranked[:3]},
+    }
+
+    return best_cat
+
+
+def categorize_sports_heuristic(entry, categories):
+    """Delegates to the rules engine for sports_season."""
+    result = score_category_rules(entry, "sports_season", categories)
+    return result or (categories[0]["id"] if categories else None)
 
 
 def categorize_heuristic(entry, categories, template=None):
     """
-    Generalized heuristic categorization for manual templates and thematic
-    category refinement. Delegates to sports heuristic for sports_season;
-    uses keyword matching, face count, and folder hints for all others.
+    Generalized heuristic categorization using the rules engine.
+    Tries CATEGORY_RULES first (scored matching), falls back to
+    keyword/face heuristics for templates without explicit rules.
     Returns a category ID string.
     """
     template_type = template.get("event_type", "") if template else ""
 
-    # Sports has its own proven heuristic
-    if template_type == "sports_season":
-        return categorize_sports_heuristic(entry, categories)
+    # Try rules engine first (covers all known event types)
+    ruled = score_category_rules(entry, template_type, categories)
+    if ruled:
+        return ruled
 
+    # Fallback for custom/unknown templates: keyword + face heuristics
     face_count = entry.get("face_count", 0)
     grade = entry.get("photo_grade") or {}
     sharpness = grade.get("sharpness", 50)
     path_lower = entry.get("path", "").lower().replace("\\", "/")
     folder_parts = "/".join(path_lower.split("/")[:-1])
+    fname_lower = entry.get("filename", "").lower()
+    tags = entry.get("tags") or []
+    has_tags = len(tags) > 0
+    tags_text = " ".join(tags)
+    path_text = folder_parts + " " + fname_lower
 
-    # Step 1: Keyword matching from category keywords + display name
+    # Step 1: Keyword matching — tags primary, path fallback
+    tag_weight = 10
+    path_weight = 2 if has_tags else 10
     best_score = 0
     best_cat = None
     for cat in categories:
         keywords = list(cat.get("keywords", []))
-        # Add significant words from display name as implicit keywords
         display_words = [w.lower() for w in cat.get("display", "").split()
                          if len(w) > 3 and w.lower() not in ("over", "with", "from", "years", "best")]
         all_kw = keywords + display_words
-        score = sum(1 for kw in all_kw if kw in folder_parts)
+        # Per-tag scoring: exact token matching, each tag at most 1 hit
+        _t_hits = sum(1 for tag in tags
+                      if any(kw == tag or kw in tag.split()
+                             for kw in all_kw))
+        _p_hits = sum(1 for kw in all_kw if kw in path_text)
+        score = _t_hits * tag_weight + _p_hits * path_weight
         if score > best_score:
             best_score = score
             best_cat = cat["id"]
@@ -2534,30 +3284,26 @@ def categorize_heuristic(entry, categories, template=None):
         return best_cat
 
     # Step 2: Face-count heuristics
-    # Portrait/couple (1-2 faces, decent quality)
     if face_count in (1, 2) and sharpness > 40:
         for cat in categories:
             d = cat.get("display", "").lower()
             if "portrait" in d or "couple" in d:
                 return cat["id"]
 
-    # Group/family/team (3+ faces)
     if face_count >= 3:
         for cat in categories:
             d = cat.get("display", "").lower()
             if any(w in d for w in ("family", "group", "team", "colleague", "friend")):
                 return cat["id"]
 
-    # No faces → landscape, action, detail, career categories
     if face_count == 0:
         for cat in categories:
             d = cat.get("display", "").lower()
             if any(w in d for w in ("landscape", "scenery", "detail", "action", "game", "career")):
                 return cat["id"]
 
-    # Step 3: Hash-based even distribution as last resort
-    path_hash = hash(entry.get("path", ""))
-    return categories[abs(path_hash) % len(categories)]["id"]
+    # Step 3: Default category (first one with is_default in template, or first)
+    return categories[0]["id"] if categories else None
 
 
 def refine_thematic_category(entry, thematic_cats):
@@ -2674,10 +3420,13 @@ def hamming_distance(hash1, hash2):
 # Default thresholds
 CLUSTER_DHASH_THRESHOLD = 5        # dHash Hamming distance ≤ 5 = exact duplicate
 CLUSTER_VECTOR_THRESHOLD = 0.92    # Cosine similarity ≥ 0.92 = near-duplicate
+CLUSTER_CLIP_THRESHOLD = 0.93      # CLIP cosine ≥ 0.93 = semantically near-identical
 
 
 def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
                            dhash_threshold=CLUSTER_DHASH_THRESHOLD,
+                           clip_threshold=CLUSTER_CLIP_THRESHOLD,
+                           clip_vectors=None,
                            progress_cb=None):
     """
     Group similar images into clusters. For each cluster, pick the best-quality
@@ -2689,9 +3438,10 @@ def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
       - suppressed_by:    str — hash of the representative (None if not suppressed)
       - cluster_size:     int — total images in this cluster (only on representative)
 
-    Uses union-find over two similarity signals:
+    Uses union-find over up to three similarity signals:
       1. dHash Hamming distance ≤ dhash_threshold (catches burst photos)
-      2. Vector cosine similarity ≥ vector_threshold (catches composition similarity)
+      2. Pixel vector cosine similarity ≥ vector_threshold (catches composition similarity)
+      3. CLIP vector cosine similarity ≥ clip_threshold (catches semantic near-duplicates)
 
     Representative selection: highest photo_grade composite wins.
 
@@ -2801,6 +3551,43 @@ def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
 
             if progress_cb and start > 0:
                 progress_cb(f"Clustering: {start}/{m} vectors compared...")
+
+    # ── CLIP semantic pass: union semantically near-identical images ──
+    if clip_vectors:
+        clip_vecs = []
+        clip_idx_map = {}  # eligible index → clip array index
+        for i, img in enumerate(eligible):
+            h = img.get("hash")
+            if h and h in clip_vectors:
+                cv = clip_vectors[h]
+                if isinstance(cv, list):
+                    cv = np.array(cv, dtype=np.float32)
+                norm = np.linalg.norm(cv)
+                if norm > 0:
+                    clip_idx_map[i] = len(clip_vecs)
+                    clip_vecs.append(cv / norm)
+
+        if len(clip_vecs) >= 2:
+            clip_matrix = np.stack(clip_vecs)
+            mc = len(clip_vecs)
+            clip_to_eligible = {v: k for k, v in clip_idx_map.items()}
+            CLIP_CHUNK = 500
+            for start in range(0, mc, CLIP_CHUNK):
+                end = min(start + CLIP_CHUNK, mc)
+                chunk = clip_matrix[start:end]
+                sims = chunk @ clip_matrix.T
+                for ci in range(end - start):
+                    gi = start + ci
+                    row = sims[ci, gi + 1:]
+                    matches = np.where(row >= clip_threshold)[0]
+                    ei = clip_to_eligible[gi]
+                    for offset in matches:
+                        gj = gi + 1 + offset
+                        ej = clip_to_eligible[gj]
+                        union(ei, ej)
+
+            if progress_cb:
+                progress_cb(f"Clustering: CLIP pass done ({mc} vectors)")
 
     # ── Build cluster groups ──
     groups = {}
