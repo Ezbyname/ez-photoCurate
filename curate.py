@@ -169,7 +169,13 @@ def load_reference_faces(faces_dir):
         cached_entry = cache.get(person)
 
         # Use cache if fingerprint matches (same files, sizes, mtimes)
-        if cached_entry and cached_entry.get("fingerprint") == fingerprint and cached_entry.get("encodings"):
+        # Guard: old cache format stored raw lists, new format is {"fingerprint":..., "encodings":...}
+        if not isinstance(cached_entry, dict):
+            # Old format or corrupt — skip cache, recompute
+            if cached_entry is not None:
+                print(f"  {person}: cache entry is {type(cached_entry).__name__}, recomputing...")
+                cache_dirty = True
+        elif cached_entry.get("fingerprint") == fingerprint and cached_entry.get("encodings"):
             encs = [np.array(e) for e in cached_entry["encodings"]]
             ref[person] = encs
             print(f"  {person}: {len(encs)} encodings (cached)")
@@ -632,6 +638,281 @@ def make_video_thumbnail_b64(filepath, size=120):
     except Exception:
         pass
     return ""
+
+
+def extract_video_frames(filepath, n_frames=5):
+    """
+    Extract evenly-spaced frames from a video as PIL RGB images.
+    Returns list of (frame_pil, timestamp_sec) tuples.
+    Tries OpenCV (works on all platforms without ffmpeg).
+    """
+    frames = []
+    try:
+        import cv2
+        cap = cv2.VideoCapture(filepath)
+        if not cap.isOpened():
+            return frames
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total_frames < 1:
+            cap.release()
+            return frames
+
+        # Pick frame positions: skip first/last 5%, sample evenly in between
+        start = max(1, int(total_frames * 0.05))
+        end = max(start + 1, int(total_frames * 0.95))
+        step = max(1, (end - start) // n_frames)
+        positions = list(range(start, end, step))[:n_frames]
+
+        for pos in positions:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                # Convert BGR (OpenCV) → RGB (PIL)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb)
+                timestamp = round(pos / fps, 2) if fps > 0 else 0
+                frames.append((pil_img, timestamp))
+        cap.release()
+    except Exception:
+        pass
+    return frames
+
+
+def analyze_video_frames(filepath, ref_encodings=None, face_names=None,
+                         tolerance=0.6, face_match_mode="any", n_frames=5):
+    """
+    Analyze a video by extracting key frames and running image analysis on them.
+
+    Returns dict with:
+        face_count, faces_found, has_target_face, face_distance,
+        photo_grade, image_vector, dhash, best_thumb (base64)
+    Returns None on failure.
+    """
+    frames = extract_video_frames(filepath, n_frames=n_frames)
+    if not frames:
+        return None
+
+    fr = None
+    best_face_count = 0
+    all_found_persons = set()
+    best_face_distance = None
+    best_grade_frame = None
+    best_grade_composite = -1
+    best_sharpness_frame = None
+    best_sharpness = -1
+
+    # ── Analyze each frame ──
+    for pil_img, ts in frames:
+        w, h = pil_img.size
+
+        # Face detection (if reference encodings provided)
+        if ref_encodings:
+            if fr is None:
+                fr = _get_fr()
+            try:
+                # Resize for speed (face_recognition works fine at 800px)
+                detect_img = pil_img.copy()
+                max_dim = 800
+                if w > max_dim or h > max_dim:
+                    detect_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                arr = np.array(detect_img)
+                locations = fr.face_locations(arr, model="hog")
+                if locations:
+                    fc = len(locations)
+                    if fc > best_face_count:
+                        best_face_count = fc
+                    encodings = fr.face_encodings(arr, locations)
+                    if encodings:
+                        for person, ref_encs in ref_encodings.items():
+                            for ref_enc in ref_encs:
+                                dists = fr.face_distance(encodings, ref_enc)
+                                min_d = float(np.min(dists))
+                                if best_face_distance is None or min_d < best_face_distance:
+                                    best_face_distance = min_d
+                                if min_d <= tolerance:
+                                    all_found_persons.add(person)
+            except Exception:
+                pass
+
+        # Sharpness check (pick sharpest frame for vector/grade)
+        try:
+            import cv2 as _cv2
+            gray = np.array(pil_img.convert("L"))
+            sharpness = _cv2.Laplacian(gray, _cv2.CV_64F).var()
+            if sharpness > best_sharpness:
+                best_sharpness = sharpness
+                best_sharpness_frame = pil_img
+        except Exception:
+            if best_sharpness_frame is None:
+                best_sharpness_frame = pil_img
+
+    # Use the sharpest frame for quality grading, vector, and dHash
+    if best_sharpness_frame is None:
+        best_sharpness_frame = frames[0][0]
+
+    result = {
+        "face_count": best_face_count,
+        "faces_found": sorted(all_found_persons),
+        "has_target_face": False,
+        "face_distance": round(best_face_distance, 3) if best_face_distance is not None and best_face_distance < 999 else None,
+        "photo_grade": None,
+        "image_vector": None,
+        "dhash": None,
+        "best_thumb": None,
+        "_analyzed_frames": len(frames),
+    }
+
+    # Determine has_target_face
+    if face_names and all_found_persons:
+        if face_match_mode == "all":
+            result["has_target_face"] = all(n in all_found_persons for n in face_names)
+        else:
+            result["has_target_face"] = any(n in all_found_persons for n in face_names)
+
+    # ── Quality grading from best frame ──
+    try:
+        import cv2 as _cv2
+        w, h = best_sharpness_frame.size
+        megapixels = (w * h) / 1_000_000
+
+        # Resolution score
+        if megapixels >= 20:
+            resolution = 100
+        elif megapixels >= 12:
+            resolution = 90
+        elif megapixels >= 5:
+            resolution = 70
+        elif megapixels >= 2:
+            resolution = 50
+        else:
+            resolution = max(20, megapixels / 0.5 * 20)
+
+        # Sharpness
+        gray = np.array(best_sharpness_frame.convert("L"))
+        sharpness_var = _cv2.Laplacian(gray, _cv2.CV_64F).var()
+        sharpness_score = min(100, sharpness_var / 8.0)
+
+        # Noise
+        blur_k = _cv2.GaussianBlur(gray, (5, 5), 0)
+        high_pass = gray.astype(float) - blur_k.astype(float)
+        noise_std = np.std(high_pass)
+        noise_score = max(0, min(100, 100 - noise_std * 5))
+
+        # Compression (estimate from frame data size)
+        file_size_kb = os.path.getsize(filepath) / 1024
+        # For video, estimate per-frame size from total file / estimated frames
+        try:
+            _, _, dur = get_video_info(filepath)
+            fps_est = 30
+            est_frames = max(1, dur * fps_est)
+            kb_per_frame = file_size_kb / est_frames
+            kb_per_mp = kb_per_frame / max(megapixels, 0.1)
+        except Exception:
+            kb_per_mp = 500  # reasonable default
+        compression_score = min(100, kb_per_mp / 15)
+
+        # Color
+        rgb_arr = np.array(best_sharpness_frame.convert("RGB"))
+        hsv = _cv2.cvtColor(rgb_arr, _cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1].mean()
+        sat_score = min(100, sat / 1.5)
+        brightness = hsv[:, :, 2].astype(float)
+        p5, p95 = np.percentile(brightness, [5, 95])
+        range_score = min(100, (p95 - p5) / 2.0)
+        color_score = sat_score * 0.4 + range_score * 0.6
+
+        # Exposure
+        mean_bright = brightness.mean()
+        std_bright = brightness.std()
+        exposure_score = 80
+        if mean_bright < 60 or mean_bright > 210:
+            exposure_score -= 30
+        elif mean_bright < 80 or mean_bright > 180:
+            exposure_score -= 10
+        if std_bright < 20:
+            exposure_score -= 15
+        elif std_bright > 90:
+            exposure_score -= 10
+        exposure_score = max(0, min(100, exposure_score))
+
+        # Focus (center vs edges)
+        ch, cw = gray.shape
+        center = gray[ch // 4: 3 * ch // 4, cw // 4: 3 * cw // 4]
+        focus_score = min(100, _cv2.Laplacian(center, _cv2.CV_64F).var() / 8.0)
+
+        # Composite
+        composite = (
+            resolution * 0.10 + sharpness_score * 0.20 + noise_score * 0.10 +
+            compression_score * 0.05 + color_score * 0.10 + exposure_score * 0.15 +
+            focus_score * 0.20 + 80 * 0.10  # distortion fixed at 80 for video frames
+        )
+
+        result["photo_grade"] = {
+            "resolution": round(resolution, 1),
+            "sharpness": round(sharpness_score, 1),
+            "noise": round(noise_score, 1),
+            "compression": round(compression_score, 1),
+            "color": round(color_score, 1),
+            "exposure": round(exposure_score, 1),
+            "focus": round(focus_score, 1),
+            "distortion": 80.0,  # N/A for video frames
+            "composite": round(composite, 1),
+            "blur_score": round(sharpness_var, 1),
+        }
+    except Exception:
+        pass
+
+    # ── Image vector from best frame ──
+    try:
+        size = 32
+        gray = best_sharpness_frame.convert("L").resize((size, size), Image.LANCZOS)
+        gray_vec = np.array(gray, dtype=np.float32).flatten()
+        rgb = best_sharpness_frame.convert("RGB")
+        r, g, b = rgb.split()
+        hist_r = np.array(r.histogram()[:256], dtype=np.float32)
+        hist_g = np.array(g.histogram()[:256], dtype=np.float32)
+        hist_b = np.array(b.histogram()[:256], dtype=np.float32)
+        hist_r = np.add.reduceat(hist_r, range(0, 256, 32))
+        hist_g = np.add.reduceat(hist_g, range(0, 256, 32))
+        hist_b = np.add.reduceat(hist_b, range(0, 256, 32))
+        vec = np.concatenate([gray_vec, hist_r, hist_g, hist_b])
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec /= norm
+        result["image_vector"] = vec
+    except Exception:
+        pass
+
+    # ── dHash from best frame ──
+    try:
+        hash_size = 8
+        dh_img = best_sharpness_frame.convert("L").resize(
+            (hash_size + 1, hash_size), Image.LANCZOS
+        )
+        pixels = list(dh_img.getdata())
+        bits = []
+        for row in range(hash_size):
+            row_start = row * (hash_size + 1)
+            for col in range(hash_size):
+                bits.append(1 if pixels[row_start + col] > pixels[row_start + col + 1] else 0)
+        result["dhash"] = int("".join(str(b) for b in bits), 2)
+    except Exception:
+        pass
+
+    # ── Best thumbnail (sharpest frame) ──
+    try:
+        thumb = best_sharpness_frame.copy()
+        thumb.thumbnail((120, 120), Image.LANCZOS)
+        if thumb.mode in ("RGBA", "P"):
+            thumb = thumb.convert("RGB")
+        buf = BytesIO()
+        thumb.save(buf, format="JPEG", quality=55)
+        result["best_thumb"] = base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        pass
+
+    return result
 
 
 def make_thumbnail_b64(filepath, size=120):
@@ -1587,17 +1868,17 @@ function render() {{
 
 function selectAllIn(cat) {{
     IMAGES.forEach(img => {{
-        const isCat = (img.st === 'qualified' && img.cat === cat);
-        const isPool = (cat === '_pool' && (img.st !== 'qualified' || !img.cat));
-        if ((isCat || isPool) && matchesFilter(img)) selected.add(img.id);
+        const inCat = ((img.st === 'qualified' || img.st === 'selected') && img.cat === cat);
+        const inPool = (cat === '_pool' && img.st !== 'qualified' && img.st !== 'selected' && img.st !== 'rejected');
+        if ((inCat || inPool) && matchesFilter(img)) selected.add(img.id);
     }});
     render();
 }}
 function deselectAllIn(cat) {{
     IMAGES.forEach(img => {{
-        const isCat = (img.st === 'qualified' && img.cat === cat);
-        const isPool = (cat === '_pool' && (img.st !== 'qualified' || !img.cat));
-        if (isCat || isPool) selected.delete(img.id);
+        const inCat = ((img.st === 'qualified' || img.st === 'selected') && img.cat === cat);
+        const inPool = (cat === '_pool' && img.st !== 'qualified' && img.st !== 'selected' && img.st !== 'rejected');
+        if (inCat || inPool) selected.delete(img.id);
     }});
     render();
 }}
@@ -2006,11 +2287,45 @@ def load_template(event_type):
         return json.load(f)
 
 
-def categorize_by_template(template, config, img_date):
+def _match_by_keywords(categories, fpath):
+    """
+    Try to match file path against category keywords.
+    Returns category ID if a keyword matches, None otherwise.
+    """
+    if not fpath or not categories:
+        return None
+    path_lower = fpath.lower().replace("\\", "/")
+    best_score = 0
+    best_cat = None
+    for cat in categories:
+        keywords = cat.get("keywords", [])
+        if keywords:
+            score = sum(1 for kw in keywords if kw.lower() in path_lower)
+            if score > best_score:
+                best_score = score
+                best_cat = cat["id"]
+    return best_cat
+
+
+def _match_thematic_category(thematic_cats, fpath=None):
+    """
+    Among thematic/catch-all categories, pick the best match using keyword
+    matching on file path. Falls back to first category if no keywords match.
+    """
+    if not thematic_cats:
+        return None
+    kw_match = _match_by_keywords(thematic_cats, fpath)
+    if kw_match:
+        return kw_match
+    return thematic_cats[0]["id"]
+
+
+def categorize_by_template(template, config, img_date, fpath=None):
     """
     Given a template and an image date, return the best matching category ID.
     Supports: age_brackets, date_time_ranges, date_ranges.
     Returns None if no category matches.
+    fpath is optional — used for keyword matching against thematic categories.
     """
     cat_type = template["categorization"]
     categories = template["categories"]
@@ -2037,12 +2352,13 @@ def categorize_by_template(template, config, img_date):
         img_day = img_date.date()
         img_time = img_date.time()
 
-        best = None
-        for cat in categories:
+        # Separate time-based and thematic categories
+        time_cats = [c for c in categories if c.get("day_offset", 0) != -1]
+        thematic_cats = [c for c in categories if c.get("day_offset", 0) == -1]
+
+        # Try time-based match first
+        for cat in time_cats:
             day_offset = cat.get("day_offset", 0)
-            # day_offset -1 means "any day" (thematic category)
-            if day_offset == -1:
-                continue  # skip thematic for now, only match time-based
             target_day = event_date + timedelta(days=day_offset)
             if img_day != target_day:
                 continue
@@ -2051,13 +2367,16 @@ def categorize_by_template(template, config, img_date):
             if time_to < time_from:
                 # wraps midnight
                 if img_time >= time_from or img_time <= time_to:
-                    best = cat["id"]
-                    break
+                    return cat["id"]
             else:
                 if time_from <= img_time <= time_to:
-                    best = cat["id"]
-                    break
-        return best
+                    return cat["id"]
+
+        # No time match — fall back to thematic categories
+        if thematic_cats:
+            return _match_thematic_category(thematic_cats, fpath)
+
+        return None
 
     elif cat_type == "date_ranges":
         if not img_date:
@@ -2068,15 +2387,475 @@ def categorize_by_template(template, config, img_date):
             if img_date.year != year:
                 return None
         img_month = img_date.month
+
+        # Separate: keyword categories (full-year + keywords), specific ranges, catch-all
+        specific_cats = []
+        keyword_cats = []
+        catchall_cats = []
         for cat in categories:
             m_from = cat.get("month_from")
             m_to = cat.get("month_to")
-            if m_from is not None and m_to is not None:
-                if m_from <= img_month <= m_to:
-                    return cat["id"]
+            if m_from is None or m_to is None:
+                continue
+            is_full_year = (m_from == 1 and m_to == 12)
+            if is_full_year and cat.get("keywords"):
+                keyword_cats.append(cat)
+            elif is_full_year:
+                catchall_cats.append(cat)
+            else:
+                specific_cats.append(cat)
+
+        # 1. Try keyword match first (e.g., folder "family vacation" → Travel)
+        if keyword_cats:
+            kw_match = _match_by_keywords(keyword_cats, fpath)
+            if kw_match:
+                return kw_match
+
+        # 2. Match by specific month range
+        for cat in specific_cats:
+            if cat["month_from"] <= img_month <= cat["month_to"]:
+                return cat["id"]
+
+        # 3. Catch-all (full-year without keywords) as last resort
+        if catchall_cats:
+            return catchall_cats[0]["id"]
+
         return None
 
     return None
+
+
+def categorize_sports_heuristic(entry, categories):
+    """
+    Heuristic categorization for sports_season (manual) templates.
+    Uses face count, sharpness, folder path, image dimensions to guess category.
+    Returns a category ID string.
+    """
+    face_count = entry.get("face_count", 0)
+    grade = entry.get("photo_grade") or {}
+    sharpness = grade.get("sharpness", 50)
+    focus = grade.get("focus", 50)
+    path_lower = entry.get("path", "").lower().replace("\\", "/")
+    w = entry.get("width", 0)
+    h = entry.get("height", 0)
+
+    # Build a set of available category IDs for flexible matching
+    cat_ids = {c["id"] for c in categories}
+
+    # Folder-name hints
+    folder_hints_action = ("game", "match", "play", "action", "basket", "sport")
+    folder_hints_practice = ("practice", "training", "warmup", "drill")
+    folder_hints_award = ("award", "trophy", "medal", "ceremony")
+    folder_hints_fun = ("fun", "party", "off", "trip", "outing")
+
+    # Check folder name for strong hints
+    parts = path_lower.split("/")
+    folder_parts = " ".join(parts[:-1])  # everything except filename
+
+    for hint in folder_hints_award:
+        if hint in folder_parts and "06_awards" in cat_ids:
+            return "06_awards"
+    for hint in folder_hints_practice:
+        if hint in folder_parts and "02_practice" in cat_ids:
+            return "02_practice"
+    for hint in folder_hints_fun:
+        if hint in folder_parts and "07_off_field" in cat_ids:
+            return "07_off_field"
+
+    # Face-count based heuristics
+    # Group shots (4+ faces) → Team Photos
+    if face_count >= 4 and "01_team" in cat_ids:
+        return "01_team"
+
+    # Single face, high sharpness + focus → Player Portraits
+    if face_count == 1 and sharpness > 50 and focus > 50 and "05_portraits" in cat_ids:
+        return "05_portraits"
+
+    # Low sharpness / focus → likely action / motion blur → Game Action
+    if sharpness < 35 and "03_games" in cat_ids:
+        return "03_games"
+
+    # 2-3 faces, decent quality → Celebrations or Team
+    if face_count in (2, 3):
+        if "04_celebrations" in cat_ids:
+            return "04_celebrations"
+
+    # No faces detected → likely wide-angle action shot
+    if face_count == 0 and "03_games" in cat_ids:
+        return "03_games"
+
+    # Folder contains sport-related keywords → Game Action
+    for hint in folder_hints_action:
+        if hint in folder_parts and "03_games" in cat_ids:
+            return "03_games"
+
+    # Default: distribute among less-filled categories (caller handles this)
+    # Return Game Action as safest default for sports template
+    if "03_games" in cat_ids:
+        return "03_games"
+
+    # Absolute fallback: first category
+    return categories[0]["id"] if categories else None
+
+
+def categorize_heuristic(entry, categories, template=None):
+    """
+    Generalized heuristic categorization for manual templates and thematic
+    category refinement. Delegates to sports heuristic for sports_season;
+    uses keyword matching, face count, and folder hints for all others.
+    Returns a category ID string.
+    """
+    template_type = template.get("event_type", "") if template else ""
+
+    # Sports has its own proven heuristic
+    if template_type == "sports_season":
+        return categorize_sports_heuristic(entry, categories)
+
+    face_count = entry.get("face_count", 0)
+    grade = entry.get("photo_grade") or {}
+    sharpness = grade.get("sharpness", 50)
+    path_lower = entry.get("path", "").lower().replace("\\", "/")
+    folder_parts = "/".join(path_lower.split("/")[:-1])
+
+    # Step 1: Keyword matching from category keywords + display name
+    best_score = 0
+    best_cat = None
+    for cat in categories:
+        keywords = list(cat.get("keywords", []))
+        # Add significant words from display name as implicit keywords
+        display_words = [w.lower() for w in cat.get("display", "").split()
+                         if len(w) > 3 and w.lower() not in ("over", "with", "from", "years", "best")]
+        all_kw = keywords + display_words
+        score = sum(1 for kw in all_kw if kw in folder_parts)
+        if score > best_score:
+            best_score = score
+            best_cat = cat["id"]
+    if best_cat:
+        return best_cat
+
+    # Step 2: Face-count heuristics
+    # Portrait/couple (1-2 faces, decent quality)
+    if face_count in (1, 2) and sharpness > 40:
+        for cat in categories:
+            d = cat.get("display", "").lower()
+            if "portrait" in d or "couple" in d:
+                return cat["id"]
+
+    # Group/family/team (3+ faces)
+    if face_count >= 3:
+        for cat in categories:
+            d = cat.get("display", "").lower()
+            if any(w in d for w in ("family", "group", "team", "colleague", "friend")):
+                return cat["id"]
+
+    # No faces → landscape, action, detail, career categories
+    if face_count == 0:
+        for cat in categories:
+            d = cat.get("display", "").lower()
+            if any(w in d for w in ("landscape", "scenery", "detail", "action", "game", "career")):
+                return cat["id"]
+
+    # Step 3: Hash-based even distribution as last resort
+    path_hash = hash(entry.get("path", ""))
+    return categories[abs(path_hash) % len(categories)]["id"]
+
+
+def refine_thematic_category(entry, thematic_cats):
+    """
+    Post-Pass-2 refinement of thematic category assignments using face count.
+    Returns a new category ID if a better match is found, None otherwise.
+    """
+    if len(thematic_cats) <= 1:
+        return None
+
+    face_count = entry.get("face_count", 0)
+    path_lower = entry.get("path", "").lower().replace("\\", "/")
+
+    # Try keyword matching first (now that we have full entry context)
+    kw_match = _match_by_keywords(thematic_cats, path_lower)
+    if kw_match:
+        return kw_match
+
+    # Face-count heuristics
+    if face_count in (1, 2):
+        for cat in thematic_cats:
+            d = cat.get("display", "").lower()
+            if "portrait" in d or "couple" in d:
+                return cat["id"]
+
+    if face_count >= 3:
+        for cat in thematic_cats:
+            d = cat.get("display", "").lower()
+            if "family" in d or "group" in d or "colleague" in d:
+                return cat["id"]
+
+    if face_count == 0:
+        for cat in thematic_cats:
+            d = cat.get("display", "").lower()
+            if any(w in d for w in ("landscape", "scenery", "detail", "career", "milestone")):
+                return cat["id"]
+
+    return None
+
+
+def compute_image_vector(fpath, size=32):
+    """
+    Compute a compact perceptual vector for visual similarity comparison.
+    Returns a 1D numpy array (grayscale thumbnail flattened + color histogram).
+    """
+    import numpy as np
+    try:
+        from PIL import Image
+        pil = Image.open(fpath)
+        # Grayscale thumbnail
+        gray = pil.convert("L").resize((size, size), Image.LANCZOS)
+        gray_vec = np.array(gray, dtype=np.float32).flatten()
+        # RGB color histogram (8 bins per channel)
+        rgb = pil.convert("RGB")
+        r, g, b = rgb.split()
+        hist_r = np.array(r.histogram()[:256], dtype=np.float32)
+        hist_g = np.array(g.histogram()[:256], dtype=np.float32)
+        hist_b = np.array(b.histogram()[:256], dtype=np.float32)
+        # Downsample histograms to 8 bins each
+        hist_r = np.add.reduceat(hist_r, range(0, 256, 32))
+        hist_g = np.add.reduceat(hist_g, range(0, 256, 32))
+        hist_b = np.add.reduceat(hist_b, range(0, 256, 32))
+        vec = np.concatenate([gray_vec, hist_r, hist_g, hist_b])
+        # Unit normalize
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec /= norm
+        pil.close()
+        return vec
+    except Exception:
+        return None
+
+
+def cosine_similarity(v1, v2):
+    """Cosine similarity between two unit-normalized vectors."""
+    import numpy as np
+    return float(np.dot(v1, v2))
+
+
+def compute_dhash(fpath, hash_size=8):
+    """
+    Compute difference hash (dHash) for near-duplicate detection.
+    Compares relative brightness between horizontally adjacent pixels.
+    Returns an integer hash (hash_size^2 bits, default 64-bit).
+    Much more robust than pixel comparison for burst photos, slight crops,
+    and minor angle/zoom differences.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(fpath).convert("L").resize(
+            (hash_size + 1, hash_size), Image.LANCZOS
+        )
+        pixels = list(img.getdata())
+        bits = []
+        for row in range(hash_size):
+            row_start = row * (hash_size + 1)
+            for col in range(hash_size):
+                bits.append(1 if pixels[row_start + col] > pixels[row_start + col + 1] else 0)
+        img.close()
+        return int("".join(str(b) for b in bits), 2)
+    except Exception:
+        return None
+
+
+def hamming_distance(hash1, hash2):
+    """Hamming distance between two integer hashes (number of differing bits)."""
+    return bin(hash1 ^ hash2).count("1")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIMILARITY CLUSTERING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Default thresholds
+CLUSTER_DHASH_THRESHOLD = 5        # dHash Hamming distance ≤ 5 = exact duplicate
+CLUSTER_VECTOR_THRESHOLD = 0.92    # Cosine similarity ≥ 0.92 = near-duplicate
+
+
+def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
+                           dhash_threshold=CLUSTER_DHASH_THRESHOLD,
+                           progress_cb=None):
+    """
+    Group similar images into clusters. For each cluster, pick the best-quality
+    representative and mark the rest as suppressed.
+
+    Modifies images in-place, adding:
+      - cluster_id:       str — shared ID for all images in a cluster (None if unclustered)
+      - is_representative: bool — True for the best image in the cluster
+      - suppressed_by:    str — hash of the representative (None if not suppressed)
+      - cluster_size:     int — total images in this cluster (only on representative)
+
+    Uses union-find over two similarity signals:
+      1. dHash Hamming distance ≤ dhash_threshold (catches burst photos)
+      2. Vector cosine similarity ≥ vector_threshold (catches composition similarity)
+
+    Representative selection: highest photo_grade composite wins.
+
+    Returns: dict with diagnostics {clusters, suppressed, largest_cluster, elapsed}
+    """
+    import numpy as np
+    import time as _time
+
+    t0 = _time.monotonic()
+
+    # ── Collect eligible images (non-rejected, with at least one signal) ──
+    eligible = []
+    for img in images:
+        if img.get("status") == "rejected":
+            continue
+        has_vector = img.get("image_vector") is not None
+        has_dhash = img.get("dhash") is not None
+        if has_vector or has_dhash:
+            eligible.append(img)
+
+    n = len(eligible)
+    if n < 2:
+        # Nothing to cluster
+        for img in images:
+            img.pop("cluster_id", None)
+            img.pop("is_representative", None)
+            img.pop("suppressed_by", None)
+            img.pop("cluster_size", None)
+        return {"clusters": 0, "suppressed": 0, "largest_cluster": 0, "elapsed": 0}
+
+    if progress_cb:
+        progress_cb(f"Clustering {n} images...")
+
+    # ── Union-Find ──
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        if rank[ra] == rank[rb]:
+            rank[ra] += 1
+
+    # ── Build vectors matrix for batch cosine similarity ──
+    vectors = []
+    vec_idx_map = {}  # maps eligible index → vectors array index
+    for i, img in enumerate(eligible):
+        v = img.get("image_vector")
+        if v is not None:
+            vec_idx_map[i] = len(vectors)
+            if isinstance(v, list):
+                vectors.append(np.array(v, dtype=np.float32))
+            else:
+                vectors.append(v.astype(np.float32))
+
+    # ── dHash pass: union exact/near duplicates ──
+    dhashes = []
+    dhash_idx_map = {}
+    for i, img in enumerate(eligible):
+        dh = img.get("dhash")
+        if dh is not None:
+            dhash_idx_map[i] = len(dhashes)
+            dhashes.append(dh)
+
+    if dhashes:
+        nd = len(dhashes)
+        # Reverse map: dhash array index → eligible index
+        dhash_to_eligible = {v: k for k, v in dhash_idx_map.items()}
+        for i in range(nd):
+            for j in range(i + 1, nd):
+                dist = bin(dhashes[i] ^ dhashes[j]).count("1")
+                if dist <= dhash_threshold:
+                    union(dhash_to_eligible[i], dhash_to_eligible[j])
+
+    # ── Vector pass: union visually similar images ──
+    if vectors:
+        vec_matrix = np.stack(vectors)  # shape (m, dim)
+        # Batch cosine similarity via matrix multiply (vectors are unit-normalized)
+        # Process in chunks to limit memory for very large sets
+        m = len(vectors)
+        vec_to_eligible = {v: k for k, v in vec_idx_map.items()}
+        CHUNK = 500
+        for start in range(0, m, CHUNK):
+            end = min(start + CHUNK, m)
+            chunk = vec_matrix[start:end]  # (chunk_size, dim)
+            sims = chunk @ vec_matrix.T     # (chunk_size, m)
+            for ci in range(end - start):
+                gi = start + ci
+                # Only check upper triangle (j > gi) to avoid double-counting
+                row = sims[ci, gi + 1:]
+                matches = np.where(row >= vector_threshold)[0]
+                ei = vec_to_eligible[gi]
+                for offset in matches:
+                    gj = gi + 1 + offset
+                    ej = vec_to_eligible[gj]
+                    union(ei, ej)
+
+            if progress_cb and start > 0:
+                progress_cb(f"Clustering: {start}/{m} vectors compared...")
+
+    # ── Build cluster groups ──
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+
+    # Only keep groups with 2+ members (actual clusters)
+    clusters = {k: v for k, v in groups.items() if len(v) > 1}
+
+    # ── Clear old cluster fields from ALL images ──
+    for img in images:
+        img.pop("cluster_id", None)
+        img.pop("is_representative", None)
+        img.pop("suppressed_by", None)
+        img.pop("cluster_size", None)
+
+    # ── Assign cluster fields ──
+    total_suppressed = 0
+    largest = 0
+
+    for cluster_idx, (_, members) in enumerate(clusters.items()):
+        cluster_imgs = [eligible[i] for i in members]
+
+        # Representative: highest photo_grade composite, tie-break by size_kb
+        def _quality_key(img):
+            grade = img.get("photo_grade")
+            composite = grade.get("composite", 0) if isinstance(grade, dict) else 0
+            return (composite, img.get("size_kb", 0))
+
+        cluster_imgs.sort(key=_quality_key, reverse=True)
+        representative = cluster_imgs[0]
+        rep_hash = representative.get("hash", f"cluster_{cluster_idx}")
+        cid = f"c_{rep_hash[:12]}"
+
+        representative["cluster_id"] = cid
+        representative["is_representative"] = True
+        representative["cluster_size"] = len(cluster_imgs)
+
+        for img in cluster_imgs[1:]:
+            img["cluster_id"] = cid
+            img["is_representative"] = False
+            img["suppressed_by"] = rep_hash
+
+        total_suppressed += len(cluster_imgs) - 1
+        largest = max(largest, len(cluster_imgs))
+
+    elapsed = round(_time.monotonic() - t0, 2)
+
+    return {
+        "clusters": len(clusters),
+        "suppressed": total_suppressed,
+        "largest_cluster": largest,
+        "elapsed": elapsed,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

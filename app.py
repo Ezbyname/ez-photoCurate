@@ -18,6 +18,19 @@ from collections import defaultdict
 
 import base64
 import shutil
+import numpy as np
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """Handle numpy types when serializing to JSON."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 from flask import Flask, request, jsonify, send_file, session, redirect
 
@@ -225,8 +238,10 @@ def load_scan_db():
 
 def save_scan_db(db):
     with _db_lock:
-        with open(SCAN_DB_PATH, "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False)
+        tmp_path = SCAN_DB_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, cls=NumpyEncoder)
+        os.replace(tmp_path, SCAN_DB_PATH)
 
 
 def _check_nsfw(fpath, classifier):
@@ -503,6 +518,8 @@ def api_scan_start():
                 age_days_to_bracket, IMAGE_EXTS, VIDEO_EXTS, MEDIA_EXTS, REEF_BIRTHDAY,
                 get_video_date, get_video_info, make_video_thumbnail_b64,
                 get_exif_gps, reverse_geocode_batch, infer_location_from_path,
+                compute_image_vector, compute_dhash, cluster_similar_images,
+                analyze_video_frames,
             )
             from PIL import Image as PILImage
 
@@ -804,10 +821,21 @@ def api_scan_start():
                     if not is_video and w < min_dim and h < min_dim:
                         return None, "low_res", fhash
 
-                    # Photo quality grading (images only)
+                    # Photo quality grading
                     photo_grade = None
                     blur_score = None
-                    if not is_video:
+                    video_analysis = None
+                    if is_video:
+                        # Analyze video frames for quality, vector, dHash
+                        video_analysis = analyze_video_frames(
+                            fpath, ref_encodings=None, face_names=None,
+                            n_frames=5,
+                        )
+                        if video_analysis:
+                            photo_grade = video_analysis.get("photo_grade")
+                            if photo_grade:
+                                blur_score = photo_grade.get("blur_score")
+                    else:
                         photo_grade = _compute_photo_grade(fpath, w, h)
                         if photo_grade:
                             blur_score = photo_grade.get("blur_score")
@@ -821,7 +849,7 @@ def api_scan_start():
                     bracket = None
                     if img_date:
                         if use_template:
-                            bracket = categorize_by_template(template, config, img_date)
+                            bracket = categorize_by_template(template, config, img_date, fpath=fpath)
                             bday_str = config.get("subject_birthday")
                             if bday_str:
                                 from datetime import datetime as dt
@@ -841,10 +869,28 @@ def api_scan_start():
                         gps_coords = get_exif_gps(fpath)
 
                     if is_video:
-                        thumb = make_video_thumbnail_b64(fpath, thumb_size)
+                        # Prefer sharpest-frame thumbnail from analysis
+                        thumb = (video_analysis or {}).get("best_thumb") or make_video_thumbnail_b64(fpath, thumb_size)
                     else:
                         thumb = make_thumbnail_b64(fpath, thumb_size)
                     device = guess_device_source(fname)
+
+                    # Compute perceptual vector + dHash for similarity clustering
+                    image_vector = None
+                    dhash_val = None
+                    if is_video and video_analysis:
+                        # Use pre-computed values from video frame analysis
+                        image_vector = video_analysis.get("image_vector")
+                        dhash_val = video_analysis.get("dhash")
+                    elif not is_video:
+                        try:
+                            image_vector = compute_image_vector(fpath)
+                        except Exception:
+                            pass
+                        try:
+                            dhash_val = compute_dhash(fpath)
+                        except Exception:
+                            pass
 
                     entry = {
                         "hash": fhash,
@@ -870,12 +916,26 @@ def api_scan_start():
                         "location": None,  # resolved in batch after Pass 1
                         "blur_score": blur_score,
                         "photo_grade": photo_grade,
+                        "image_vector": image_vector,
+                        "dhash": dhash_val,
                     }
 
-                    # For manual categorization
+                    # For manual categorization: assign temporary category (will be refined after Pass 2)
                     if not bracket and config.get("categorization") == "manual" and config.get("categories"):
                         bracket = config["categories"][0]["id"]
                         entry["category"] = bracket
+                        entry["_needs_recategorize"] = True
+
+                    # Mark thematic fallback assignments for refinement after Pass 2
+                    if bracket and use_template and template and config.get("categorization") in ("date_time_ranges", "date_ranges"):
+                        for _tc in template.get("categories", []):
+                            if _tc["id"] == bracket and _tc.get("day_offset") == -1:
+                                entry["_needs_recategorize"] = True
+                                break
+                            # Full-year catch-all in date_ranges
+                            if _tc["id"] == bracket and _tc.get("month_from") == 1 and _tc.get("month_to") == 12:
+                                entry["_needs_recategorize"] = True
+                                break
 
                     # Preliminary status (will be updated after face detection in Pass 2)
                     blur_threshold = config.get("blur_threshold", 50)
@@ -1089,8 +1149,7 @@ def api_scan_start():
             # === PASS 2: Face detection (single-threaded, selective) ===
             if use_faces:
                 need_face = [e for e in all_images
-                             if e.get("media_type") != "video"
-                             and not e.get("_face_checked")
+                             if not e.get("_face_checked")
                              and e.get("status") != "rejected"
                              and not _should_skip_face_detect(e)]
 
@@ -1098,7 +1157,7 @@ def api_scan_start():
                 for e in all_images:
                     if e in need_face:
                         continue
-                    if e.get("media_type") == "video" or e.get("status") == "rejected":
+                    if e.get("status") == "rejected":
                         continue
                     needs_face_check = not e.get("_face_checked")
                     needs_distance_backfill = (e.get("has_target_face")
@@ -1125,12 +1184,34 @@ def api_scan_start():
                     t0 = _time.monotonic()
                     fpath = entry["path"].replace("/", os.sep)
                     try:
-                        fc, ff, ok, best_d = _fast_face_detect(fpath, ref_encodings, face_names, tolerance)
-                        entry["face_count"] = fc
-                        entry["faces_found"] = ff
-                        entry["has_target_face"] = (all(n in ff for n in face_names) if face_match_mode == "all" else any(n in ff for n in face_names)) if face_names else (fc > 0)
-                        if best_d is not None:
-                            entry["face_distance"] = best_d
+                        is_vid = entry.get("media_type") == "video"
+                        if is_vid:
+                            # Video: analyze frames for face detection
+                            va = analyze_video_frames(
+                                fpath, ref_encodings=ref_encodings,
+                                face_names=face_names, tolerance=tolerance,
+                                face_match_mode=face_match_mode, n_frames=5,
+                            )
+                            if va:
+                                fc = va["face_count"]
+                                ff = va["faces_found"]
+                                best_d = va["face_distance"]
+                                entry["face_count"] = fc
+                                entry["faces_found"] = ff
+                                entry["has_target_face"] = va["has_target_face"]
+                                if best_d is not None:
+                                    entry["face_distance"] = best_d
+                            else:
+                                fc, ff = 0, []
+                                entry["face_count"] = 0
+                                entry["has_target_face"] = False
+                        else:
+                            fc, ff, ok, best_d = _fast_face_detect(fpath, ref_encodings, face_names, tolerance)
+                            entry["face_count"] = fc
+                            entry["faces_found"] = ff
+                            entry["has_target_face"] = (all(n in ff for n in face_names) if face_match_mode == "all" else any(n in ff for n in face_names)) if face_names else (fc > 0)
+                            if best_d is not None:
+                                entry["face_distance"] = best_d
                         entry["_face_checked"] = True
 
                         # Update status based on face results
@@ -1200,12 +1281,75 @@ def api_scan_start():
                 if age_count:
                     _update_task(f"Age estimation: {age_count} images processed")
 
+            # Re-categorize images that need refinement (manual templates + thematic fallbacks)
+            # Now we have face_count from Pass 2, so heuristics can use it
+            if config.get("categories"):
+                cats_list = config["categories"]
+                cat_type = config.get("categorization", "")
+                recat_count = 0
+
+                if cat_type == "manual":
+                    # Manual templates: use generalized heuristic
+                    from curate import categorize_heuristic
+                    for entry in all_images:
+                        if entry.get("_needs_recategorize") and entry.get("status") != "rejected":
+                            new_cat = categorize_heuristic(entry, cats_list, template)
+                            if new_cat:
+                                entry["category"] = new_cat
+                            recat_count += 1
+                        entry.pop("_needs_recategorize", None)
+
+                elif cat_type in ("date_time_ranges", "date_ranges"):
+                    # Thematic fallback refinement using face count
+                    from curate import refine_thematic_category
+                    thematic_cats = [c for c in cats_list
+                                     if c.get("day_offset") == -1
+                                     or (c.get("month_from") == 1 and c.get("month_to") == 12)]
+                    if thematic_cats:
+                        for entry in all_images:
+                            if entry.get("_needs_recategorize") and entry.get("status") != "rejected":
+                                new_cat = refine_thematic_category(entry, thematic_cats)
+                                if new_cat:
+                                    entry["category"] = new_cat
+                                recat_count += 1
+                            entry.pop("_needs_recategorize", None)
+
+                if recat_count:
+                    dist = {}
+                    for entry in all_images:
+                        c = entry.get("category")
+                        if c:
+                            dist[c] = dist.get(c, 0) + 1
+                    dist_str = ", ".join(f"{k}: {v}" for k, v in sorted(dist.items()))
+                    _update_task(f"Smart categorization: {recat_count} images sorted ({dist_str})")
+
+            # === PASS 3: Similarity clustering ===
+            _update_task("Pass 3: Clustering similar images...")
+            cluster_result = cluster_similar_images(
+                all_images,
+                vector_threshold=config.get("cluster_vector_threshold", 0.92),
+                dhash_threshold=config.get("cluster_dhash_threshold", 5),
+                progress_cb=_update_task,
+            )
+            if cluster_result["clusters"] > 0:
+                _update_task(
+                    f"Clustering: {cluster_result['clusters']} groups found, "
+                    f"{cluster_result['suppressed']} duplicates suppressed "
+                    f"(largest group: {cluster_result['largest_cluster']}, "
+                    f"{cluster_result['elapsed']:.1f}s)"
+                )
+
             # Final save
             total_elapsed = _time.monotonic() - pass1_start
             db = {
                 "scan_date": datetime.now().isoformat(),
                 "config": config,
-                "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped)},
+                "stats": {
+                    "total_scanned": scanned, "total_kept": len(all_images),
+                    "skipped": dict(skipped),
+                    "clusters": cluster_result["clusters"],
+                    "suppressed_duplicates": cluster_result["suppressed"],
+                },
                 "images": all_images,
             }
             save_scan_db(db)
@@ -1214,11 +1358,22 @@ def api_scan_start():
             blurry_count = sum(1 for e in all_images if e.get("reject_reason") == "blurry")
             graded = [e["photo_grade"]["composite"] for e in all_images if e.get("photo_grade")]
             grade_avg = round(sum(graded) / len(graded), 1) if graded else 0
+            sup_msg = f", {cluster_result['suppressed']} near-duplicates suppressed" if cluster_result["suppressed"] else ""
             _update_task(f"Done! {len(all_images)} images, {found_target} with target face, "
-                         f"{blurry_count} blurry rejected, avg grade {grade_avg}/100 ({total_elapsed:.0f}s)")
+                         f"{blurry_count} blurry rejected, avg grade {grade_avg}/100{sup_msg} ({total_elapsed:.0f}s)")
             _finish_task()
 
         except Exception as e:
+            import traceback
+            tb_str = traceback.format_exc()
+            traceback.print_exc()
+            # Also write to scan_error.log for reliable diagnosis
+            try:
+                with open(os.path.join(PROJECT_DIR, "scan_error.log"), "w", encoding="utf-8") as ef:
+                    ef.write(f"Scan error at {datetime.now().isoformat()}\n")
+                    ef.write(tb_str)
+            except Exception:
+                pass
             # Save whatever we have on crash
             try:
                 if all_images:
@@ -1227,7 +1382,7 @@ def api_scan_start():
                         "images": all_images})
             except Exception:
                 pass
-            _finish_task(str(e))
+            _finish_task(f"{type(e).__name__}: {e}")
 
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
@@ -1450,6 +1605,7 @@ def api_quick_fill():
 
             # Get categories
             from event_agent import get_categories_from_config, compute_quality_score, get_event_type, EVENT_KNOWLEDGE
+            from ranking_engine import RankingEngine
             categories = get_categories_from_config(config, images)
             event_type = get_event_type(config)
             knowledge = EVENT_KNOWLEDGE.get(event_type, EVENT_KNOWLEDGE.get("photo_book"))
@@ -1460,18 +1616,101 @@ def api_quick_fill():
                 weights["_taste_quiz"] = taste_quiz
 
             # Group by category (only face-matched when face names are configured)
+            # Skip suppressed duplicates — only representatives and unclustered images compete
             face_names = config.get("face_names", [])
             unlimited = config.get("unlimited_mode", False)
+            is_manual_cat = config.get("categorization") == "manual"
+            suppressed_count = 0
             by_cat = {}
             for img in images:
                 if img.get("status") == "rejected":
                     continue
-                # For videos, skip face check (can't detect faces in video thumbs)
-                if face_names and img.get("media_type") != "video" and not img.get("has_target_face"):
+                # Skip suppressed duplicates (non-representative cluster members)
+                if img.get("suppressed_by"):
+                    suppressed_count += 1
                     continue
+                has_face = img.get("has_target_face")
+                if face_names and not has_face:
+                    if is_manual_cat:
+                        # Manual templates: include non-face media with penalty
+                        # (action shots / videos may lack recognizable faces)
+                        img["_no_face_penalty"] = True
+                    else:
+                        # Auto-categorized: require face match (images and videos)
+                        continue
                 cat = img.get("category")
                 if cat:
                     by_cat.setdefault(cat, []).append(img)
+            if suppressed_count:
+                _update_task(f"Skipped {suppressed_count} suppressed duplicates")
+
+            # ── Ranking Engine setup ──
+            from curate import compute_image_vector, compute_dhash
+
+            ranker = RankingEngine(
+                face_names=face_names,
+                is_manual_cat=is_manual_cat,
+            )
+
+            # Vector/dHash accessors: use persisted values, fallback to computation
+            _vec_cache = {}
+            _dhash_cache = {}
+
+            def _get_vector(img):
+                h = img.get("hash")
+                if h and h in _vec_cache:
+                    return _vec_cache[h]
+                # Try persisted vector first
+                v = img.get("image_vector")
+                if v is not None:
+                    import numpy as np
+                    v = np.array(v, dtype=np.float32) if isinstance(v, list) else v
+                    if h:
+                        _vec_cache[h] = v
+                    return v
+                # Fallback: compute from file (images only — videos get vectors during scan)
+                fpath = img.get("path", "").replace("/", os.sep)
+                if not fpath or not os.path.isfile(fpath) or img.get("media_type") == "video":
+                    return None
+                v = compute_image_vector(fpath)
+                if h and v is not None:
+                    _vec_cache[h] = v
+                return v
+
+            def _get_dhash(img):
+                h = img.get("hash")
+                if h and h in _dhash_cache:
+                    return _dhash_cache[h]
+                # Try persisted dHash first
+                dh = img.get("dhash")
+                if dh is not None:
+                    if h:
+                        _dhash_cache[h] = dh
+                    return dh
+                # Fallback: compute from file (images only — videos get dHash during scan)
+                fpath = img.get("path", "").replace("/", os.sep)
+                if not fpath or not os.path.isfile(fpath) or img.get("media_type") == "video":
+                    return None
+                dh = compute_dhash(fpath)
+                if h and dh is not None:
+                    _dhash_cache[h] = dh
+                return dh
+
+            # Pre-compute vectors for rated images (for visual preference learning)
+            _update_task("Building preference model...")
+            vector_lookup = {}
+            rated_imgs = [i for i in images if i.get("preference") in ("like", "dislike")]
+            for img in rated_imgs:
+                v = _get_vector(img)
+                if v is not None:
+                    vector_lookup[img.get("hash")] = v
+
+            ranker.learn_from_feedback(images, vector_lookup)
+            if ranker._n_likes + ranker._n_dislikes > 0:
+                _update_task(f"Preference model: {ranker._n_likes} likes, {ranker._n_dislikes} dislikes"
+                             + (", visual similarity active" if ranker._session_vector is not None else ""))
+
+            dedup_skipped = [0]
 
             total_selected = 0
             total_videos = 0
@@ -1488,43 +1727,60 @@ def api_quick_fill():
                 vid_target = cat.get("video_target", 0)
                 pool = by_cat.get(cid, [])
 
-                # Split pool into images and videos
                 img_pool = [i for i in pool if i.get("media_type") != "video"]
                 vid_pool = [i for i in pool if i.get("media_type") == "video"]
 
                 def _score_and_select(candidates, target_count, media_label):
-                    # Face distance filtering for images
-                    if face_names and media_label == "images":
+                    # Hard filters first
+                    if face_names:
                         age_days_to = cat.get("age_days_to", 99999)
-                        if age_days_to <= 365:
-                            max_dist = 0.45
-                        elif age_days_to <= 1095:
-                            max_dist = 0.50
+                        max_dist = 0.45 if age_days_to <= 365 else 0.50
+                        if is_manual_cat:
+                            for img in candidates:
+                                if not img.get("has_target_face"):
+                                    img["_no_face_penalty"] = True
                         else:
-                            max_dist = 0.55
-                        candidates = [i for i in candidates
-                                      if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
+                            if media_label == "images":
+                                candidates = [i for i in candidates
+                                              if i.get("face_distance") is not None and i.get("face_distance") <= max_dist]
 
                     already = [i for i in candidates if i.get("status") == "selected"]
                     unselected = [i for i in candidates if i.get("status") != "selected"]
 
+                    # Register already-selected in ranker state
+                    for img in already:
+                        v = _get_vector(img)
+                        dh = _get_dhash(img)
+                        ranker.register_selected(img, v, dh)
+
+                    # Score all unselected with ranking engine
                     for img in unselected:
-                        base_score = compute_quality_score(img, weights)
-                        fd = img.get("face_distance")
-                        if fd is not None and face_names:
-                            base_score += max(0, (0.6 - fd)) * 5
-                        img["_score"] = base_score
-                    unselected.sort(key=lambda x: x["_score"], reverse=True)
+                        v = _get_vector(img)
+                        dh = _get_dhash(img)
+                        ranker.score(img, vector=v, dhash=dh, quality_weights=weights)
+
+                    unselected.sort(key=lambda x: x.get("_score", 0), reverse=True)
 
                     if unlimited:
                         remaining = len(unselected)
                     else:
                         remaining = max(0, target_count - len(already))
 
+                    # Select top candidates, skipping hard duplicates
                     picked = 0
-                    for img in unselected[:remaining]:
+                    for img in unselected:
+                        if picked >= remaining:
+                            break
+                        bd = img.get("_score_breakdown", {})
+                        if bd.get("duplicate_penalty", 0) >= 100:
+                            dedup_skipped[0] += 1
+                            continue
                         img["status"] = "selected"
                         picked += 1
+                        v = _get_vector(img)
+                        dh = _get_dhash(img)
+                        ranker.register_selected(img, v, dh)
+
                     return len(already) + picked, picked
 
                 img_total, img_picked = _score_and_select(img_pool, img_target, "images")
@@ -1545,12 +1801,16 @@ def api_quick_fill():
             # Clean temp scores
             for img in images:
                 img.pop("_score", None)
+                img.pop("_score_breakdown", None)
+                img.pop("_no_face_penalty", None)
 
             save_scan_db(db)
             msg = f"Done! {total_selected} images"
             if total_videos > 0:
                 msg += f" + {total_videos} videos"
             msg += " selected."
+            if dedup_skipped[0] > 0:
+                msg += f" ({dedup_skipped[0]} near-duplicates skipped)"
             _update_task(msg)
             _finish_task()
         except Exception as e:
@@ -1584,6 +1844,10 @@ def api_images():
     location = request.args.get("location")
     if location:
         filtered = [i for i in filtered if i.get("location") == location]
+    # By default hide suppressed duplicates; pass show_duplicates=1 to include them
+    show_dups = request.args.get("show_duplicates", "0") == "1"
+    if not show_dups:
+        filtered = [i for i in filtered if not i.get("suppressed_by")]
 
     total = len(filtered)
     page = filtered[offset:offset + limit]
@@ -3099,7 +3363,7 @@ def api_age_assess_start():
             # Save results to a temp file for the UI to fetch
             results_path = os.path.join(PROJECT_DIR, "age_results.json")
             with open(results_path, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False)
+                json.dump(results, f, ensure_ascii=False, cls=NumpyEncoder)
 
             msg = f"Done! Estimated age for {len(results)} images out of {processed} analyzed."
             if use_face_filter:
@@ -5461,7 +5725,7 @@ async function checkExistingScan() {
     const res = await fetch('/api/stats');
     const st = await res.json();
     var scanBtn = document.getElementById('btn-start-scan');
-    if (st.has_scan && st.total_media > 0) {
+    if (st.has_scan && st.total_media > 0 && st.has_sources) {
         document.getElementById('btn-next-4').disabled = false;
         document.getElementById('scan-progress').style.display = 'block';
         if (st.partial) {

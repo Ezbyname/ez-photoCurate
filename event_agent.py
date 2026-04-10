@@ -22,6 +22,7 @@ Or integrated via curate.py:
 import os
 import sys
 import json
+import math
 import argparse
 import hashlib
 from datetime import datetime
@@ -245,6 +246,101 @@ def compute_quality_score(img, weights):
                 score -= 1.0
 
     return score
+
+
+class PreferencePredictor:
+    """
+    Lightweight logistic regression trained on user likes/dislikes.
+    Predicts preference scores for unrated images during Quick Fill.
+    """
+
+    def __init__(self):
+        self._weights = None
+        self._bias = 0.0
+        self._trained = False
+
+    @staticmethod
+    def _features(img):
+        """Extract feature vector from image metadata."""
+        g = img.get("photo_grade") or {}
+        return [
+            (g.get("resolution", 50)) / 100.0,
+            (g.get("sharpness", 50)) / 100.0,
+            (g.get("noise", 50)) / 100.0,
+            (g.get("compression", 50)) / 100.0,
+            (g.get("color", 50)) / 100.0,
+            (g.get("exposure", 50)) / 100.0,
+            (g.get("focus", 50)) / 100.0,
+            (g.get("composite", 50)) / 100.0,
+            min((img.get("face_count", 0)) / 5.0, 1.0),
+            1.0 if img.get("has_target_face") else 0.0,
+            (1.0 - img.get("face_distance", 0.5)) if img.get("face_distance") is not None else 0.5,
+            min((img.get("size_kb", 500)) / 5000.0, 1.0),
+            1.0 if img.get("media_type") == "video" else 0.0,
+        ]
+
+    def train(self, images):
+        """Train from all rated images using logistic regression (gradient descent)."""
+        rated = [i for i in images if i.get("preference") in ("like", "dislike")]
+        if len(rated) < 3:
+            self._trained = False
+            return
+
+        X = [self._features(i) for i in rated]
+        Y = [1.0 if i.get("preference") == "like" else 0.0 for i in rated]
+        n_feat = len(X[0])
+        n = len(X)
+
+        w = [0.0] * n_feat
+        b = 0.0
+        lr = 0.5
+
+        for _ in range(80):
+            dw = [0.0] * n_feat
+            db = 0.0
+            for i in range(n):
+                z = b + sum(w[j] * X[i][j] for j in range(n_feat))
+                z = max(-10.0, min(10.0, z))
+                pred = 1.0 / (1.0 + math.exp(-z))
+                err = pred - Y[i]
+                for j in range(n_feat):
+                    dw[j] += err * X[i][j]
+                db += err
+            for j in range(n_feat):
+                w[j] -= lr * dw[j] / n
+            b -= lr * db / n
+
+        self._weights = w
+        self._bias = b
+        self._trained = True
+
+    def score(self, img):
+        """
+        Returns (preference_score, exploration_bonus) for an image.
+        Liked/disliked images return (0, 0) — their boost is already in compute_quality_score.
+        Unrated with model: (predicted_score scaled -5..+5, exploration_bonus 0..2)
+        Unrated without model: (0, 1) — small exploration bonus
+        """
+        pref = img.get("preference")
+        if pref in ("like", "dislike"):
+            return 0.0, 0.0  # already scored in compute_quality_score
+
+        if not self._trained or not self._weights:
+            return 0.0, 1.0  # no model yet, small exploration boost
+
+        x = self._features(img)
+        z = self._bias + sum(self._weights[j] * x[j] for j in range(len(x)))
+        z = max(-10.0, min(10.0, z))
+        p = 1.0 / (1.0 + math.exp(-z))
+
+        # Scale prediction to score: p=1.0→+5, p=0.0→-5
+        pref_score = (p - 0.5) * 10.0
+
+        # Exploration bonus: highest when uncertain (p near 0.5), zero when confident
+        confidence = abs(p - 0.5) * 2.0  # 0=uncertain, 1=confident
+        exploration = max(0.0, 2.0 * (1.0 - confidence))
+
+        return pref_score, exploration
 
 
 def compute_image_vector(image_path):
