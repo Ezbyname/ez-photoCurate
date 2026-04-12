@@ -47,6 +47,7 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_DIR = os.path.join(PROJECT_DIR, "projects")
 SCAN_DB_PATH = os.path.join(PROJECT_DIR, "scan_db.json")
 CLIP_VECTORS_PATH = os.path.join(PROJECT_DIR, "clip_vectors.npz")
+IMAGE_VECTORS_PATH = os.path.join(PROJECT_DIR, "image_vectors.npz")
 FACE_ENCODINGS_PATH = os.path.join(PROJECT_DIR, "face_encodings.npz")
 CONFIG_PATH = os.path.join(PROJECT_DIR, "curate_config.json")
 
@@ -262,13 +263,18 @@ def _auto_save_to_project(config_only=False, scan_db_only=False):
             now = time.time()
             if now - _last_project_sync < 30:
                 return
-            shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
+            # Copy sidecars BEFORE scan_db — on crash, project has
+            # newer sidecars + older scan_db (safe: extra vectors harmless)
+            if os.path.isfile(IMAGE_VECTORS_PATH):
+                shutil.copy2(IMAGE_VECTORS_PATH,
+                             os.path.join(pdir, "image_vectors.npz"))
             if os.path.isfile(CLIP_VECTORS_PATH):
                 shutil.copy2(CLIP_VECTORS_PATH,
                              os.path.join(pdir, "clip_vectors.npz"))
             if os.path.isfile(FACE_ENCODINGS_PATH):
                 shutil.copy2(FACE_ENCODINGS_PATH,
                              os.path.join(pdir, "face_encodings.npz"))
+            shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
             _last_project_sync = now
     except Exception:
         pass
@@ -292,13 +298,188 @@ def load_scan_db():
     return None
 
 
+def _save_image_vectors(images, path=None):
+    """Extract image_vector from image entries and save to npz sidecar.
+    Returns the number of vectors saved.  Never raises — logs errors so
+    callers (save_scan_db) can always proceed to write JSON."""
+    path = path or IMAGE_VECTORS_PATH
+    vectors = {}
+    for img in images:
+        v = img.get("image_vector")
+        h = img.get("hash")
+        if v is not None and h:
+            if isinstance(v, list):
+                vectors[h] = np.array(v, dtype=np.float32)
+            elif isinstance(v, np.ndarray):
+                vectors[h] = v.astype(np.float32)
+    if not vectors:
+        return 0
+    # np.savez_compressed appends .npz if filename doesn't end with it,
+    # so use a tmp name that already ends with .npz for predictable paths.
+    tmp = path + ".tmp.npz"
+    try:
+        # Merge with existing vectors (don't lose vectors from images not in this save)
+        if os.path.isfile(path):
+            try:
+                existing = dict(np.load(path, allow_pickle=False))
+                existing.update(vectors)
+                vectors = existing
+            except Exception as e:
+                print(f"[WARN] Could not merge existing {path} (corrupt?): {e} — "
+                      f"saving {len(vectors)} new vectors only", flush=True)
+        np.savez_compressed(tmp, **vectors)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt < 4:
+                    time.sleep(1 + attempt)
+                    continue
+                print(f"[WARN] Could not replace {path} after 5 retries — "
+                      f"vectors not persisted this cycle", flush=True)
+                break
+    except Exception as e:
+        print(f"[WARN] Failed to save image vectors to {path}: {e}", flush=True)
+    finally:
+        # Clean up stale tmp if replace failed or we crashed mid-write
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    return len(vectors)
+
+
+def load_image_vectors(path=None):
+    """Load image vectors from npz sidecar. Returns dict {hash: np.array}.
+    Returns empty dict (never raises) if file missing or corrupt."""
+    path = path or IMAGE_VECTORS_PATH
+    if os.path.isfile(path):
+        try:
+            data = np.load(path, allow_pickle=False)
+            return dict(data)
+        except Exception as e:
+            print(f"[WARN] Could not load {path} (corrupt?): {e} — "
+                  f"vectors will be recomputed from files where possible", flush=True)
+    return {}
+
+
 def save_scan_db(db):
-    with _db_lock:
-        tmp_path = SCAN_DB_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, cls=NumpyEncoder)
-        os.replace(tmp_path, SCAN_DB_PATH)
+    images = db.get("images", [])
+    # Save vectors to npz sidecar (before stripping from entries).
+    # _save_image_vectors never raises — if npz write fails, JSON still gets saved.
+    _save_image_vectors(images)
+    tmp_path = SCAN_DB_PATH + ".tmp"
+    try:
+        with _db_lock:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                # Strip image_vector from entries to keep JSON small
+                def _strip_vectors(obj):
+                    if isinstance(obj, dict) and "images" in obj:
+                        stripped = dict(obj)
+                        stripped["images"] = [
+                            {k: v for k, v in img.items() if k != "image_vector"}
+                            for img in obj["images"]
+                        ]
+                        return stripped
+                    return obj
+                json.dump(_strip_vectors(db), f, ensure_ascii=False, cls=NumpyEncoder)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, SCAN_DB_PATH)
+                    break
+                except PermissionError:
+                    if attempt < 4:
+                        time.sleep(1 + attempt)
+                        continue
+                    raise
+    except Exception:
+        # Clean up stale tmp on failure
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     _auto_save_to_project(scan_db_only=True)
+
+
+def verify_vector_consistency(db=None, repair=False):
+    """Check that image_vectors.npz covers all hashes in scan_db.
+    Returns dict with diagnostics.  If repair=True, recomputes missing
+    vectors for images (videos cannot be recomputed cheaply)."""
+    if db is None:
+        db = load_scan_db() or {}
+    images = db.get("images", [])
+    npz_vecs = load_image_vectors()
+
+    total = 0
+    covered = 0
+    missing_images = []  # can recompute
+    missing_videos = []  # cannot recompute
+    orphan_keys = set(npz_vecs.keys())
+
+    for img in images:
+        h = img.get("hash")
+        if not h:
+            continue
+        total += 1
+        if h in npz_vecs:
+            covered += 1
+            orphan_keys.discard(h)
+        else:
+            if img.get("media_type") == "video":
+                missing_videos.append(h)
+            else:
+                missing_images.append(h)
+
+    repaired = 0
+    if repair and missing_images:
+        from curate import compute_image_vector
+        new_vecs = {}
+        for img in images:
+            h = img.get("hash")
+            if h and h in missing_images:
+                fpath = img.get("path", "").replace("/", os.sep)
+                if fpath and os.path.isfile(fpath):
+                    try:
+                        v = compute_image_vector(fpath)
+                        if v is not None:
+                            new_vecs[h] = v.astype(np.float32)
+                            repaired += 1
+                    except Exception:
+                        pass
+        if new_vecs:
+            # Merge repaired vectors into npz
+            npz_vecs.update(new_vecs)
+            tmp = IMAGE_VECTORS_PATH + ".tmp.npz"
+            try:
+                np.savez_compressed(tmp, **npz_vecs)
+                os.replace(tmp, IMAGE_VECTORS_PATH)
+            except Exception as e:
+                print(f"[WARN] Could not save repaired vectors: {e}", flush=True)
+            finally:
+                try:
+                    if os.path.isfile(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+
+    result = {
+        "total_entries": total,
+        "covered": covered,
+        "missing_images": len(missing_images),
+        "missing_videos": len(missing_videos),
+        "orphan_vectors": len(orphan_keys),
+        "repaired": repaired,
+        "consistent": len(missing_images) == 0 and len(missing_videos) == 0,
+    }
+    if missing_images or missing_videos:
+        print(f"[WARN] Vector consistency: {len(missing_images)} images + "
+              f"{len(missing_videos)} videos missing from npz "
+              f"(out of {total} entries)", flush=True)
+    return result
 
 
 def _check_nsfw(fpath, classifier):
@@ -502,6 +683,190 @@ def api_save_sources():
     config["sources"] = data.get("sources", [])
     save_config(config)
     return jsonify({"ok": True})
+
+
+@app.route("/api/browse")
+def api_browse():
+    """List subdirectories at a given path for the folder picker.
+    GET /api/browse              → list drive letters (Windows) or /
+    GET /api/browse?path=C:\\    → list folders in C:\\
+    Returns {path, parent, folders: [{name, path, has_children}]}"""
+    import string
+    raw_path = request.args.get("path", "").strip()
+
+    # ── Root: list available drives (Windows) or filesystem root ──
+    if not raw_path:
+        if sys.platform == "win32":
+            drives = []
+            for letter in string.ascii_uppercase:
+                dp = f"{letter}:\\"
+                if os.path.isdir(dp):
+                    drives.append({"name": f"{letter}:", "path": dp, "has_children": True})
+            return jsonify({"path": "", "parent": None, "folders": drives})
+        else:
+            raw_path = "/"
+
+    # Normalize
+    browse_path = os.path.normpath(raw_path)
+    if not os.path.isdir(browse_path):
+        return jsonify({"error": f"Not a directory: {raw_path}"}), 400
+
+    # Parent path (None at drive root / filesystem root)
+    parent = os.path.dirname(browse_path)
+    if parent == browse_path:
+        parent = ""  # at root — signal to show drives list
+
+    folders = []
+    try:
+        with os.scandir(browse_path) as it:
+            for entry in sorted(it, key=lambda e: e.name.lower()):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                # Skip hidden/system folders
+                name = entry.name
+                if name.startswith(".") or name.startswith("$"):
+                    continue
+                # Check if folder has subdirectories (for expand arrow hint)
+                has_sub = False
+                try:
+                    with os.scandir(entry.path) as sub:
+                        for s in sub:
+                            if s.is_dir(follow_symlinks=False):
+                                has_sub = True
+                                break
+                except PermissionError:
+                    pass
+                folders.append({
+                    "name": name,
+                    "path": entry.path,
+                    "has_children": has_sub,
+                })
+    except PermissionError:
+        return jsonify({"path": browse_path, "parent": parent,
+                        "folders": [], "error": "Access denied"})
+    except OSError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"path": browse_path, "parent": parent, "folders": folders})
+
+
+@app.route("/api/browse/validate")
+def api_browse_validate():
+    """Validate a source folder path.
+    GET /api/browse/validate?path=C:\\Photos
+    Returns {path, valid, accessible, media_count, subfolder_count}"""
+    raw_path = request.args.get("path", "").strip()
+    if not raw_path:
+        return jsonify({"path": "", "valid": False, "accessible": False,
+                        "media_count": 0, "subfolder_count": 0})
+
+    norm = os.path.normpath(raw_path)
+    exists = os.path.isdir(norm)
+    if not exists:
+        return jsonify({"path": raw_path, "valid": False, "accessible": False,
+                        "media_count": 0, "subfolder_count": 0})
+
+    # Count media files (walk up to a cap for responsiveness)
+    MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic",
+                  ".webp", ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm",
+                  ".m4v", ".mpg", ".mpeg", ".3gp"}
+    media_count = 0
+    subfolder_count = 0
+    cap = 50000  # stop counting after this to stay fast
+    accessible = True
+    try:
+        for dirpath, dirnames, filenames in os.walk(norm):
+            subfolder_count += len(dirnames)
+            for fn in filenames:
+                if os.path.splitext(fn)[1].lower() in MEDIA_EXTS:
+                    media_count += 1
+                    if media_count >= cap:
+                        break
+            if media_count >= cap:
+                break
+    except PermissionError:
+        accessible = False
+
+    return jsonify({
+        "path": raw_path,
+        "valid": True,
+        "accessible": accessible,
+        "media_count": media_count,
+        "capped": media_count >= cap,
+        "subfolder_count": subfolder_count,
+    })
+
+
+_native_picker = {"active": False, "result": None}  # guarded by GIL
+
+@app.route("/api/browse/native", methods=["POST"])
+def api_browse_native():
+    """Open the native Windows folder picker (non-blocking).
+    POST {initialdir?, poll?}
+    First call (poll absent): launches dialog, returns {status:'open'}.
+    Subsequent calls (poll=true): returns {status:'open'|'done', paths:[]}."""
+    import subprocess as _sp
+    data = request.json or {}
+
+    # Poll mode — check if dialog finished
+    if data.get("poll"):
+        if not _native_picker["active"]:
+            res = _native_picker["result"]
+            _native_picker["result"] = None
+            return jsonify({"status": "done", "paths": res or []})
+        return jsonify({"status": "open"})
+
+    # Already open — don't launch another
+    if _native_picker["active"]:
+        return jsonify({"status": "open"})
+
+    initial = data.get("initialdir", "").strip()
+    if initial and not os.path.isdir(initial):
+        initial = ""
+
+    ps = (
+        'Add-Type -AssemblyName System.Windows.Forms;'
+        '$owner = New-Object System.Windows.Forms.Form;'
+        '$owner.TopMost = $true;'
+        '$owner.ShowInTaskbar = $false;'
+        '$owner.WindowState = "Minimized";'
+        '$owner.Show();'
+        '$owner.Hide();'
+        '$f = New-Object System.Windows.Forms.OpenFileDialog;'
+        '$f.ValidateNames = $false;'
+        '$f.CheckFileExists = $false;'
+        '$f.CheckPathExists = $true;'
+        "$f.FileName = 'Select Folder';"
+        "$f.Title = 'Select Source Folder';"
+        "$f.Filter = 'Folders|no.files';"
+    )
+    if initial:
+        ps += f"$f.InitialDirectory = '{initial.replace(chr(39), chr(39)+chr(39))}';"
+    ps += (
+        "if ($f.ShowDialog($owner) -eq 'OK') {"
+        "  Write-Output ([System.IO.Path]::GetDirectoryName($f.FileName))"
+        "}"
+        "$owner.Dispose();"
+    )
+
+    _native_picker["active"] = True
+    _native_picker["result"] = None
+
+    def _run():
+        try:
+            r = _sp.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                capture_output=True, text=True, timeout=120,
+            )
+            path = r.stdout.strip()
+            _native_picker["result"] = [path] if path else []
+        except Exception:
+            _native_picker["result"] = []
+        finally:
+            _native_picker["active"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "open"})
 
 
 @app.route("/api/init", methods=["POST"])
@@ -1122,7 +1487,7 @@ def api_scan_start():
 
             # Process in batches with ThreadPoolExecutor
             BATCH_SIZE = 50
-            with ThreadPoolExecutor(max_workers=6) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 for batch_start in range(0, total_media_files, BATCH_SIZE):
                     if _is_cancelled():
                         if all_images:
@@ -1295,8 +1660,8 @@ def api_scan_start():
                     else:
                         _update_task(f"Pass 1: {scanned}/{total_media_files} files ({len(all_images)} kept)...")
 
-                    # Periodic save every ~5% of total files
-                    save_interval = max(BATCH_SIZE, total_media_files // 20)
+                    # Periodic save every ~2% of total files
+                    save_interval = max(BATCH_SIZE, total_media_files // 50)
                     if scanned % save_interval < BATCH_SIZE and all_images:
                         save_scan_db({"scan_date": datetime.now().isoformat(), "config": config,
                             "stats": {"total_scanned": scanned, "total_kept": len(all_images), "skipped": dict(skipped), "partial": True},
@@ -1572,11 +1937,13 @@ def api_scan_start():
                         CLIP_VECTORS_PATH)
                 except Exception:
                     pass
+            _cluster_img_vecs = load_image_vectors()
             cluster_result = cluster_similar_images(
                 all_images,
                 vector_threshold=config.get("cluster_vector_threshold", 0.92),
                 dhash_threshold=config.get("cluster_dhash_threshold", 5),
                 clip_vectors=_cluster_clip_vecs,
+                image_vectors=_cluster_img_vecs,
                 progress_cb=_update_task,
             )
             if cluster_result["clusters"] > 0:
@@ -1648,6 +2015,14 @@ def api_scan_status():
             "error": _task["error"],
             "cancelled": _task["cancelled"],
         })
+
+
+@app.route("/api/vectors/verify")
+def api_vectors_verify():
+    """Check consistency between scan_db.json and image_vectors.npz."""
+    repair = request.args.get("repair", "").lower() in ("1", "true", "yes")
+    result = verify_vector_consistency(repair=repair)
+    return jsonify(result)
 
 
 @app.route("/api/task/stop", methods=["POST"])
@@ -1900,18 +2275,18 @@ def api_quick_fill():
                 is_manual_cat=is_manual_cat,
             )
 
-            # Vector/dHash accessors: use persisted values, fallback to computation
-            _vec_cache = {}
+            # Vector/dHash accessors: load from npz sidecar, fallback to computation
+            _vec_cache = load_image_vectors()  # pre-load all vectors from npz
             _dhash_cache = {}
 
             def _get_vector(img):
                 h = img.get("hash")
                 if h and h in _vec_cache:
-                    return _vec_cache[h]
-                # Try persisted vector first
+                    v = _vec_cache[h]
+                    return np.array(v, dtype=np.float32) if isinstance(v, list) else v
+                # Legacy: try persisted vector in entry (pre-migration data)
                 v = img.get("image_vector")
                 if v is not None:
-                    import numpy as np
                     v = np.array(v, dtype=np.float32) if isinstance(v, list) else v
                     if h:
                         _vec_cache[h] = v
@@ -2031,19 +2406,21 @@ def api_quick_fill():
                     else:
                         remaining = max(0, target_count - len(already))
 
-                    # Select top candidates, skipping hard duplicates
+                    # Select top candidates, re-checking duplicates incrementally
+                    # (batch scoring can't catch intra-round duplicates)
                     picked = 0
                     for img in unselected:
                         if picked >= remaining:
                             break
-                        bd = img.get("_score_breakdown", {})
-                        if bd.get("duplicate_penalty", 0) >= 100:
+                        v = _get_vector(img)
+                        dh = _get_dhash(img)
+                        # Re-compute dedup against everything selected so far
+                        dup = ranker._compute_duplicate_penalty(v, dh, path=img.get("path"))
+                        if dup >= 100:
                             dedup_skipped[0] += 1
                             continue
                         img["status"] = "selected"
                         picked += 1
-                        v = _get_vector(img)
-                        dh = _get_dhash(img)
                         cv = _get_clip_vector(img)
                         ranker.register_selected(img, v, dh, clip_vector=cv)
 
@@ -2421,6 +2798,62 @@ def api_categories_update_target():
     return jsonify({"ok": True})
 
 
+@app.route("/api/categories/substitutes")
+def api_categories_substitutes():
+    """Get substitute candidates for under-filled categories.
+    Returns qualified+suppressed images with target face, sorted by quality.
+    For categories below target, these are images a user can manually add."""
+    db = load_scan_db()
+    config = load_config()
+    if not db:
+        return jsonify({"categories": []})
+
+    images = db["images"]
+    config_cats = config.get("categories", []) if config else []
+    face_names = config.get("face_names", [])
+    target = int(request.args.get("target", config.get("target_per_category", 75)))
+    cat_id = request.args.get("category")  # optional: filter to one category
+    limit = int(request.args.get("limit", 200))
+
+    results = []
+    for c in config_cats:
+        cid = c["id"]
+        if cat_id and cid != cat_id:
+            continue
+        cat_target = c.get("target", target)
+        cat_imgs = [i for i in images if i.get("category") == cid]
+        selected = [i for i in cat_imgs if i.get("status") == "selected"]
+        gap = cat_target - len(selected)
+        if gap <= 0 and not cat_id:
+            continue  # fully filled, skip unless specifically requested
+
+        # Substitutes: qualified or suppressed, with target face
+        subs = []
+        for i in cat_imgs:
+            if i.get("status") in ("qualified", "pool"):
+                has_face = (not face_names or
+                            any(n in i.get("faces_found", []) for n in face_names))
+                if has_face:
+                    subs.append(i)
+
+        # Sort by photo_grade composite (best first)
+        def _grade(img):
+            g = img.get("photo_grade")
+            return g.get("composite", 0) if isinstance(g, dict) else 0
+        subs.sort(key=_grade, reverse=True)
+
+        results.append({
+            "id": cid,
+            "display": c.get("display", cid),
+            "target": cat_target,
+            "selected": len(selected),
+            "gap": gap,
+            "substitutes": subs[:limit],
+        })
+
+    return jsonify({"categories": results})
+
+
 @app.route("/api/export", methods=["POST"])
 def api_export():
     """Export selected/qualified images to output folder."""
@@ -2504,6 +2937,304 @@ def api_export():
 
     threading.Thread(target=run_export, daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/api/export/pptx", methods=["POST"])
+def api_export_pptx():
+    """Generate a PowerPoint presentation from selected images."""
+    if _any_job_running():
+        return jsonify({"error": "A task is already running"}), 409
+
+    data = request.json or {}
+    opt_captions = data.get("captions", True)
+    opt_dividers = data.get("dividers", True)
+    opt_sort = data.get("sort", "date")  # "date" or "score"
+
+    config = load_config()
+    proj_name = (config.get("project_name") or config.get("event_name") or "Photo Collection") if config else "Photo Collection"
+    job_id = _create_job("pptx_export", proj_name)
+
+    def run_pptx_export():
+        try:
+            from pptx import Presentation
+            from pptx.util import Inches, Pt
+            from pptx.dml.color import RGBColor
+            from pptx.enum.text import PP_ALIGN
+            from io import BytesIO
+            from PIL import Image
+
+            _reset_task("pptx_export")
+            _update_task("Preparing presentation...")
+
+            db = load_scan_db()
+            if not db:
+                _finish_task("No scan data.")
+                return
+
+            cfg = load_config() or {}
+            categories = cfg.get("categories", [])
+            cat_display = {}
+            for cat in categories:
+                cat_display[cat["id"]] = cat.get("display", cat["id"])
+
+            # Filter to selected images, exclude videos (can't embed in slides)
+            _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif",
+                           ".gif", ".webp", ".heic", ".heif"}
+            all_selected = [i for i in db["images"] if i.get("status") == "selected"]
+            images = []
+            skipped_videos = 0
+            for i in all_selected:
+                ext = os.path.splitext(i["filename"])[1].lower()
+                if i.get("media_type") == "video" or ext not in _IMAGE_EXTS:
+                    skipped_videos += 1
+                else:
+                    images.append(i)
+
+            if not images and not skipped_videos:
+                _update_task("No selected images. Use the Select step first.")
+                _finish_task("No images to export")
+                return
+            if not images:
+                _update_task(f"All {skipped_videos} selected items are videos (cannot embed in PowerPoint).")
+                _finish_task("No images to export")
+                return
+
+            # Group by category, preserving category order from config
+            from collections import OrderedDict
+            cat_order = [c["id"] for c in categories]
+            by_cat = OrderedDict()
+            for cid in cat_order:
+                by_cat[cid] = []
+            by_cat["uncategorized"] = []
+            for img in images:
+                c = img.get("category", "uncategorized")
+                if c not in by_cat:
+                    by_cat[c] = []
+                by_cat[c].append(img)
+            # Remove empty categories
+            by_cat = OrderedDict((k, v) for k, v in by_cat.items() if v)
+
+            total = len(images)
+            label = f"{total} photo{'s' if total != 1 else ''}"
+            if skipped_videos:
+                label += f" ({skipped_videos} video{'s' if skipped_videos != 1 else ''} skipped)"
+            _update_task(f"Building presentation with {label}...")
+
+            # ── Create presentation (16:9 widescreen) ──
+            prs = Presentation()
+            prs.slide_width = Inches(13.333)
+            prs.slide_height = Inches(7.5)
+
+            # ── Color palette ──
+            BG_DARK = RGBColor(0x1A, 0x20, 0x2C)
+            TEXT_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+            TEXT_SOFT = RGBColor(0xA0, 0xAE, 0xC0)
+
+            def _set_slide_bg(slide, color):
+                bg = slide.background
+                fill = bg.fill
+                fill.solid()
+                fill.fore_color.rgb = color
+
+            def _add_textbox(slide, left, top, width, height, text, font_size=18,
+                             color=TEXT_WHITE, bold=False, alignment=PP_ALIGN.LEFT):
+                txBox = slide.shapes.add_textbox(left, top, width, height)
+                tf = txBox.text_frame
+                tf.word_wrap = True
+                p = tf.paragraphs[0]
+                p.text = text
+                p.font.size = Pt(font_size)
+                p.font.color.rgb = color
+                p.font.bold = bold
+                p.alignment = alignment
+                return txBox
+
+            def _pluralize(n, word):
+                return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+            # ── Title Slide ──
+            title_slide = prs.slides.add_slide(prs.slide_layouts[6])
+            _set_slide_bg(title_slide, BG_DARK)
+            _add_textbox(title_slide, Inches(1), Inches(2.2), Inches(11.3), Inches(1.5),
+                         proj_name, font_size=44, color=TEXT_WHITE, bold=True,
+                         alignment=PP_ALIGN.CENTER)
+            subtitle = cfg.get("template", "")
+            if subtitle:
+                _add_textbox(title_slide, Inches(1), Inches(3.6), Inches(11.3), Inches(0.8),
+                             subtitle, font_size=22, color=TEXT_SOFT,
+                             alignment=PP_ALIGN.CENTER)
+            _add_textbox(title_slide, Inches(1), Inches(5.0), Inches(11.3), Inches(0.6),
+                         f"{_pluralize(total, 'photo')} across {_pluralize(len(by_cat), 'chapter')}",
+                         font_size=16, color=TEXT_SOFT, alignment=PP_ALIGN.CENTER)
+
+            # ── Per-category slides ──
+            done = 0
+            skipped_missing = 0
+            for cat_id, cat_images in by_cat.items():
+                if _is_cancelled():
+                    _update_task("Stopped by user.")
+                    _finish_task("Cancelled")
+                    return
+
+                display_name = cat_display.get(cat_id, cat_id.replace("_", " ").title())
+
+                # Sort images within category
+                if opt_sort == "score":
+                    cat_images.sort(key=lambda x: (x.get("photo_grade") or {}).get("composite", 0), reverse=True)
+                else:
+                    cat_images.sort(key=lambda x: x.get("date") or "")
+
+                # Section divider slide
+                if opt_dividers:
+                    sec_slide = prs.slides.add_slide(prs.slide_layouts[6])
+                    _set_slide_bg(sec_slide, BG_DARK)
+                    _add_textbox(sec_slide, Inches(1), Inches(2.5), Inches(11.3), Inches(1.2),
+                                 display_name, font_size=40, color=TEXT_WHITE, bold=True,
+                                 alignment=PP_ALIGN.CENTER)
+                    _add_textbox(sec_slide, Inches(1), Inches(3.8), Inches(11.3), Inches(0.6),
+                                 _pluralize(len(cat_images), "photo"),
+                                 font_size=18, color=TEXT_SOFT, alignment=PP_ALIGN.CENTER)
+
+                # Image slides
+                for img in cat_images:
+                    if _is_cancelled():
+                        _update_task("Stopped by user.")
+                        _finish_task("Cancelled")
+                        return
+
+                    src_path = img["path"].replace("/", os.sep)
+                    if not os.path.isfile(src_path):
+                        done += 1
+                        skipped_missing += 1
+                        continue
+
+                    img_slide = prs.slides.add_slide(prs.slide_layouts[6])
+                    _set_slide_bg(img_slide, BG_DARK)
+
+                    # Load image to get dimensions for proper scaling
+                    try:
+                        pil_img = Image.open(src_path)
+                        img_w, img_h = pil_img.size
+                        pil_img.close()
+                    except Exception:
+                        img_w = img.get("width", 1920)
+                        img_h = img.get("height", 1080)
+
+                    if img_w <= 0: img_w = 1920
+                    if img_h <= 0: img_h = 1080
+
+                    # Scale image to fit slide, reserving space for caption
+                    aspect = img_w / img_h
+                    caption_h = 0.5 if opt_captions else 0
+                    max_w_in = 12.733   # 13.333 - 0.6 (0.3" margin each side)
+                    max_h_in = 7.5 - 0.4 - caption_h  # top margin + caption reserve
+
+                    if aspect >= max_w_in / max_h_in:
+                        pic_w = max_w_in
+                        pic_h = pic_w / aspect
+                    else:
+                        pic_h = max_h_in
+                        pic_w = pic_h * aspect
+
+                    left = (13.333 - pic_w) / 2
+                    avail_h = 7.5 - caption_h
+                    top = (avail_h - pic_h) / 2
+
+                    try:
+                        img_slide.shapes.add_picture(
+                            src_path,
+                            Inches(left), Inches(top),
+                            Inches(pic_w), Inches(pic_h)
+                        )
+                    except Exception:
+                        # Fallback: load via PIL, convert to JPEG in memory
+                        try:
+                            pil_img = Image.open(src_path)
+                            if pil_img.mode != "RGB":
+                                pil_img = pil_img.convert("RGB")
+                            buf = BytesIO()
+                            pil_img.save(buf, format="JPEG", quality=92)
+                            buf.seek(0)
+                            pil_img.close()
+                            img_slide.shapes.add_picture(
+                                buf, Inches(left), Inches(top),
+                                Inches(pic_w), Inches(pic_h)
+                            )
+                        except Exception:
+                            _add_textbox(img_slide, Inches(2), Inches(3), Inches(9), Inches(1),
+                                         f"Could not load: {img['filename']}",
+                                         font_size=14, color=TEXT_SOFT, alignment=PP_ALIGN.CENTER)
+
+                    # Caption
+                    if opt_captions:
+                        caption = img.get("date", "")
+                        if caption and display_name:
+                            caption = f"{display_name}  |  {caption}"
+                        elif display_name:
+                            caption = display_name
+                        _add_textbox(img_slide, Inches(0.3), Inches(7.0), Inches(12.7), Inches(0.4),
+                                     caption, font_size=11, color=TEXT_SOFT,
+                                     alignment=PP_ALIGN.CENTER)
+
+                    done += 1
+                    if done % 10 == 0:
+                        pct = int(done * 100 / total) if total else 0
+                        _update_task_percent(pct)
+                        _update_task(f"Added {done}/{total} images...")
+
+            # ── End slide ──
+            end_slide = prs.slides.add_slide(prs.slide_layouts[6])
+            _set_slide_bg(end_slide, BG_DARK)
+            _add_textbox(end_slide, Inches(1), Inches(3.0), Inches(11.3), Inches(1),
+                         proj_name, font_size=36, color=TEXT_WHITE, bold=True,
+                         alignment=PP_ALIGN.CENTER)
+            _add_textbox(end_slide, Inches(1), Inches(4.2), Inches(11.3), Inches(0.6),
+                         f"{_pluralize(total, 'photo')}  |  {_pluralize(len(by_cat), 'chapter')}",
+                         font_size=16, color=TEXT_SOFT, alignment=PP_ALIGN.CENTER)
+
+            # ── Save ──
+            safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in proj_name).strip()[:80]
+            out_name = f"{safe_name}.pptx" if safe_name else "presentation.pptx"
+            out_path = os.path.join(PROJECT_DIR, out_name)
+            _update_task("Saving presentation...")
+            prs.save(out_path)
+
+            size_mb = os.path.getsize(out_path) / 1e6
+            summary = f"Done! {out_name} ({size_mb:.1f} MB) — {_pluralize(total, 'photo')}, {len(prs.slides)} slides"
+            if skipped_videos:
+                summary += f", {_pluralize(skipped_videos, 'video')} skipped"
+            if skipped_missing:
+                summary += f", {skipped_missing} files not found"
+            _update_task(summary)
+            # Store path for download
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job:
+                    job["result_file"] = out_path
+            _finish_task()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _finish_task(str(e))
+
+    threading.Thread(target=run_pptx_export, daemon=True).start()
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/api/export/pptx/download")
+def api_export_pptx_download():
+    """Download the last generated PowerPoint file."""
+    # Find the most recent pptx job
+    with _jobs_lock:
+        pptx_jobs = [j for j in _jobs.values() if j.get("type") == "pptx_export" and j.get("result_file")]
+    if not pptx_jobs:
+        return jsonify({"error": "No presentation file available. Generate one first."}), 404
+    latest = max(pptx_jobs, key=lambda j: j.get("started_at", ""))
+    fpath = latest["result_file"]
+    if not os.path.isfile(fpath):
+        return jsonify({"error": "Presentation file not found."}), 404
+    return send_file(fpath, as_attachment=True, download_name=os.path.basename(fpath))
 
 
 @app.route("/api/ref-faces")
@@ -3269,20 +4000,22 @@ def api_projects_save():
     if os.path.isfile(CONFIG_PATH):
         shutil.copy2(CONFIG_PATH, os.path.join(pdir, "curate_config.json"))
 
-    # Copy scan_db
-    if os.path.isfile(SCAN_DB_PATH):
-        with _db_lock:
-            shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
-
-    # Copy CLIP vectors sidecar
+    # Copy sidecars BEFORE scan_db — on crash, project has newer
+    # sidecars + older scan_db (safe: extra vectors are harmless)
+    if os.path.isfile(IMAGE_VECTORS_PATH):
+        shutil.copy2(IMAGE_VECTORS_PATH,
+                     os.path.join(pdir, "image_vectors.npz"))
     if os.path.isfile(CLIP_VECTORS_PATH):
         shutil.copy2(CLIP_VECTORS_PATH,
                      os.path.join(pdir, "clip_vectors.npz"))
-
-    # Copy face encodings sidecar
     if os.path.isfile(FACE_ENCODINGS_PATH):
         shutil.copy2(FACE_ENCODINGS_PATH,
                      os.path.join(pdir, "face_encodings.npz"))
+
+    # Copy scan_db last
+    if os.path.isfile(SCAN_DB_PATH):
+        with _db_lock:
+            shutil.copy2(SCAN_DB_PATH, os.path.join(pdir, "scan_db.json"))
 
     # Copy ref_faces
     ref_src = os.path.join(PROJECT_DIR, "ref_faces")
@@ -3332,6 +4065,13 @@ def api_projects_load():
     elif os.path.isfile(CLIP_VECTORS_PATH):
         os.remove(CLIP_VECTORS_PATH)
 
+    # Restore image vectors sidecar
+    src_ivec = os.path.join(pdir, "image_vectors.npz")
+    if os.path.isfile(src_ivec):
+        shutil.copy2(src_ivec, IMAGE_VECTORS_PATH)
+    elif os.path.isfile(IMAGE_VECTORS_PATH):
+        os.remove(IMAGE_VECTORS_PATH)
+
     # Restore face encodings sidecar
     src_face = os.path.join(pdir, "face_encodings.npz")
     if os.path.isfile(src_face):
@@ -3357,12 +4097,15 @@ def api_projects_load():
 
 @app.route("/api/projects/new", methods=["POST"])
 def api_projects_new():
-    """Start a fresh project. Clears current config, scan_db, and ref_faces."""
+    """Start a fresh project. Clears current config, scan_db, sidecars, and ref_faces."""
     if os.path.isfile(CONFIG_PATH):
         os.remove(CONFIG_PATH)
     with _db_lock:
         if os.path.isfile(SCAN_DB_PATH):
             os.remove(SCAN_DB_PATH)
+    for sidecar in (IMAGE_VECTORS_PATH, CLIP_VECTORS_PATH, FACE_ENCODINGS_PATH):
+        if os.path.isfile(sidecar):
+            os.remove(sidecar)
     ref_dir = os.path.join(PROJECT_DIR, "ref_faces")
     if os.path.isdir(ref_dir):
         shutil.rmtree(ref_dir)
@@ -3711,91 +4454,446 @@ WIZARD_HTML = """<!DOCTYPE html>
 <title>E-z Photo Organizer</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#f5f7fa; color:#2d3748; min-height:100vh; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#f0f4f8; color:#2d3748; min-height:100vh; }
 
 /* ── Layout ── */
-.app { max-width:1200px; margin:0 auto; padding:20px; padding-left:68px; }
-.header { text-align:center; padding:30px 0 20px; }
-.header h1 { font-size:2em; color:#2b6cb0; margin-bottom:5px; }
-.header p { color:#718096; font-size:.9em; }
+.app { max-width:1200px; margin:0 auto; padding:20px; padding-left:72px; }
+.header { text-align:center; padding:36px 0 22px; position:relative; }
+.header h1 { font-size:2.2em; color:#1a365d; margin-bottom:4px; letter-spacing:-.02em; font-weight:800; }
+.header .version-badge { display:inline-block; font-size:.6em; font-weight:600; color:#3182ce; background:#dbeafe; padding:2px 10px; border-radius:99px; vertical-align:middle; margin-left:8px; letter-spacing:.03em; }
+.header p { color:#718096; font-size:.92em; margin-top:2px; }
 
 /* ── Steps nav ── */
-.steps { display:flex; justify-content:center; gap:0; margin:25px 0; }
+.steps-wrap { display:flex; align-items:center; gap:12px; margin:25px 0; }
+.steps { display:flex; justify-content:center; gap:0; margin:0; flex:1; overflow:hidden; border-radius:10px; box-shadow:0 1px 4px rgba(0,0,0,.06); }
 .step-dot {
-    display:flex; align-items:center; gap:8px; padding:10px 18px;
-    background:#fff; cursor:pointer; font-size:.85em; color:#a0aec0;
-    border:1px solid #e2e8f0; transition:all .2s;
+    display:flex; align-items:center; gap:8px; padding:11px 18px;
+    background:#fff; cursor:pointer; font-size:.82em; color:#a0aec0;
+    border:1px solid #e2e8f0; border-left:none; transition:all .25s;
+    position:relative;
 }
-.step-dot:first-child { border-radius:8px 0 0 8px; }
-.step-dot:last-child { border-radius:0 8px 8px 0; }
+.step-dot:first-child { border-left:1px solid #e2e8f0; border-radius:10px 0 0 10px; }
+.step-dot:last-child { border-radius:0 10px 10px 0; }
+.step-dot:hover { background:#f7fafc; color:#4a5568; }
 .step-dot.done { background:#f0fff4; color:#276749; border-color:#9ae6b4; }
-.step-dot.active { background:#2b6cb0; color:white; border-color:#2b6cb0; font-weight:600; }
+.step-dot.done + .step-dot { border-left-color:#9ae6b4; }
+.step-dot.active { background:linear-gradient(135deg, #2b6cb0, #3182ce); color:white; border-color:#2b6cb0; font-weight:600; box-shadow:0 2px 8px rgba(43,108,176,.3); }
+.step-dot.active + .step-dot { border-left-color:#2b6cb0; }
 .step-dot .num {
-    width:24px; height:24px; border-radius:50%; background:#e2e8f0; color:#a0aec0;
-    display:flex; align-items:center; justify-content:center; font-size:.75em; font-weight:bold;
+    width:22px; height:22px; border-radius:50%; background:#edf2f7; color:#a0aec0;
+    display:flex; align-items:center; justify-content:center; font-size:.72em; font-weight:bold;
+    transition:all .25s;
 }
 .step-dot.done .num { background:#38a169; color:white; }
-.step-dot.active .num { background:white; color:#2b6cb0; }
+.step-dot.active .num { background:rgba(255,255,255,.95); color:#2b6cb0; }
 
 /* ── Panels ── */
-.panel { display:none; background:#fff; border-radius:12px; padding:30px; margin-top:10px; box-shadow:0 1px 3px rgba(0,0,0,.1); border:1px solid #e2e8f0; }
-.panel.active { display:block; }
-.panel h2 { color:#2b6cb0; margin-bottom:15px; font-size:1.3em; }
-.panel p { color:#4a5568; line-height:1.6; margin-bottom:15px; }
+.panel {
+    display:none; background:#fff; border-radius:14px; padding:32px 34px; margin-top:14px;
+    box-shadow:0 2px 12px rgba(0,0,0,.06); border:1px solid #e2e8f0;
+    position:relative;
+}
+.panel.active { display:block; animation:panelIn .3s ease-out; }
+@keyframes panelIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+.panel h2 {
+    color:#1a365d; margin-bottom:16px; font-size:1.35em; font-weight:700;
+    padding-bottom:12px; border-bottom:2px solid #ebf4ff;
+    display:flex; align-items:center; gap:10px;
+}
+.panel p { color:#4a5568; line-height:1.65; margin-bottom:16px; }
+
+/* ── Footer ── */
+.app-footer { text-align:center; padding:20px 0 12px; color:#a0aec0; font-size:.75em; }
+.app-footer a { color:#718096; text-decoration:none; }
+.app-footer a:hover { color:#2b6cb0; }
+
+/* ── Shared design system ── */
+
+/* Stat cards (summary numbers) */
+.stat-row { display:flex; gap:14px; margin-bottom:18px; flex-wrap:wrap; }
+.stat-card {
+    border-radius:12px; padding:18px 22px; flex:1; min-width:140px; text-align:center;
+    background:#ebf8ff; border:1px solid #bee3f8; transition:transform .15s, box-shadow .15s;
+}
+.stat-card:hover { transform:translateY(-1px); box-shadow:0 3px 10px rgba(0,0,0,.06); }
+.stat-card .stat-value { font-size:1.9em; font-weight:800; color:#2b6cb0; line-height:1.2; letter-spacing:-.02em; }
+.stat-card .stat-label { color:#718096; font-size:.8em; margin-top:4px; font-weight:500; text-transform:uppercase; letter-spacing:.04em; }
+.stat-card.green { background:#f0fff4; border-color:#c6f6d5; }
+.stat-card.green .stat-value { color:#38a169; }
+.stat-card.red { background:#fff5f5; border-color:#fed7d7; }
+.stat-card.red .stat-value { color:#e53e3e; }
+
+/* Notice/alert boxes */
+.notice { padding:13px 16px; border-radius:10px; font-size:.84em; margin-top:12px; line-height:1.6; }
+.notice strong { font-weight:600; }
+.notice-error { background:#fff5f5; border:1px solid #feb2b2; color:#9b2c2c; }
+.notice-warn { background:#fffff0; border:1px solid #fefcbf; color:#744210; }
+.notice-info { background:#ebf8ff; border:1px solid #bee3f8; color:#2b6cb0; }
+.notice-tip { background:#f0fff4; border:1px solid #c6f6d5; color:#276749; }
+
+/* Option checkbox row */
+.option-check {
+    display:flex; align-items:flex-start; gap:7px; padding:7px 0;
+    font-size:.82em; cursor:pointer;
+}
+.option-check input[type=checkbox],
+.option-check input[type=radio] {
+    width:16px; height:16px; accent-color:#3b82f6; cursor:pointer; margin:0; margin-top:1px; flex-shrink:0;
+}
+.option-check .opt-text { color:#4a5568; font-weight:600; }
+.option-check .opt-hint { font-weight:400; color:#a0aec0; font-size:.92em; }
+
+/* Radio group */
+.radio-group { margin:6px 0 4px 23px; }
+.radio-row {
+    display:flex; align-items:flex-start; gap:7px; padding:4px 0; font-size:.82em; cursor:pointer;
+}
+.radio-row input[type=radio] { width:16px; height:16px; accent-color:#3b82f6; cursor:pointer; margin:0; margin-top:1px; flex-shrink:0; }
+.radio-row strong { color:#4a5568; font-weight:600; }
+.radio-row .radio-hint { color:#a0aec0; }
+
+/* Section title (subheading within panel) */
+.section-title { font-weight:600; color:#2d3748; font-size:.95em; margin-bottom:8px; }
+
+/* Panel section grouping */
+.panel-section { margin-top:20px; }
+.section-break { margin-top:20px; padding-top:16px; border-top:1px solid #edf2f7; }
+
+/* Help/hint text */
+.help-text { font-size:.8em; color:#718096; margin-top:5px; line-height:1.5; }
+
+/* Info box (highlighted section with border) */
+.info-box { padding:14px 18px; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; margin-top:12px; }
+.info-box .info-box-title { font-weight:600; font-size:.9em; color:#2d3748; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
+
+/* Export cards */
+.export-cards { display:flex; gap:18px; margin-top:22px; flex-wrap:wrap; }
+.export-card { flex:1; min-width:260px; border:2px solid #e2e8f0; border-radius:14px; padding:24px; background:#f7fafc; transition:all .2s; }
+.export-card:hover { box-shadow:0 4px 16px rgba(0,0,0,.06); transform:translateY(-2px); }
+.export-card.primary { border-color:#3182ce; background:linear-gradient(135deg, #ebf8ff 0%, #dbeafe 100%); min-width:280px; }
+.export-card.primary:hover { box-shadow:0 4px 16px rgba(49,130,206,.15); }
+.export-card .card-title { font-size:1.1em; font-weight:700; color:#2d3748; margin-bottom:8px; }
+.export-card.primary .card-title { color:#1a365d; }
+.export-card .card-desc { font-size:.85em; color:#4a5568; margin:0 0 14px; line-height:1.55; }
+
+/* Category card list */
+.cat-card-list { display:flex; flex-direction:column; gap:8px; }
+.cat-card {
+    display:flex; align-items:center; gap:14px; padding:14px 16px;
+    background:#fff; border:1px solid #e2e8f0; border-radius:12px;
+    transition:border-color .2s, box-shadow .2s;
+}
+.cat-card:hover { border-color:#bfdbfe; box-shadow:0 2px 8px rgba(0,0,0,.04); }
+.cat-card .cat-num {
+    width:26px; height:26px; border-radius:50%; background:#f1f5f9;
+    color:#94a3b8; font-size:.72em; font-weight:700;
+    display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
+.cat-card .cat-name-wrap { flex:1; min-width:0; }
+.cat-card .cat-name-input {
+    width:100%; border:1px solid transparent; background:transparent;
+    padding:5px 8px; border-radius:6px; font-size:.92em; font-weight:600;
+    color:#1e293b; transition:all .15s;
+}
+.cat-card .cat-name-input:hover { border-color:#e2e8f0; background:#f8fafc; }
+.cat-card .cat-name-input:focus { border-color:#93c5fd; background:#fff; box-shadow:0 0 0 2px rgba(59,130,246,.15); outline:none; }
+.cat-card .cat-targets {
+    display:flex; gap:10px; flex-shrink:0; align-items:center;
+}
+.cat-card .cat-target-group {
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+}
+.cat-card .cat-target-label {
+    font-size:.62em; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:#94a3b8;
+}
+.cat-card .cat-target-input {
+    width:62px; text-align:center; border:1px solid #e2e8f0; border-radius:8px;
+    padding:5px 4px; font-size:.85em; font-weight:500; color:#334155;
+    background:#f8fafc; transition:all .15s;
+}
+.cat-card .cat-target-input:hover { border-color:#cbd5e1; }
+.cat-card .cat-target-input:focus { border-color:#93c5fd; background:#fff; box-shadow:0 0 0 2px rgba(59,130,246,.15); outline:none; }
+.cat-card .cat-delete {
+    width:28px; height:28px; border:none; background:none; border-radius:6px;
+    color:#cbd5e1; cursor:pointer; display:flex; align-items:center; justify-content:center;
+    font-size:1.15em; transition:all .15s; flex-shrink:0;
+}
+.cat-card .cat-delete:hover { background:#fef2f2; color:#ef4444; }
+
+/* Inline form group */
+.form-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.form-row input, .form-row select { width:auto; }
 
 /* ── Forms ── */
-label { display:block; font-size:.85em; color:#718096; margin-bottom:4px; margin-top:12px; }
-input, select { width:100%; padding:10px 12px; border-radius:6px; border:1px solid #cbd5e0; background:#fff; color:#2d3748; font-size:.9em; }
+label { display:block; font-size:.85em; color:#718096; margin-bottom:4px; margin-top:12px; font-weight:500; }
+input, select { width:100%; padding:10px 14px; border-radius:8px; border:1px solid #cbd5e0; background:#fff; color:#2d3748; font-size:.9em; transition:border-color .2s, box-shadow .2s; }
 input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0 3px rgba(66,153,225,.15); }
 .row { display:flex; gap:12px; }
 .row > * { flex:1; }
 
 /* ── Buttons ── */
 .btn {
-    padding:10px 24px; border:none; border-radius:6px; cursor:pointer;
-    font-size:.9em; font-weight:600; transition:all .15s;
+    padding:10px 24px; border:none; border-radius:8px; cursor:pointer;
+    font-size:.88em; font-weight:600; transition:all .2s; letter-spacing:.01em;
 }
-.btn-primary { background:#3182ce; color:white; }
-.btn-primary:hover { background:#2b6cb0; }
-.btn-primary:disabled { background:#cbd5e0; color:#a0aec0; cursor:not-allowed; }
-.btn-secondary { background:#edf2f7; color:#2b6cb0; }
-.btn-secondary:hover { background:#e2e8f0; }
-.btn-danger { background:#fed7d7; color:#c53030; }
-.btn-group { display:flex; gap:10px; margin-top:20px; }
+.btn-primary { background:linear-gradient(135deg, #3182ce, #2b6cb0); color:white; box-shadow:0 2px 6px rgba(49,130,206,.25); }
+.btn-primary:hover { background:linear-gradient(135deg, #2b6cb0, #2c5282); box-shadow:0 3px 10px rgba(49,130,206,.35); transform:translateY(-1px); }
+.btn-primary:active { transform:translateY(0); box-shadow:0 1px 3px rgba(49,130,206,.2); }
+.btn-primary:disabled { background:#cbd5e0; color:#a0aec0; cursor:not-allowed; box-shadow:none; transform:none; }
+.btn-secondary { background:#edf2f7; color:#2b6cb0; border:1px solid #e2e8f0; }
+.btn-secondary:hover { background:#e2e8f0; border-color:#cbd5e0; }
+.btn-danger { background:#fff5f5; color:#c53030; border:1px solid #feb2b2; }
+.btn-danger:hover { background:#fed7d7; }
+.btn-group { display:flex; gap:10px; margin-top:24px; }
 
 /* ── Cards ── */
-.template-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px; margin-top:15px; }
+.template-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:14px; margin-top:18px; }
 .template-card {
-    background:#fff; border:2px solid #e2e8f0; border-radius:8px; padding:16px;
-    cursor:pointer; transition:all .15s;
+    background:#fff; border:2px solid #e2e8f0; border-radius:12px; padding:18px 20px;
+    cursor:pointer; transition:all .2s;
 }
-.template-card:hover { border-color:#63b3ed; box-shadow:0 2px 8px rgba(66,153,225,.15); }
-.template-card.selected { border-color:#3182ce; background:#ebf8ff; }
-.template-card h3 { color:#2b6cb0; margin-bottom:6px; }
-.template-card .desc { color:#718096; font-size:.8em; line-height:1.4; }
-.template-card .meta { color:#a0aec0; font-size:.75em; margin-top:8px; }
+.template-card:hover { border-color:#90cdf4; box-shadow:0 4px 14px rgba(66,153,225,.12); transform:translateY(-2px); }
+.template-card.selected { border-color:#3182ce; background:#ebf8ff; box-shadow:0 0 0 3px rgba(49,130,206,.15); }
+.template-card h3 { color:#2b6cb0; margin-bottom:6px; font-size:1.05em; }
+.template-card .desc { color:#718096; font-size:.82em; line-height:1.5; }
+.template-card .meta { color:#a0aec0; font-size:.75em; margin-top:10px; font-weight:500; }
 
 /* ── Sources list ── */
-.source-list { margin-top:10px; }
-.source-item {
-    display:flex; align-items:center; gap:10px; padding:8px 12px;
-    background:#f7fafc; border-radius:6px; margin-bottom:6px; border:1px solid #e2e8f0;
+.source-list { display:flex; flex-direction:column; gap:10px; margin-top:16px; }
+
+/* Source card — each source is a self-contained block */
+.src-card {
+    background:#fff; border:1px solid #e2e8f0; border-radius:12px;
+    padding:16px 18px 14px; transition:border-color .2s, box-shadow .2s;
 }
-.source-item input { flex:1; }
-.source-item .remove { color:#e53e3e; cursor:pointer; font-size:1.2em; padding:0 8px; }
+.src-card:hover { border-color:#bfdbfe; box-shadow:0 2px 8px rgba(0,0,0,.04); }
+
+/* Top row: number pill, label input, remove button */
+.src-header {
+    display:flex; align-items:center; gap:10px; margin-bottom:8px;
+}
+.src-num {
+    width:24px; height:24px; border-radius:50%; background:#f1f5f9;
+    color:#94a3b8; font-size:.68em; font-weight:700;
+    display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
+.src-label {
+    border:1px solid transparent; background:transparent;
+    padding:3px 7px; border-radius:6px; font-size:.82em; font-weight:600;
+    color:#64748b; transition:all .15s; max-width:200px;
+}
+.src-label:hover { border-color:#e2e8f0; background:#f8fafc; }
+.src-label:focus { border-color:#93c5fd; background:#fff; box-shadow:0 0 0 2px rgba(59,130,246,.15); outline:none; }
+.src-remove {
+    margin-left:auto; width:26px; height:26px; border:none; background:none;
+    border-radius:6px; color:#cbd5e1; cursor:pointer; font-size:1.1em;
+    display:flex; align-items:center; justify-content:center; transition:all .15s; flex-shrink:0;
+}
+.src-remove:hover { background:#fef2f2; color:#ef4444; }
+
+/* Path input — visually dominant */
+.src-path {
+    width:100%; padding:9px 12px; border:1px solid #e2e8f0; border-radius:8px;
+    font-size:.9em; color:#1e293b; background:#f8fafc; transition:all .15s;
+    box-sizing:border-box;
+}
+.src-path:hover { border-color:#cbd5e1; background:#fff; }
+.src-path:focus { border-color:#93c5fd; background:#fff; box-shadow:0 0 0 2px rgba(59,130,246,.15); outline:none; }
+.src-path.path-valid { border-color:#68d391; }
+.src-path.path-invalid { border-color:#fc8181; }
+.src-path.path-warn { border-color:#ecc94b; }
+
+/* Meta row: badge + coverage hint + browse action */
+.src-meta {
+    display:flex; align-items:center; gap:8px; margin-top:8px;
+}
+.source-badge {
+    font-size:.72em; padding:3px 9px; border-radius:10px; white-space:nowrap;
+    display:inline-flex; align-items:center; gap:4px; font-weight:500;
+}
+.src-coverage {
+    font-size:.72em; color:#94a3b8; font-weight:400; font-style:italic;
+}
+.src-actions { margin-left:auto; display:flex; gap:6px; align-items:center; }
+.src-browse {
+    background:#edf2f7; border:1px solid #cbd5e0; border-radius:6px; padding:5px 12px;
+    cursor:pointer; font-size:.78em; color:#4a5568; white-space:nowrap; transition:all .15s;
+    display:inline-flex; align-items:center; gap:4px;
+}
+.src-browse:hover { background:#e2e8f0; border-color:#a0aec0; }
+.src-browse svg { flex-shrink:0; }
+.source-badge.valid { background:#c6f6d5; color:#276749; }
+.source-badge.empty { background:#fefcbf; color:#744210; }
+.source-badge.invalid { background:#fed7d7; color:#9b2c2c; }
+.source-badge.checking { background:#e2e8f0; color:#718096; }
+
+/* Source summary row */
+.src-summary-row { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+.src-summary-card {
+    flex:1; min-width:120px; padding:14px 16px; text-align:center;
+    border-radius:10px; background:#f8fafc; border:1px solid #e2e8f0;
+}
+.src-summary-val { font-size:1.5em; font-weight:800; color:#2b6cb0; line-height:1.2; }
+.src-summary-lbl { color:#94a3b8; font-size:.7em; font-weight:500; text-transform:uppercase; letter-spacing:.04em; margin-top:2px; }
+
+/* Coverage guidance badge */
+.src-readiness {
+    display:inline-flex; align-items:center; gap:6px; padding:6px 14px;
+    border-radius:8px; font-size:.78em; font-weight:500; margin-top:4px;
+}
+.src-readiness.good { background:#f0fff4; border:1px solid #c6f6d5; color:#276749; }
+.src-readiness.okay { background:#fffff0; border:1px solid #fefcbf; color:#744210; }
+.src-readiness.low { background:#fff5f5; border:1px solid #fed7d7; color:#9b2c2c; }
+
+/* Add-source inline button */
+.src-add-btn {
+    display:flex; align-items:center; justify-content:center; gap:6px;
+    width:100%; padding:12px; border:2px dashed #e2e8f0; border-radius:12px;
+    background:transparent; color:#94a3b8; font-size:.85em; font-weight:500;
+    cursor:pointer; transition:all .2s;
+}
+.src-add-btn:hover { border-color:#93c5fd; color:#3b82f6; background:#f8fbff; }
+
+/* Subtle notice (collapsed) */
+.notice-subtle {
+    padding:0; margin-top:16px; border:none; background:none;
+}
+.notice-subtle-toggle {
+    font-size:.78em; color:#94a3b8; cursor:pointer; display:inline-flex; align-items:center; gap:4px;
+    transition:color .15s; border:none; background:none; padding:0;
+}
+.notice-subtle-toggle:hover { color:#64748b; }
+.notice-subtle-toggle svg { transition:transform .2s; }
+.notice-subtle-toggle.open svg { transform:rotate(90deg); }
+.notice-subtle-body {
+    display:none; margin-top:8px; padding:10px 14px; border-radius:8px;
+    font-size:.8em; line-height:1.55;
+}
+.notice-subtle-body.show { display:block; }
+.notice-subtle-body.warn { background:#fffdf5; border:1px solid #fef3c7; color:#92400e; }
+.notice-subtle-body.error { background:#fef7f7; border:1px solid #fecaca; color:#991b1b; }
+
+/* ── Folder picker: multi-select checkbox ── */
+.fp-item input[type=checkbox] {
+    width:16px; height:16px; flex-shrink:0; accent-color:#3182ce; cursor:pointer;
+}
+.fp-checked-count {
+    font-size:.82em; color:#3182ce; font-weight:600;
+}
+
+/* ── PPTX export option controls ── */
+.pptx-options {
+    display:flex; flex-wrap:wrap; gap:6px; margin-bottom:16px;
+}
+.pptx-opt {
+    display:inline-flex; align-items:center; gap:7px;
+    padding:6px 12px; border-radius:8px; background:#dbeafe;
+    border:1px solid #bfdbfe; cursor:pointer; position:relative;
+    transition:background .15s, border-color .15s;
+    user-select:none;
+}
+.pptx-opt:hover { background:#c7d7f5; border-color:#93c5fd; }
+.pptx-opt svg {
+    width:16px; height:16px; flex-shrink:0; stroke:#4573b0;
+    fill:none; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round;
+}
+.pptx-opt .pptx-opt-label {
+    font-size:.82em; font-weight:500; color:#2d4a7a; white-space:nowrap;
+}
+.pptx-opt input[type=checkbox] {
+    width:15px; height:15px; accent-color:#3b82f6; cursor:pointer;
+    flex-shrink:0; margin:0;
+}
+.pptx-opt select {
+    font-size:.82em; padding:2px 6px; border:1px solid #93c5fd;
+    border-radius:5px; background:#fff; color:#2d4a7a; cursor:pointer;
+    outline:none;
+}
+.pptx-opt select:focus { border-color:#3b82f6; box-shadow:0 0 0 2px rgba(59,130,246,.15); }
+.pptx-opt .pptx-hint {
+    display:none; position:absolute; bottom:calc(100% + 8px); left:50%;
+    transform:translateX(-50%); width:230px; padding:8px 11px;
+    background:#1e293b; color:#e2e8f0; font-size:11.5px; font-weight:400;
+    border-radius:7px; line-height:1.45; z-index:100; pointer-events:none;
+    text-align:left; box-shadow:0 4px 12px rgba(0,0,0,.2);
+}
+.pptx-opt .pptx-hint::after {
+    content:''; position:absolute; top:100%; left:50%; transform:translateX(-50%);
+    border:5px solid transparent; border-top-color:#1e293b;
+}
+.pptx-opt:hover .pptx-hint { display:block; }
+
+/* ── Folder picker: recent folders ── */
+.fp-recent { padding:6px 18px; border-bottom:1px solid #edf2f7; }
+.fp-recent-title { font-size:.75em; color:#a0aec0; text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px; }
+.fp-recent-item {
+    display:inline-flex; align-items:center; gap:4px; padding:3px 10px; margin:2px 4px 2px 0;
+    background:#edf2f7; border-radius:12px; font-size:.78em; color:#4a5568; cursor:pointer;
+}
+.fp-recent-item:hover { background:#e2e8f0; }
+
+/* ── Folder picker modal ── */
+.fp-overlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
+    z-index:9000; align-items:center; justify-content:center;
+}
+.fp-overlay.active { display:flex; }
+.fp-modal {
+    background:#fff; border-radius:10px; width:560px; max-width:92vw;
+    max-height:80vh; display:flex; flex-direction:column;
+    box-shadow:0 8px 30px rgba(0,0,0,.25);
+}
+.fp-header {
+    padding:14px 18px; border-bottom:1px solid #e2e8f0;
+    display:flex; align-items:center; justify-content:space-between;
+}
+.fp-header h3 { margin:0; font-size:1em; color:#2d3748; }
+.fp-breadcrumb {
+    padding:8px 18px; background:#f7fafc; border-bottom:1px solid #edf2f7;
+    font-size:.82em; color:#718096; display:flex; flex-wrap:wrap; gap:2px; align-items:center;
+}
+.fp-breadcrumb span { cursor:pointer; color:#3182ce; }
+.fp-breadcrumb span:hover { text-decoration:underline; }
+.fp-breadcrumb .sep { color:#a0aec0; cursor:default; margin:0 2px; }
+.fp-list {
+    flex:1; overflow-y:auto; padding:6px 0; min-height:200px;
+}
+.fp-item {
+    display:flex; align-items:center; padding:7px 18px; cursor:pointer;
+    font-size:.88em; color:#2d3748; gap:8px;
+}
+.fp-item:hover { background:#ebf8ff; }
+.fp-item.selected { background:#bee3f8; }
+.fp-item .fp-icon { color:#ecc94b; font-size:1.1em; flex-shrink:0; }
+.fp-item .fp-arrow { color:#a0aec0; margin-left:auto; font-size:.9em; }
+.fp-empty { padding:30px 18px; text-align:center; color:#a0aec0; font-size:.88em; }
+.fp-footer {
+    padding:12px 18px; border-top:1px solid #e2e8f0;
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+}
+.fp-footer .fp-path { flex:1; font-size:.78em; color:#718096; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.fp-footer button { padding:6px 16px; border-radius:5px; font-size:.85em; cursor:pointer; border:1px solid #cbd5e0; }
+.fp-footer .fp-select { background:#3182ce; color:#fff; border-color:#3182ce; }
+.fp-footer .fp-select:hover { background:#2b6cb0; }
+.fp-footer .fp-select:disabled { background:#a0aec0; border-color:#a0aec0; cursor:not-allowed; }
+.fp-footer .fp-cancel { background:#fff; color:#4a5568; }
+.fp-footer .fp-cancel:hover { background:#f7fafc; }
 
 /* ── Progress ── */
 .progress-box {
-    background:#1a202c; border-radius:8px; padding:15px; margin-top:15px;
-    font-family:monospace; font-size:.8em; max-height:300px; overflow-y:auto;
+    background:#1a202c; border-radius:10px; padding:16px 18px; margin-top:16px;
+    font-family:'SF Mono', 'Fira Code', Consolas, monospace; font-size:.8em; max-height:300px; overflow-y:auto;
+    box-shadow:inset 0 2px 4px rgba(0,0,0,.2);
 }
 .progress-box .line { padding:2px 0; color:#63b3ed; }
 .progress-box .current { color:#fc8181; font-weight:bold; }
 
 /* ── Analysis ── */
-.analysis-table { width:100%; border-collapse:collapse; margin-top:10px; }
-.analysis-table th, .analysis-table td { padding:8px 12px; text-align:left; border-bottom:1px solid #e2e8f0; font-size:.85em; }
-.analysis-table th { color:#718096; }
+.analysis-table { width:100%; border-collapse:collapse; margin-top:12px; }
+.analysis-table th, .analysis-table td { padding:10px 14px; text-align:left; border-bottom:1px solid #edf2f7; font-size:.85em; }
+.analysis-table th { color:#718096; font-weight:600; text-transform:uppercase; font-size:.72em; letter-spacing:.05em; }
+.analysis-table tbody tr { transition:background .15s; }
+.analysis-table tbody tr:hover { background:#f7fafc; }
 .status-ok { color:#38a169; }
 .status-close { color:#d69e2e; }
 .status-low { color:#dd6b20; }
@@ -3804,15 +4902,16 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 .status-overflow { color:#3182ce; }
 
 .rec-card {
-    background:#f7fafc; border-radius:6px; padding:12px; margin-bottom:8px;
-    border-left:3px solid #cbd5e0;
+    background:#f7fafc; border-radius:10px; padding:14px 16px; margin-bottom:10px;
+    border-left:4px solid #cbd5e0; transition:transform .15s;
 }
-.rec-card.critical { border-left-color:#e53e3e; }
-.rec-card.warning { border-left-color:#dd6b20; }
-.rec-card.info { border-left-color:#3182ce; }
-.rec-card.tip { border-left-color:#38a169; }
-.rec-card .title { font-weight:600; margin-bottom:4px; color:#2d3748; }
-.rec-card .detail { color:#718096; font-size:.85em; }
+.rec-card:hover { transform:translateX(2px); }
+.rec-card.critical { border-left-color:#e53e3e; background:#fff5f5; }
+.rec-card.warning { border-left-color:#dd6b20; background:#fffff0; }
+.rec-card.info { border-left-color:#3182ce; background:#ebf8ff; }
+.rec-card.tip { border-left-color:#38a169; background:#f0fff4; }
+.rec-card .title { font-weight:600; margin-bottom:4px; color:#2d3748; font-size:.92em; }
+.rec-card .detail { color:#718096; font-size:.84em; line-height:1.5; }
 
 /* ── Gallery (embedded) ── */
 .gallery-frame { width:100%; height:80vh; border:none; border-radius:8px; margin-top:15px; background:#f7fafc; }
@@ -3823,11 +4922,11 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 @keyframes spin { to { transform: translate(-50%,-50%) rotate(360deg); } }
 
 /* ── Lightbox ── */
-.lightbox { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.7); z-index:9999; align-items:center; justify-content:center; }
+.lightbox { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.8); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); z-index:9999; align-items:center; justify-content:center; }
 .lightbox.open { display:flex; }
-.lightbox img { max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 4px 30px rgba(0,0,0,.4); }
-.lightbox .close-btn { position:absolute; top:20px; right:30px; font-size:2em; color:white; cursor:pointer; background:rgba(0,0,0,.5); border:none; border-radius:50%; width:44px; height:44px; display:flex; align-items:center; justify-content:center; }
-.lightbox .close-btn:hover { background:rgba(0,0,0,.8); }
+.lightbox img { max-width:90vw; max-height:90vh; border-radius:10px; box-shadow:0 8px 40px rgba(0,0,0,.5); }
+.lightbox .close-btn { position:absolute; top:20px; right:30px; font-size:2em; color:white; cursor:pointer; background:rgba(255,255,255,.15); border:none; border-radius:50%; width:44px; height:44px; display:flex; align-items:center; justify-content:center; backdrop-filter:blur(4px); transition:background .2s; }
+.lightbox .close-btn:hover { background:rgba(255,255,255,.3); }
 
 /* ── Inline spinner ── */
 .inline-loader { display:inline-flex; align-items:center; gap:10px; padding:12px 16px; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; color:#2b6cb0; font-size:.9em; }
@@ -3835,10 +4934,10 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 @keyframes spinA { to { transform:rotate(360deg); } }
 
 /* ── Task overlay ── */
-#task-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,.88); z-index:9990; align-items:center; justify-content:center; flex-direction:column; }
+#task-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,.92); backdrop-filter:blur(4px); -webkit-backdrop-filter:blur(4px); z-index:9990; align-items:center; justify-content:center; flex-direction:column; }
 #task-overlay.active { display:flex; }
-#task-overlay .task-box { background:#fff; border-radius:12px; box-shadow:0 4px 24px rgba(0,0,0,.12); padding:30px 40px; min-width:400px; max-width:600px; text-align:center; }
-#task-overlay .task-title { font-size:1.2em; font-weight:600; color:#2d3748; margin-bottom:12px; }
+#task-overlay .task-box { background:#fff; border-radius:16px; box-shadow:0 8px 32px rgba(0,0,0,.1); padding:36px 44px; min-width:400px; max-width:600px; text-align:center; border:1px solid #e2e8f0; }
+#task-overlay .task-title { font-size:1.2em; font-weight:700; color:#1a365d; margin-bottom:12px; }
 #task-overlay .task-status { font-size:.9em; color:#718096; margin-bottom:16px; min-height:1.2em; }
 #task-overlay .task-bar-bg { height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden; margin-bottom:16px; }
 #task-overlay .task-bar { height:100%; background:linear-gradient(90deg, #3182ce, #63b3ed); border-radius:4px; transition:width .5s ease; }
@@ -3851,41 +4950,86 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
 /* ── Side menu (projects) ── */
 /* ── Icon rail (always visible) ── */
-#icon-rail { position:fixed; top:0; left:0; width:48px; height:100%; background:#fff; z-index:10000; display:flex; flex-direction:column; align-items:center; padding:10px 0; border-right:1px solid #e2e8f0; box-shadow:1px 0 6px rgba(0,0,0,.04); }
-#icon-rail .rail-btn { width:36px; height:36px; border:none; background:none; border-radius:8px; cursor:pointer; display:flex; align-items:center; justify-content:center; color:#718096; transition:all .15s; position:relative; margin-bottom:4px; }
-#icon-rail .rail-btn:hover { background:#ebf8ff; color:#2b6cb0; }
-#icon-rail .rail-btn.active { background:#ebf8ff; color:#2b6cb0; }
-#icon-rail .rail-btn svg { width:20px; height:20px; }
-#icon-rail .rail-btn .rail-tip { display:none; position:absolute; left:46px; top:50%; transform:translateY(-50%); background:#2d3748; color:#fff; font-size:.72em; padding:4px 10px; border-radius:5px; white-space:nowrap; pointer-events:none; z-index:10; }
+#icon-rail {
+    position:fixed; top:0; left:0; width:52px; height:100%;
+    background:linear-gradient(180deg, #f8fafc 0%, #fff 100%);
+    z-index:10000; display:flex; flex-direction:column; align-items:center;
+    padding:14px 0 10px; border-right:1px solid #e2e8f0;
+    box-shadow:1px 0 8px rgba(0,0,0,.04);
+}
+#icon-rail .rail-btn {
+    width:36px; height:36px; border:none; background:none; border-radius:10px;
+    cursor:pointer; display:flex; align-items:center; justify-content:center;
+    color:#94a3b8; transition:all .2s; position:relative; margin-bottom:2px;
+}
+#icon-rail .rail-btn:hover { background:#dbeafe; color:#2563eb; }
+#icon-rail .rail-btn.active { background:#dbeafe; color:#2563eb; }
+#icon-rail .rail-btn svg { width:19px; height:19px; }
+#icon-rail .rail-btn .rail-tip {
+    display:none; position:absolute; left:50px; top:50%; transform:translateY(-50%);
+    background:#1e293b; color:#f1f5f9; font-size:.72em; font-weight:500;
+    padding:5px 12px; border-radius:6px; white-space:nowrap; pointer-events:none; z-index:10;
+    box-shadow:0 2px 8px rgba(0,0,0,.15);
+}
+#icon-rail .rail-btn .rail-tip::before {
+    content:''; position:absolute; left:-4px; top:50%; transform:translateY(-50%) rotate(45deg);
+    width:8px; height:8px; background:#1e293b;
+}
 #icon-rail .rail-btn:hover .rail-tip { display:block; }
 #icon-rail .rail-spacer { flex:1; }
-#icon-rail .rail-divider { width:24px; height:1px; background:#e2e8f0; margin:6px 0; }
-#icon-rail .rail-btn .job-badge { position:absolute; top:-2px; right:-2px; background:#e53e3e; color:#fff; font-size:10px; font-weight:700; width:16px; height:16px; border-radius:50%; display:flex; align-items:center; justify-content:center; line-height:1; }
+#icon-rail .rail-divider { width:22px; height:1px; background:#e2e8f0; margin:8px 0; }
+#icon-rail .rail-btn .job-badge {
+    position:absolute; top:-3px; right:-3px; background:#ef4444; color:#fff;
+    font-size:9px; font-weight:700; width:16px; height:16px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center; line-height:1;
+    box-shadow:0 1px 3px rgba(239,68,68,.4);
+}
+.rail-submenu {
+    position:absolute; left:50px; top:0; background:#fff; border:1px solid #e2e8f0;
+    border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,.1); padding:6px; z-index:20;
+    white-space:nowrap; min-width:160px;
+}
+.rail-submenu-btn {
+    display:flex; align-items:center; gap:8px; width:100%; padding:9px 14px;
+    border:none; background:none; cursor:pointer; border-radius:8px;
+    font-size:.82em; color:#475569; text-align:left; transition:all .15s;
+}
+.rail-submenu-btn:hover { background:#eff6ff; color:#1d4ed8; }
+.rail-submenu-btn svg { color:#94a3b8; }
+.rail-submenu-btn:hover svg { color:#3b82f6; }
 /* ── Jobs panel ── */
-#jobs-panel { display:none; position:fixed; bottom:60px; left:56px; width:360px; background:#fff; border-radius:10px; box-shadow:0 6px 24px rgba(0,0,0,.15); z-index:10001; max-height:400px; overflow:hidden; border:1px solid #e2e8f0; }
+#jobs-panel {
+    display:none; position:fixed; bottom:60px; left:60px; width:360px;
+    background:#fff; border-radius:14px; box-shadow:0 8px 30px rgba(0,0,0,.12);
+    z-index:10001; max-height:400px; overflow:hidden; border:1px solid #e2e8f0;
+}
 #jobs-panel.open { display:flex; flex-direction:column; }
-#jobs-panel .jp-header { padding:12px 16px; border-bottom:1px solid #e2e8f0; font-weight:600; font-size:.9em; color:#2d3748; display:flex; justify-content:space-between; align-items:center; }
-#jobs-panel .jp-list { overflow-y:auto; max-height:340px; padding:6px 0; }
-#jobs-panel .jp-empty { padding:24px; text-align:center; color:#a0aec0; font-size:.85em; }
-#jobs-panel .jp-item { padding:10px 16px; border-bottom:1px solid #f7fafc; }
+#jobs-panel .jp-header {
+    padding:14px 18px; border-bottom:1px solid #edf2f7; font-weight:700;
+    font-size:.88em; color:#1e293b; display:flex; justify-content:space-between; align-items:center;
+}
+#jobs-panel .jp-list { overflow-y:auto; max-height:340px; padding:4px 0; }
+#jobs-panel .jp-empty { padding:28px; text-align:center; color:#a0aec0; font-size:.85em; }
+#jobs-panel .jp-item { padding:12px 18px; border-bottom:1px solid #f7fafc; transition:background .15s; }
+#jobs-panel .jp-item:hover { background:#f8fafc; }
 #jobs-panel .jp-item:last-child { border-bottom:none; }
 #jobs-panel .jp-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
-#jobs-panel .jp-type { font-weight:600; font-size:.82em; color:#2d3748; }
+#jobs-panel .jp-type { font-weight:600; font-size:.82em; color:#1e293b; }
 #jobs-panel .jp-proj { font-size:.72em; color:#a0aec0; margin-left:6px; }
 #jobs-panel .jp-status { font-size:.72em; color:#718096; }
 #jobs-panel .jp-bar-bg { height:5px; background:#e2e8f0; border-radius:3px; overflow:hidden; margin-bottom:4px; }
 #jobs-panel .jp-bar { height:100%; border-radius:3px; transition:width .5s ease; }
 #jobs-panel .jp-bar.running { background:linear-gradient(90deg, #3182ce, #63b3ed); animation:taskPulse 1.5s ease-in-out infinite; }
-#jobs-panel .jp-bar.done { background:#38a169; }
-#jobs-panel .jp-bar.error { background:#e53e3e; }
+#jobs-panel .jp-bar.done { background:#22c55e; }
+#jobs-panel .jp-bar.error { background:#ef4444; }
 #jobs-panel .jp-actions { display:flex; gap:6px; }
-#jobs-panel .jp-actions button { border:none; background:none; cursor:pointer; font-size:.75em; padding:2px 8px; border-radius:4px; }
-#jobs-panel .jp-actions .jp-stop { color:#e53e3e; }
-#jobs-panel .jp-actions .jp-stop:hover { background:#fed7d7; }
+#jobs-panel .jp-actions button { border:none; background:none; cursor:pointer; font-size:.75em; padding:3px 10px; border-radius:6px; transition:background .15s; }
+#jobs-panel .jp-actions .jp-stop { color:#ef4444; }
+#jobs-panel .jp-actions .jp-stop:hover { background:#fef2f2; }
 #jobs-panel .jp-actions .jp-goto { color:#3182ce; }
-#jobs-panel .jp-actions .jp-goto:hover { background:#ebf8ff; }
+#jobs-panel .jp-actions .jp-goto:hover { background:#eff6ff; }
 #jobs-panel .jp-actions .jp-dismiss { color:#a0aec0; }
-#jobs-panel .jp-actions .jp-dismiss:hover { background:#f7fafc; color:#718096; }
+#jobs-panel .jp-actions .jp-dismiss:hover { background:#f8fafc; color:#718096; }
 .menu-btn { display:none; }
 /* ── Cleanup overlay ── */
 #cleanup-overlay { display:none; position:fixed; top:0; left:48px; width:calc(100% - 48px); height:100%; background:#f5f7fa; z-index:1300; overflow-y:auto; }
@@ -3917,24 +5061,78 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 .cleanup-trash-bar .trash-count { font-size:.95em; color:#4a5568; font-weight:600; }
 .cleanup-trash-bar .trash-size { font-size:.8em; color:#a0aec0; margin-left:8px; }
 
-#side-drawer { position:fixed; top:0; left:-320px; width:300px; height:100%; background:#fff; z-index:1150; box-shadow:4px 0 20px rgba(0,0,0,.1); transition:left .25s ease; display:flex; flex-direction:column; padding-left:48px; }
+#side-drawer {
+    position:fixed; top:0; left:-324px; width:304px; height:100%;
+    background:#fff; z-index:1150;
+    box-shadow:6px 0 24px rgba(0,0,0,.08);
+    transition:left .28s cubic-bezier(.4,0,.2,1);
+    display:flex; flex-direction:column; padding-left:52px;
+}
 #side-drawer.open { left:0; }
-#side-drawer .drawer-header { padding:16px 18px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; }
-#side-drawer .drawer-header h3 { color:#2d3748; margin:0; font-size:1em; }
-#side-drawer .drawer-close { background:none; border:none; font-size:1.4em; cursor:pointer; color:#718096; padding:0 4px; }
-#side-drawer .drawer-close:hover { color:#2d3748; }
-#side-drawer .drawer-actions { padding:12px 18px; display:flex; gap:8px; border-bottom:1px solid #e2e8f0; }
-#side-drawer .drawer-actions button { flex:1; padding:7px 0; border-radius:5px; font-size:.8em; cursor:pointer; border:1px solid #e2e8f0; background:#f7fafc; color:#4a5568; }
-#side-drawer .drawer-actions button:hover { background:#ebf8ff; border-color:#90cdf4; color:#2b6cb0; }
-#side-drawer .project-list { flex:1; overflow-y:auto; padding:8px 0; }
-#side-drawer .project-item { padding:10px 18px; cursor:pointer; border-bottom:1px solid #f7fafc; transition:background .1s; }
+#side-drawer .drawer-header {
+    padding:18px 20px 14px; border-bottom:1px solid #edf2f7;
+    display:flex; justify-content:space-between; align-items:center;
+}
+#side-drawer .drawer-header h3 { color:#1e293b; margin:0; font-size:1.05em; font-weight:700; }
+#side-drawer .drawer-close {
+    background:none; border:none; font-size:1.4em; cursor:pointer;
+    color:#94a3b8; padding:2px 6px; border-radius:6px; transition:all .15s;
+}
+#side-drawer .drawer-close:hover { color:#1e293b; background:#f1f5f9; }
+#side-drawer .drawer-section {
+    border-bottom:1px solid #edf2f7;
+}
+#side-drawer .drawer-section-header {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:12px 20px; cursor:pointer; user-select:none; transition:background .15s;
+}
+#side-drawer .drawer-section-header:hover { background:#f8fafc; }
+#side-drawer .drawer-section-title {
+    font-weight:600; font-size:.88em; color:#334155; display:flex; align-items:center; gap:8px;
+}
+#side-drawer .drawer-section-title svg { color:#94a3b8; }
+#side-drawer .drawer-section-body { padding:0 20px 14px; }
+#side-drawer .drawer-btn {
+    width:100%; padding:10px 14px; border:1px solid #e2e8f0; border-radius:10px;
+    background:#f8fafc; color:#475569; font-size:.84em; cursor:pointer;
+    display:flex; align-items:center; gap:9px; text-align:left;
+    transition:all .15s; margin-bottom:6px;
+}
+#side-drawer .drawer-btn:hover { background:#eff6ff; border-color:#bfdbfe; color:#1d4ed8; }
+#side-drawer .drawer-btn:last-child { margin-bottom:0; }
+#side-drawer .drawer-btn svg { color:#94a3b8; flex-shrink:0; }
+#side-drawer .drawer-btn:hover svg { color:#3b82f6; }
+#side-drawer .drawer-btn.primary {
+    border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; font-weight:600;
+}
+#side-drawer .drawer-btn.primary:hover { background:#dbeafe; border-color:#93c5fd; }
+#side-drawer .drawer-btn.primary svg { color:#3b82f6; }
+#side-drawer .drawer-actions { padding:12px 20px; display:flex; gap:8px; border-bottom:1px solid #edf2f7; }
+#side-drawer .drawer-actions button {
+    flex:1; padding:7px 0; border-radius:8px; font-size:.8em; cursor:pointer;
+    border:1px solid #e2e8f0; background:#f8fafc; color:#475569; transition:all .15s;
+}
+#side-drawer .drawer-actions button:hover { background:#eff6ff; border-color:#93c5fd; color:#2563eb; }
+#side-drawer .project-list { flex:1; overflow-y:auto; padding:6px 0; }
+#side-drawer .project-item {
+    padding:11px 20px; cursor:pointer; border-bottom:1px solid #f8fafc; transition:background .15s;
+}
 #side-drawer .project-item:hover { background:#f0f9ff; }
-#side-drawer .project-item .p-name { font-weight:500; color:#2d3748; font-size:.9em; }
-#side-drawer .project-item .p-meta { color:#a0aec0; font-size:.72em; margin-top:2px; }
+#side-drawer .project-item .p-name { font-weight:600; color:#1e293b; font-size:.88em; }
+#side-drawer .project-item .p-meta { color:#94a3b8; font-size:.72em; margin-top:3px; }
 #side-drawer .project-item .p-actions { display:flex; gap:6px; margin-top:6px; }
-#side-drawer .project-item .p-del { background:none; border:none; color:#e53e3e; cursor:pointer; font-size:.75em; padding:2px 6px; border-radius:3px; }
-#side-drawer .project-item .p-del:hover { background:#fed7d7; }
-#drawer-backdrop { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.2); z-index:1150; }
+#side-drawer .project-item .p-del {
+    background:none; border:none; color:#ef4444; cursor:pointer;
+    font-size:.75em; padding:2px 8px; border-radius:5px; transition:background .15s;
+}
+#side-drawer .project-item .p-del:hover { background:#fef2f2; }
+#side-drawer .drawer-footer {
+    padding:14px 20px; border-top:1px solid #edf2f7; margin-top:auto;
+}
+#side-drawer .drawer-footer .user-info {
+    font-size:.78em; color:#94a3b8; margin-bottom:10px;
+}
+#drawer-backdrop { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.25); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); z-index:1150; }
 #drawer-backdrop.open { display:block; }
 
 /* ── Tutorial overlay ── */
@@ -4040,13 +5238,13 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
             <span class="rail-tip">Cleanup Assistant</span>
         </button>
-        <div id="rail-cleanup-sub" style="display:none; position:absolute; left:46px; top:0; background:#fff; border:1px solid #e2e8f0; border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,.12); padding:6px; z-index:20; white-space:nowrap;">
-            <button onclick="openCleanup(); closeRailCleanup();" style="display:flex; align-items:center; gap:8px; width:100%; padding:8px 14px; border:none; background:none; cursor:pointer; border-radius:6px; font-size:.82em; color:#4a5568; text-align:left;" onmouseover="this.style.background='#ebf8ff'" onmouseout="this.style.background='none'">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        <div id="rail-cleanup-sub" class="rail-submenu" style="display:none;">
+            <button class="rail-submenu-btn" onclick="openCleanup(); closeRailCleanup();">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
                 Hard Drives
             </button>
-            <button onclick="openPhoneImages(); closeRailCleanup();" style="display:flex; align-items:center; gap:8px; width:100%; padding:8px 14px; border:none; background:none; cursor:pointer; border-radius:6px; font-size:.82em; color:#4a5568; text-align:left;" onmouseover="this.style.background='#ebf8ff'" onmouseout="this.style.background='none'">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+            <button class="rail-submenu-btn" onclick="openPhoneImages(); closeRailCleanup();">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
                 Mobile Images
             </button>
         </div>
@@ -4075,7 +5273,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <div id="jobs-panel">
     <div class="jp-header">
         <span>Running Jobs</span>
-        <button onclick="toggleJobsPanel()" style="background:none; border:none; cursor:pointer; color:#a0aec0; font-size:1.1em;">&times;</button>
+        <button onclick="toggleJobsPanel()" style="background:none; border:none; cursor:pointer; color:#94a3b8; font-size:1.2em; padding:2px 6px; border-radius:6px; transition:all .15s;" onmouseover="this.style.background='#f1f5f9';this.style.color='#334155'" onmouseout="this.style.background='none';this.style.color='#94a3b8'">&times;</button>
     </div>
     <div class="jp-list" id="jp-list"></div>
 </div>
@@ -4089,68 +5287,73 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     </div>
 
     <!-- New Project button -->
-    <div style="padding:12px 18px; border-bottom:1px solid #e2e8f0;">
-        <button onclick="newProject()" style="width:100%; padding:10px 12px; border:1px solid #bee3f8; border-radius:8px; background:#ebf8ff; color:#2b6cb0; font-size:.85em; font-weight:600; cursor:pointer; display:flex; align-items:center; gap:8px;">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-            New Project
-        </button>
+    <div class="drawer-section">
+        <div style="padding:14px 20px;">
+            <button class="drawer-btn primary" onclick="newProject()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                New Project
+            </button>
+        </div>
     </div>
 
     <!-- Saved Projects section (collapsible) -->
-    <div style="border-bottom:1px solid #e2e8f0;">
-        <div onclick="toggleProjectsSection()" style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; cursor:pointer; user-select:none;" id="projects-toggle">
-            <span style="font-weight:600; font-size:.9em; color:#2d3748; display:flex; align-items:center; gap:8px;">
+    <div class="drawer-section">
+        <div class="drawer-section-header" onclick="toggleProjectsSection()" id="projects-toggle">
+            <span class="drawer-section-title">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
                 Saved Projects
             </span>
-            <svg id="projects-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
+            <svg id="projects-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2.5" stroke-linecap="round" style="transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
         <div id="projects-section" style="display:none;">
             <div class="project-list" id="project-list">
-                <div style="padding:18px; color:#a0aec0; font-size:.85em; text-align:center;">Loading...</div>
+                <div style="padding:20px; color:#94a3b8; font-size:.85em; text-align:center;">Loading...</div>
             </div>
         </div>
     </div>
 
     <!-- Cleanup section -->
-    <div style="border-bottom:1px solid #e2e8f0;">
-        <div onclick="toggleCleanupSection()" style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; cursor:pointer; user-select:none;">
-            <span style="font-weight:600; font-size:.9em; color:#2d3748; display:flex; align-items:center; gap:8px;">
+    <div class="drawer-section">
+        <div class="drawer-section-header" onclick="toggleCleanupSection()">
+            <span class="drawer-section-title">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
                 Cleanup
             </span>
-            <svg id="cleanup-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
+            <svg id="cleanup-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2.5" stroke-linecap="round" style="transition:transform .2s;"><polyline points="6 9 12 15 18 9"/></svg>
         </div>
-        <div id="cleanup-section" style="display:none; padding:0 18px 12px;">
-            <button onclick="toggleDrawer(); openCleanup();" style="width:100%; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; margin-bottom:6px; display:flex; align-items:center; gap:8px; text-align:left;">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                Desktop / Laptop / Portable Memory
-            </button>
-            <button onclick="toggleDrawer(); openPhoneImages();" style="width:100%; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; display:flex; align-items:center; gap:8px; text-align:left;">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-                Mobile
-            </button>
+        <div id="cleanup-section" style="display:none;">
+            <div class="drawer-section-body">
+                <button class="drawer-btn" onclick="toggleDrawer(); openCleanup();">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                    Desktop / Laptop / Portable Memory
+                </button>
+                <button class="drawer-btn" onclick="toggleDrawer(); openPhoneImages();">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+                    Mobile
+                </button>
+            </div>
         </div>
     </div>
 
     <!-- Age Assessment -->
-    <div style="border-bottom:1px solid #e2e8f0;">
-        <button onclick="toggleDrawer(); openAgeAssessment();" style="display:flex; align-items:center; gap:8px; padding:12px 18px; width:100%; border:none; background:none; cursor:pointer; font-weight:600; font-size:.9em; color:#2d3748; text-align:left;">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
-            Age Assessment
-        </button>
+    <div class="drawer-section">
+        <div class="drawer-section-header" onclick="toggleDrawer(); openAgeAssessment();" style="cursor:pointer;">
+            <span class="drawer-section-title">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+                Age Assessment
+            </span>
+        </div>
     </div>
 
     <!-- Bottom actions -->
-    <div style="flex:1;"></div>
-    <div style="padding:12px 18px; border-top:1px solid #e2e8f0;">
-        <div id="user-info" style="font-size:.8em; color:#718096; margin-bottom:8px;"></div>
-        <button onclick="toggleDrawer(); startTutorial();" style="width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:6px; background:#f7fafc; color:#4a5568; font-size:.85em; cursor:pointer; margin-bottom:8px; display:flex; align-items:center; justify-content:center; gap:6px;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    <div class="drawer-footer">
+        <div class="user-info" id="user-info"></div>
+        <button class="drawer-btn" onclick="toggleDrawer(); startTutorial();">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
             Tutorial
         </button>
-        <button onclick="logout()" style="width:100%; padding:8px; border:1px solid #fed7d7; border-radius:6px; background:#fff5f5; color:#e53e3e; font-size:.85em; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <button class="drawer-btn" onclick="logout()" style="border-color:#fecaca; color:#dc2626; background:#fef2f2;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
             Sign Out
         </button>
     </div>
@@ -4304,13 +5507,13 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <div class="app">
 
 <div class="header">
-    <h1>E-z Photo Organizer</h1>
+    <h1>E-z Photo Organizer <span class="version-badge">v2.0</span></h1>
     <div id="project-name-bar" style="display:none; font-size:1.6em; color:#2b6cb0; font-weight:700; margin-top:2px; margin-bottom:4px;">Project: <span id="project-name-text"></span></div>
     <p id="header-greeting">Build a meaningful photo collection for your special event</p>
 </div>
 
-<div style="display:flex; align-items:center; gap:12px; margin:25px 0;">
-    <div class="steps" id="steps-nav" style="margin:0;">
+<div class="steps-wrap">
+    <div class="steps" id="steps-nav">
         <div class="step-dot active" onclick="goStep(0)"><span class="num">1</span> Event</div>
         <div class="step-dot" onclick="goStep(1)"><span class="num">2</span> Categories</div>
         <div class="step-dot" onclick="goStep(2)"><span class="num">3</span> Sources</div>
@@ -4383,45 +5586,36 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <h2>Customize Your Categories</h2>
     <p>These categories come from your event template. Adjust names, targets, or add/remove as needed.</p>
 
-    <div style="margin-bottom:16px;">
-        <label style="font-weight:600; font-size:.9em; color:#2d3748;">Project Name <span style="color:#e53e3e;">*</span></label>
-        <input type="text" id="inp-project-name" placeholder="e.g. Reef's Bar Mitzva Photos" style="width:100%; max-width:400px; margin-top:4px; padding:8px 12px; border:1px solid #e2e8f0; border-radius:6px; font-size:.9em;" oninput="validateProjectName()">
-        <div id="project-name-error" style="color:#e53e3e; font-size:.8em; margin-top:4px; display:none;">Project name is required</div>
+    <div style="margin-bottom:20px;">
+        <label class="section-title">Project Name <span style="color:#ef4444;">*</span></label>
+        <input type="text" id="inp-project-name" placeholder="e.g. Reef's Bar Mitzva Photos" style="max-width:420px; margin-top:4px;" oninput="validateProjectName()">
+        <div id="project-name-error" style="color:#ef4444; font-size:.8em; margin-top:4px; display:none;">Project name is required</div>
     </div>
 
-    <div style="display:flex; gap:20px; margin-bottom:15px; flex-wrap:wrap;">
-        <div style="background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; padding:15px; flex:1; min-width:150px; text-align:center;">
-            <div style="font-size:1.8em; font-weight:bold; color:#2b6cb0;" id="cat-total-count">0</div>
-            <div style="color:#718096; font-size:.85em;">Categories</div>
+    <div class="stat-row">
+        <div class="stat-card">
+            <div class="stat-value" id="cat-total-count">0</div>
+            <div class="stat-label">Categories</div>
         </div>
-        <div style="background:#f0fff4; border:1px solid #c6f6d5; border-radius:8px; padding:15px; flex:1; min-width:150px; text-align:center;">
-            <div style="font-size:1.8em; font-weight:bold; color:#38a169;" id="cat-total-target">0</div>
-            <div style="color:#718096; font-size:.85em;">Total Target (images + videos)</div>
+        <div class="stat-card green">
+            <div class="stat-value" id="cat-total-target">0</div>
+            <div class="stat-label">Total target</div>
+        </div>
+        <div class="stat-card" style="background:#f8fafc; border-color:#e2e8f0;">
+            <div class="stat-value" id="cat-avg-target" style="color:#64748b;">0</div>
+            <div class="stat-label">Per category avg</div>
         </div>
     </div>
 
-    <div style="margin-bottom:12px;">
-        <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:.85em; color:#4a5568; font-weight:600; white-space:nowrap;">
-            <input type="checkbox" id="chk-unlimited" onchange="toggleUnlimited(this.checked)">
-            Select all matching media (no count limit)
-            <span style="font-weight:400; font-size:.88em; color:#a0aec0;">— Selects every image/video that matches your face reference</span>
-        </label>
-    </div>
+    <label class="option-check" style="margin-bottom:16px;">
+        <input type="checkbox" id="chk-unlimited" onchange="toggleUnlimited(this.checked)">
+        <span><span class="opt-text">Select all matching media (no count limit)</span> <span class="opt-hint">— Selects every image/video that matches your face reference</span></span>
+    </label>
 
-    <table class="analysis-table" id="cat-table">
-        <thead>
-            <tr>
-                <th style="width:40px;">#</th>
-                <th>Category Name</th>
-                <th style="width:100px;">Photos</th>
-                <th style="width:100px;">Videos</th>
-                <th style="width:60px;"></th>
-            </tr>
-        </thead>
-        <tbody id="cat-tbody"></tbody>
-    </table>
+    <div class="section-title" style="margin-bottom:10px;">Categories</div>
+    <div id="cat-card-list" class="cat-card-list"></div>
 
-    <div class="btn-group">
+    <div style="margin-top:12px;">
         <button class="btn btn-secondary" onclick="addCategory()">+ Add Category</button>
     </div>
 
@@ -4434,16 +5628,28 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <!-- ── STEP 2: Sources ── -->
 <div class="panel" id="panel-2">
     <h2>Where are your photos?</h2>
-    <p>Add the folders where your photos are stored. These can be USB drives, cloud exports, phone backups, etc. The more sources, the better your collection.</p>
+    <p>Point to folders where your photos live — phone backups, cloud exports, USB drives, anything.</p>
+    <div class="help-text" style="margin-top:-10px; margin-bottom:16px;">Adding multiple sources gives better coverage across years and events.</div>
+
+    <div id="src-summary" class="src-summary-row" style="display:none;"></div>
 
     <div class="source-list" id="source-list"></div>
-    <button class="btn btn-secondary" onclick="addSource()" style="margin-top:10px">+ Add Source</button>
+    <button class="src-add-btn" onclick="addSource()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add source folder
+    </button>
 
-    <div style="margin-top:14px; padding:10px 14px; background:#fff5f5; border:1px solid #feb2b2; border-radius:6px; font-size:.82em; color:#9b2c2c;">
-        <strong>Important:</strong> Do not use paths inside ZIP files. Windows Explorer may let you browse ZIP contents, but the scanner cannot read them. Please <strong>extract the ZIP first</strong>, then add the extracted folder as a source.
-    </div>
-    <div style="margin-top:8px; padding:10px 14px; background:#fffff0; border:1px solid #fefcbf; border-radius:6px; font-size:.82em; color:#744210;">
-        <strong>Tip:</strong> If your images are not properly rotated (e.g. sideways photos from phones), face detection may miss faces and scanning will take longer as it retries with rotation correction. For best results, make sure your source images have correct EXIF orientation.
+    <div id="src-readiness" style="margin-top:12px;"></div>
+
+    <div class="notice-subtle">
+        <button class="notice-subtle-toggle" onclick="toggleSourceTips(this)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+            Tips &amp; warnings
+        </button>
+        <div id="src-tips-body" class="notice-subtle-body warn">
+            <strong>ZIP files:</strong> Windows Explorer can browse ZIP contents, but the scanner cannot read them. Extract the ZIP first, then add the extracted folder.<br><br>
+            <strong>Rotated images:</strong> If your images have wrong orientation, face detection may miss faces and scanning retries with rotation correction (slower). Make sure source images have correct EXIF orientation.
+        </div>
     </div>
 
     <div class="btn-group">
@@ -4459,7 +5665,7 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 
     <div style="margin-bottom:20px;">
         <label>Person Name</label>
-        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div class="form-row" style="margin-top:4px;">
             <input type="text" id="inp-face-name" placeholder="e.g. daniel" style="max-width:250px">
             <button class="btn btn-secondary" onclick="addPerson()" style="margin:0">Add Person</button>
             <button class="btn btn-secondary" onclick="showFaceLibrary()" style="margin:0; background:#ebf8ff; color:#2b6cb0; border-color:#bee3f8;">Pick from Library</button>
@@ -4469,14 +5675,14 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
                 <strong style="color:#2b6cb0; font-size:.9em;">Saved People</strong>
                 <span style="cursor:pointer; color:#a0aec0; font-size:1.2em;" onclick="document.getElementById('face-library-panel').style.display='none'">&times;</span>
             </div>
-            <div id="face-library-list" style="color:#718096; font-size:.85em;">Loading...</div>
+            <div id="face-library-list" class="help-text">Loading...</div>
         </div>
     </div>
 
     <div id="face-persons"></div>
 
-    <div id="face-match-mode" style="display:none; margin:16px 0; padding:14px 18px; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px;">
-        <div style="font-weight:600; font-size:.9em; color:#2d3748; margin-bottom:4px; display:flex; align-items:center; gap:6px;">Face matching mode <span style="color:#e53e3e;">*</span>
+    <div id="face-match-mode" class="info-box" style="display:none; margin:16px 0;">
+        <div class="info-box-title">Face matching mode <span style="color:#e53e3e;">*</span>
             <span style="position:relative; display:inline-flex; cursor:help;" id="face-mode-info">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#718096" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
                 <span style="display:none; position:absolute; left:24px; top:-8px; width:320px; padding:10px 14px; background:#2d3748; color:#fff; font-size:.8em; font-weight:400; border-radius:6px; line-height:1.5; z-index:10; box-shadow:0 4px 12px rgba(0,0,0,.2); pointer-events:none;" id="face-mode-tooltip">
@@ -4485,17 +5691,15 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
                 </span>
             </span>
         </div>
-        <table style="border-collapse:collapse;">
-            <tr>
-                <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="face-match" value="any" checked style="margin:0; cursor:pointer;"></td>
-                <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true"><strong style="color:#4a5568;">Any person</strong> <span style="color:#a0aec0;">— At least one appears</span></td>
-            </tr>
-            <tr>
-                <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="face-match" value="all" style="margin:0; cursor:pointer;"></td>
-                <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true"><strong style="color:#4a5568;">All together</strong> <span style="color:#a0aec0;">— Everyone must appear</span></td>
-            </tr>
-        </table>
-        <div id="face-match-people" style="margin-top:8px; font-size:.8em; color:#718096;"></div>
+        <label class="radio-row" style="margin-top:4px;">
+            <input type="radio" name="face-match" value="any" checked>
+            <span><strong>Any person</strong> <span class="radio-hint">— At least one appears</span></span>
+        </label>
+        <label class="radio-row">
+            <input type="radio" name="face-match" value="all">
+            <span><strong>All together</strong> <span class="radio-hint">— Everyone must appear</span></span>
+        </label>
+        <div id="face-match-people" class="help-text"></div>
     </div>
 
     <div class="btn-group" id="face-verify-btn-group" style="display:none;">
@@ -4516,31 +5720,28 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <h2>Scanning your photos</h2>
     <p>This scans all your sources, extracts dates, detects duplicates, and creates thumbnails. This runs once — future scans are incremental.</p>
 
-    <div style="margin-bottom:10px;">
-        <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; font-size:.8em; color:#4a5568; font-weight:600; white-space:nowrap;">
-            <input type="checkbox" id="chk-nsfw-filter" onchange="toggleNsfwFilter(this.checked)">
-            Filter out nudity / inappropriate content <span style="font-weight:400; color:#a0aec0;">(AI detection, ~25 MB model)</span>
-        </label>
-    </div>
+    <div id="scan-summary-stats" style="display:none;"></div>
 
-    <div style="margin-bottom:10px;">
-        <label style="display:inline-flex; align-items:center; gap:5px; cursor:pointer; font-size:.8em; color:#4a5568; font-weight:600; white-space:nowrap;">
-            <input type="checkbox" id="chk-age-estimation" onchange="toggleAgeEstimation(this.checked)">
-            Estimate age from faces <span style="font-weight:400; color:#a0aec0;">(AI age detection — helps sort undated photos, first run downloads ~500 MB model)</span>
+    <div class="section-title" style="margin-top:16px;">Scan options</div>
+    <label class="option-check" style="margin-bottom:6px;">
+        <input type="checkbox" id="chk-nsfw-filter" onchange="toggleNsfwFilter(this.checked)">
+        <span><span class="opt-text">Filter out nudity / inappropriate content</span> <span class="opt-hint">(AI detection, ~25 MB model)</span></span>
+    </label>
+
+    <label class="option-check" style="margin-bottom:6px;">
+        <input type="checkbox" id="chk-age-estimation" onchange="toggleAgeEstimation(this.checked)">
+        <span><span class="opt-text">Estimate age from faces</span> <span class="opt-hint">(AI age detection — helps sort undated photos, first run downloads ~500 MB model)</span></span>
+    </label>
+    <div id="age-est-options" style="display:none;" class="radio-group">
+        <label class="radio-row" onclick="event.stopPropagation()">
+            <input type="radio" name="age-est-scope" value="all" checked>
+            <span><strong>All scanned images</strong> <span class="radio-hint">— Estimate age on every photo with a recognized face</span></span>
         </label>
-        <div id="age-est-options" style="display:none; margin-top:8px; margin-left:22px;">
-            <table style="border-collapse:collapse;">
-                <tr>
-                    <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="age-est-scope" value="all" checked style="margin:0; cursor:pointer;"></td>
-                    <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true"><strong style="color:#4a5568;">All scanned images</strong> <span style="color:#a0aec0;">— Estimate age on every photo with a recognized face</span></td>
-                </tr>
-                <tr>
-                    <td style="padding:2px 6px 2px 0; vertical-align:middle;"><input type="radio" name="age-est-scope" value="folders" style="margin:0; cursor:pointer;"></td>
-                    <td style="padding:2px 0; font-size:.8em; cursor:pointer;" onclick="this.previousElementSibling.querySelector('input').checked=true; showAgeEstFolders()"><strong style="color:#4a5568;">Specific folders only</strong> <span style="color:#a0aec0;">— Choose which source folders to run age estimation on</span></td>
-                </tr>
-            </table>
-            <div id="age-est-folders" style="display:none; margin-top:6px; text-align:left;"></div>
-        </div>
+        <label class="radio-row" onclick="event.stopPropagation(); showAgeEstFolders()">
+            <input type="radio" name="age-est-scope" value="folders">
+            <span><strong>Specific folders only</strong> <span class="radio-hint">— Choose which source folders to run age estimation on</span></span>
+        </label>
+        <div id="age-est-folders" style="display:none; margin-top:6px; text-align:left;"></div>
     </div>
 
     <div class="btn-group">
@@ -4564,35 +5765,44 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     <!-- Quick stats (loads instantly) -->
     <div id="a-quick" style="margin-top:12px;"></div>
 
+    <div id="a-next-hint" style="display:none;"></div>
+
     <!-- Actions -->
-    <div style="margin-top:16px; display:flex; gap:12px; flex-wrap:wrap;">
-        <button class="btn btn-secondary" onclick="runFullAnalysis()" id="btn-full-analysis">Run Full Analysis (recommendations)</button>
-        <button class="btn btn-secondary" style="color:#e53e3e; border-color:#fed7d7;" onclick="resetAllSelections()">Reset All Selections</button>
+    <div class="section-break" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+        <button class="btn btn-secondary" onclick="runFullAnalysis()" id="btn-full-analysis">Run Full Analysis</button>
+        <button class="btn btn-danger" onclick="resetAllSelections()">Reset All Selections</button>
+        <span class="help-text" style="margin:0;">Full analysis gives recommendations on which categories need attention.</span>
     </div>
     <div id="a-full-results" style="display:none; margin-top:16px;"></div>
 
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(4)">Back</button>
-        <button class="btn btn-primary" id="btn-next-5" onclick="goStep(6)">Next: Select</button>
+        <button class="btn btn-primary" id="btn-next-5" onclick="goStep(6)">Next: Select Photos</button>
     </div>
 </div>
 
 <!-- ── STEP 6: Select ── -->
 <div class="panel" id="panel-6" style="max-width:1200px">
     <h2>Select Photos</h2>
-    <p>Pick images for each category manually, or auto-fill remaining slots.</p>
+    <div id="sel-overall-bar" style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
+        <div style="font-size:.85em; font-weight:600; color:#334155; min-width:60px;" id="sel-overall-label">0 / 0</div>
+        <div style="flex:1; height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden;">
+            <div id="sel-overall-fill" style="height:100%; width:0%; background:linear-gradient(90deg, #3b82f6, #22c55e); border-radius:4px; transition:width .4s;"></div>
+        </div>
+        <div style="font-size:.78em; font-weight:600; color:#64748b;" id="sel-overall-pct">0%</div>
+    </div>
 
-    <div style="display:flex; gap:16px; margin-top:12px;">
+    <div style="display:flex; gap:16px; margin-top:0;">
         <!-- Category sidebar -->
         <div id="sel-cat-list" style="min-width:240px; max-width:280px; border-right:1px solid #e2e8f0; padding-right:12px; max-height:70vh; overflow-y:auto;">
-            <div style="font-weight:600; margin-bottom:8px; color:#2d3748;">Categories</div>
+            <div class="section-title">Categories</div>
         </div>
 
         <!-- Image grid area -->
         <div style="flex:1; min-width:0;">
             <div id="sel-cat-header" style="display:flex; align-items:center; gap:12px; margin-bottom:10px; flex-wrap:wrap;">
-                <span id="sel-cat-title" style="font-size:1.1em; font-weight:600; color:#2d3748;">Select a category</span>
-                <span id="sel-cat-counter" style="font-size:.9em; color:#718096;"></span>
+                <span id="sel-cat-title" style="font-size:1.1em; font-weight:700; color:#1e293b;">Select a category</span>
+                <span id="sel-cat-counter" style="font-size:.85em; color:#64748b; background:#f1f5f9; padding:2px 10px; border-radius:99px; font-weight:500;"></span>
                 <div id="sel-target-edit" style="display:none; margin-left:auto; align-items:center; gap:6px; font-size:.85em;">
                     <label style="color:#4a5568; margin:0;">Target:</label>
                     <input type="number" id="sel-target-input" style="width:60px; padding:2px 6px; border:1px solid #cbd5e0; border-radius:4px;" min="0" max="999">
@@ -4642,13 +5852,13 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
     </div>
 
     <!-- Auto-fill section -->
-    <div style="margin-top:16px; padding-top:12px; border-top:1px solid #e2e8f0;">
-        <div style="font-weight:600; color:#2d3748; margin-bottom:8px;">Auto-fill remaining slots</div>
+    <div class="section-break">
+        <div class="section-title">Auto-fill remaining slots</div>
         <div style="display:flex; gap:12px; flex-wrap:wrap;">
             <button class="btn btn-primary" onclick="runQuickFill()">Quick Fill (fast)</button>
             <button class="btn btn-secondary" onclick="runAutoSelect()">Smart Fill (slow, dedup)</button>
         </div>
-        <div style="font-size:.8em; color:#718096; margin-top:6px;">
+        <div class="help-text">
             Quick Fill picks top-quality images instantly. Smart Fill also removes visual duplicates (takes several minutes).
         </div>
     </div>
@@ -4662,36 +5872,95 @@ input:focus, select:focus { outline:none; border-color:#63b3ed; box-shadow:0 0 0
 <!-- ── STEP 7: Review ── -->
 <div class="panel" id="panel-7">
     <h2>Review Your Selection</h2>
-    <p>Open the interactive gallery to review, move, and reject images. When done, come back here to export.</p>
-    <button class="btn btn-primary" onclick="openGallery()">Open Gallery in New Tab</button>
-    <p style="margin-top:10px; font-size:.85em; color:#a0aec0;">Review your images in the gallery, then return here to export.</p>
+    <p>Check your collection is ready, then open the gallery to fine-tune.</p>
+
+    <div id="review-stats" style="margin-top:12px;"></div>
+
+    <div id="review-readiness" style="margin-top:16px;"></div>
+
+    <div id="review-cat-breakdown" style="margin-top:16px; display:none;"></div>
+
+    <div style="margin-top:20px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-primary" onclick="openGallery()">Open Gallery in New Tab</button>
+        <button class="btn btn-secondary" onclick="loadReviewStats()">Refresh</button>
+    </div>
+
+    <div class="notice notice-info" style="margin-top:14px;">
+        <strong>Tip:</strong> In the gallery you can drag images between categories, mark favorites, and remove unwanted photos. Changes are saved automatically — return here when you're done.
+    </div>
 
     <div class="btn-group">
         <button class="btn btn-secondary" onclick="goStep(6)">Back</button>
-        <button class="btn btn-primary" onclick="goStep(8)">Next: Export</button>
+        <button class="btn btn-primary" id="btn-next-7" onclick="goStep(8)">Next: Export</button>
     </div>
 </div>
 
 <!-- ── STEP 8: Export ── -->
 <div class="panel" id="panel-8">
     <h2>Export Your Collection</h2>
-    <p>Copy your curated photos to a final folder, organized by category. Ready to use for your presentation, photo book, or slideshow.</p>
-
-    <label>Output Folder</label>
-    <input type="text" id="inp-export-dir">
+    <p>Export your curated photos as a ready-to-use presentation or organized folder.</p>
 
     <div id="export-stats" style="margin-top:15px;"></div>
 
-    <div class="btn-group">
-        <button class="btn btn-primary" id="btn-export" onclick="runExport()">Export Photos</button>
+    <!-- Export options as cards -->
+    <div class="export-cards">
+
+        <!-- PowerPoint card -->
+        <div class="export-card primary">
+            <div class="card-title">PowerPoint Presentation</div>
+            <p class="card-desc">
+                One slide per photo, organized by category. Ready to present or customize.
+            </p>
+            <div class="pptx-options">
+                <label class="pptx-opt">
+                    <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h14"/></svg>
+                    <span class="pptx-opt-label">Captions</span>
+                    <input type="checkbox" id="pptx-captions" checked>
+                    <span class="pptx-hint">Show category name and date below each photo. Turn off for clean, image-only slides.</span>
+                </label>
+                <label class="pptx-opt">
+                    <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/></svg>
+                    <span class="pptx-opt-label">Section dividers</span>
+                    <input type="checkbox" id="pptx-dividers" checked>
+                    <span class="pptx-hint">Add a title slide before each category group. Turn off for a continuous photo flow.</span>
+                </label>
+                <label class="pptx-opt">
+                    <svg viewBox="0 0 24 24"><path d="M3 6h7M3 12h10M3 18h5"/><path d="M17 6l3 3-3 3"/><path d="M20 9H14"/></svg>
+                    <span class="pptx-opt-label">Sort</span>
+                    <select id="pptx-sort">
+                        <option value="date">By date</option>
+                        <option value="score">By quality</option>
+                    </select>
+                    <span class="pptx-hint">By date: chronological within each category. By quality: highest-graded photos first.</span>
+                </label>
+            </div>
+            <button class="btn btn-primary" id="btn-export-pptx" onclick="runPptxExport()">Create Presentation</button>
+            <div id="pptx-download" style="margin-top:10px; display:none;">
+                <a id="pptx-download-link" href="/api/export/pptx/download" style="color:#2b6cb0; font-weight:600; font-size:.9em;">Download .pptx</a>
+            </div>
+        </div>
+
+        <!-- Folder export card -->
+        <div class="export-card">
+            <div class="card-title">Export to Folder</div>
+            <p class="card-desc">
+                Copy photos to a folder organized by category subfolders.
+            </p>
+            <label style="font-size:.82em; color:#718096;">Output Folder</label>
+            <input type="text" id="inp-export-dir" style="margin-bottom:10px;">
+            <button class="btn btn-secondary" id="btn-export" onclick="runExport()">Export Photos</button>
+        </div>
+
     </div>
 
     <div class="progress-box" id="export-progress" style="display:none"></div>
 
-    <div class="btn-group">
+    <div class="btn-group" style="margin-top:20px;">
         <button class="btn btn-secondary" onclick="goStep(7)">Back</button>
     </div>
 </div>
+
+<div class="app-footer">E-z Photo Organizer v2.0</div>
 
 </div><!-- .app -->
 
@@ -4994,6 +6263,7 @@ function goStep(n) {
     if (n === 4) checkExistingScan();
     if (n === 5) runAnalysis();
     if (n === 6) loadSelCategories();
+    if (n === 7) loadReviewStats();
     if (n === 8) loadExportStats();
 }
 
@@ -5143,16 +6413,30 @@ function loadCategoriesStep() {
 function renderCategories(cats) {
     const unlimited = config?.unlimited_mode || false;
     document.getElementById('chk-unlimited').checked = unlimited;
-    const tbody = document.getElementById('cat-tbody');
-    tbody.innerHTML = cats.map((c, i) => `
-        <tr>
-            <td style="color:#a0aec0;">${i + 1}</td>
-            <td><input type="text" value="${esc(c.display || c.id || '')}" onchange="updateCatField(${i}, 'display', this.value)" style="border:1px solid #e2e8f0;"></td>
-            <td><input type="number" value="${c.target || config?.target_per_category || 75}" min="0" max="500" onchange="updateCatField(${i}, 'target', parseInt(this.value))" style="width:80px; border:1px solid #e2e8f0;" ${unlimited ? 'disabled' : ''}></td>
-            <td><input type="number" value="${c.video_target || 0}" min="0" max="500" onchange="updateCatField(${i}, 'video_target', parseInt(this.value))" style="width:80px; border:1px solid #e2e8f0;" ${unlimited ? 'disabled' : ''}></td>
-            <td><span style="color:#e53e3e; cursor:pointer; font-size:1.2em;" onclick="removeCategory(${i})">&times;</span></td>
-        </tr>
-    `).join('');
+    var el = document.getElementById('cat-card-list');
+    el.innerHTML = cats.map(function(c, i) {
+        var nameVal = esc(c.display || c.id || '');
+        var photoVal = c.target || config?.target_per_category || 75;
+        var videoVal = c.video_target || 0;
+        var dis = unlimited ? ' disabled' : '';
+        return '<div class="cat-card">' +
+            '<div class="cat-num">' + (i + 1) + '</div>' +
+            '<div class="cat-name-wrap">' +
+                '<input class="cat-name-input" type="text" value="' + nameVal + '" onchange="updateCatField(' + i + ',\\'display\\',this.value)">' +
+            '</div>' +
+            '<div class="cat-targets">' +
+                '<div class="cat-target-group">' +
+                    '<span class="cat-target-label">Photos</span>' +
+                    '<input class="cat-target-input" type="number" value="' + photoVal + '" min="0" max="500" onchange="updateCatField(' + i + ',\\'target\\',parseInt(this.value))"' + dis + '>' +
+                '</div>' +
+                '<div class="cat-target-group">' +
+                    '<span class="cat-target-label">Videos</span>' +
+                    '<input class="cat-target-input" type="number" value="' + videoVal + '" min="0" max="500" onchange="updateCatField(' + i + ',\\'video_target\\',parseInt(this.value))"' + dis + '>' +
+                '</div>' +
+            '</div>' +
+            '<button class="cat-delete" onclick="removeCategory(' + i + ')" title="Remove category">&times;</button>' +
+        '</div>';
+    }).join('');
     updateCatSummary();
 }
 
@@ -5172,12 +6456,15 @@ function updateCatSummary() {
     const cats = config?.categories || [];
     const defaultTarget = config?.target_per_category || 75;
     document.getElementById('cat-total-count').textContent = cats.length;
+    var avgEl = document.getElementById('cat-avg-target');
     if (config?.unlimited_mode) {
         document.getElementById('cat-total-target').textContent = 'All matching';
+        if (avgEl) avgEl.textContent = '--';
     } else {
         const imgTotal = cats.reduce((sum, c) => sum + (c.target || defaultTarget), 0);
         const vidTotal = cats.reduce((sum, c) => sum + (c.video_target || 0), 0);
-        document.getElementById('cat-total-target').textContent = imgTotal + (vidTotal ? ' + ' + vidTotal + ' videos' : '');
+        document.getElementById('cat-total-target').textContent = imgTotal + (vidTotal ? ' + ' + vidTotal + ' vid' : '');
+        if (avgEl) avgEl.textContent = cats.length > 0 ? Math.round(imgTotal / cats.length) : 0;
     }
 }
 
@@ -5224,11 +6511,90 @@ async function completeCategoriesStep() {
 }
 
 // ── Step 2: Sources ──
+
+// --- Validation ---
+var _validateTimers = {};
+var _validateCache = {};  // path → result
+
+function validateSourcePath(idx) {
+    var path = (config.sources[idx] && config.sources[idx].path) || '';
+    var badge = document.getElementById('source-badge-' + idx);
+    var pathInput = document.getElementById('source-path-' + idx);
+    if (!badge) return;
+    if (!path.trim()) {
+        badge.className = 'source-badge';
+        badge.textContent = '';
+        if (pathInput) { pathInput.style.borderColor = ''; }
+        return;
+    }
+    // Check cache first
+    if (_validateCache[path]) {
+        applyValidationBadge(idx, _validateCache[path]);
+        return;
+    }
+    badge.className = 'source-badge checking';
+    badge.textContent = 'checking...';
+    if (pathInput) pathInput.style.borderColor = '';
+    // Debounce per-row
+    if (_validateTimers[idx]) clearTimeout(_validateTimers[idx]);
+    _validateTimers[idx] = setTimeout(async function() {
+        try {
+            var res = await fetch('/api/browse/validate?path=' + encodeURIComponent(path));
+            var data = await res.json();
+            _validateCache[path] = data;
+            applyValidationBadge(idx, data);
+        } catch (e) {
+            badge.className = 'source-badge invalid';
+            badge.textContent = 'error';
+        }
+    }, 300);
+}
+
+function _fmtCount(n) {
+    return n >= 1000 ? n.toLocaleString() : String(n);
+}
+
+function applyValidationBadge(idx, data) {
+    var badge = document.getElementById('source-badge-' + idx);
+    var hint = document.getElementById('source-hint-' + idx);
+    var pathInput = document.getElementById('source-path-' + idx);
+    if (!badge) return;
+    if (!data.valid) {
+        badge.className = 'source-badge invalid';
+        badge.textContent = 'not found';
+        if (pathInput) { pathInput.className = 'src-path path-invalid'; }
+        if (hint) { hint.textContent = ''; }
+    } else if (!data.accessible) {
+        badge.className = 'source-badge invalid';
+        badge.textContent = 'no access';
+        if (pathInput) { pathInput.className = 'src-path path-invalid'; }
+        if (hint) { hint.textContent = ''; }
+    } else if (data.media_count === 0) {
+        badge.className = 'source-badge empty';
+        badge.textContent = 'no media';
+        if (pathInput) { pathInput.className = 'src-path path-warn'; }
+        if (hint) { hint.textContent = 'empty folder'; }
+    } else {
+        var cnt = data.media_count;
+        var label = data.capped ? _fmtCount(cnt) + '+ photos' : _fmtCount(cnt) + ' photos';
+        badge.className = 'source-badge valid';
+        badge.textContent = label;
+        if (pathInput) { pathInput.className = 'src-path path-valid'; }
+        if (hint) {
+            if (cnt >= 2000) hint.textContent = 'great coverage';
+            else if (cnt >= 500) hint.textContent = 'good coverage';
+            else if (cnt >= 50) hint.textContent = '';
+            else hint.textContent = 'very small source';
+        }
+    }
+    updateSourceSummary();
+}
+
+// --- Source row rendering ---
 function renderSources() {
     const list = document.getElementById('source-list');
     if (!config) config = { sources: [] };
     if (!config.sources) config.sources = [];
-    // Normalize: convert plain strings to {path, label} objects
     config.sources = config.sources.map(function(s, i) {
         if (typeof s === 'string') return { path: s, label: 'Source ' + (i + 1) };
         return s;
@@ -5237,34 +6603,178 @@ function renderSources() {
     list.innerHTML = '';
     sources.forEach(function(s, i) {
         var lbl = s.label || ('Source ' + (i + 1));
-        var row = document.createElement('div');
-        row.className = 'source-item';
+        // Card container
+        var card = document.createElement('div');
+        card.className = 'src-card';
+
+        // Header row: num + label + remove
+        var header = document.createElement('div');
+        header.className = 'src-header';
+        var num = document.createElement('span');
+        num.className = 'src-num';
+        num.textContent = i + 1;
         var lblInput = document.createElement('input');
         lblInput.type = 'text';
+        lblInput.className = 'src-label';
         lblInput.value = lbl;
         lblInput.placeholder = 'Source ' + (i + 1);
-        lblInput.style.maxWidth = '150px';
         lblInput.onchange = function() { updateSource(i, 'label', this.value); };
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'src-remove';
+        removeBtn.innerHTML = '&times;';
+        removeBtn.title = 'Remove source';
+        removeBtn.onclick = function() { removeSource(i); };
+        header.appendChild(num);
+        header.appendChild(lblInput);
+        header.appendChild(removeBtn);
+
+        // Path input — visually dominant
         var pathInput = document.createElement('input');
         pathInput.type = 'text';
+        pathInput.id = 'source-path-' + i;
+        pathInput.className = 'src-path';
         pathInput.value = s.path || '';
-        pathInput.placeholder = 'Full path to folder (e.g. D:\\Photos)';
-        pathInput.onchange = function() { updateSource(i, 'path', this.value); };
-        var removeSpan = document.createElement('span');
-        removeSpan.className = 'remove';
-        removeSpan.innerHTML = '&times;';
-        removeSpan.onclick = function() { removeSource(i); };
-        row.appendChild(lblInput);
-        row.appendChild(pathInput);
-        row.appendChild(removeSpan);
-        list.appendChild(row);
+        pathInput.placeholder = 'Paste folder path or click Browse';
+        pathInput.onchange = function() { updateSource(i, 'path', this.value); validateSourcePath(i); };
+        pathInput.onblur = function() { validateSourcePath(i); };
+
+        // Meta row: badge + coverage hint + browse
+        var meta = document.createElement('div');
+        meta.className = 'src-meta';
+        var badge = document.createElement('span');
+        badge.id = 'source-badge-' + i;
+        badge.className = 'source-badge';
+        var hint = document.createElement('span');
+        hint.id = 'source-hint-' + i;
+        hint.className = 'src-coverage';
+        var actions = document.createElement('span');
+        actions.className = 'src-actions';
+        var browseBtn = document.createElement('button');
+        browseBtn.type = 'button';
+        browseBtn.className = 'src-browse';
+        browseBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg> Browse';
+        (function(idx) {
+            browseBtn.onclick = async function() {
+                var startPath = config.sources[idx].path || '';
+                var paths = await nativePick(startPath);
+                if (!paths.length) return;
+                config.sources[idx].path = paths[0];
+                var curLabel = config.sources[idx].label || '';
+                if (!curLabel || curLabel.match(/^Source [0-9]+$/)) {
+                    config.sources[idx].label = _folderLabel(paths[0]);
+                }
+                for (var p = 1; p < paths.length; p++) {
+                    config.sources.push({ path: paths[p], label: _folderLabel(paths[p]) });
+                }
+                fpAddRecent(paths);
+                renderSources();
+                saveSourcesConfig();
+            };
+        })(i);
+        actions.appendChild(browseBtn);
+        meta.appendChild(badge);
+        meta.appendChild(hint);
+        meta.appendChild(actions);
+
+        // Assemble card
+        card.appendChild(header);
+        card.appendChild(pathInput);
+        card.appendChild(meta);
+        list.appendChild(card);
+
+        // Trigger validation for existing paths
+        if (s.path) validateSourcePath(i);
     });
+    updateSourceSummary();
 }
 
-function addSource() {
+function toggleSourceTips(btn) {
+    btn.classList.toggle('open');
+    var body = document.getElementById('src-tips-body');
+    body.classList.toggle('show');
+}
+
+function updateSourceSummary() {
+    var summaryEl = document.getElementById('src-summary');
+    var readyEl = document.getElementById('src-readiness');
+    var sources = (config && config.sources) || [];
+    var validCount = 0;
+    var totalPhotos = 0;
+    sources.forEach(function(s) {
+        var cached = _validateCache[s.path];
+        if (cached && cached.valid && cached.accessible && cached.media_count > 0) {
+            validCount++;
+            totalPhotos += cached.media_count;
+        }
+    });
+    // Summary row
+    if (sources.length > 0) {
+        summaryEl.style.display = 'flex';
+        summaryEl.innerHTML =
+            '<div class="src-summary-card"><div class="src-summary-val">' + sources.length + '</div><div class="src-summary-lbl">Sources</div></div>' +
+            '<div class="src-summary-card"><div class="src-summary-val">' + validCount + '</div><div class="src-summary-lbl">Valid</div></div>' +
+            '<div class="src-summary-card"><div class="src-summary-val">' + (totalPhotos > 0 ? _fmtCount(totalPhotos) : '--') + '</div><div class="src-summary-lbl">Total Photos</div></div>';
+    } else {
+        summaryEl.style.display = 'none';
+    }
+    // Readiness hint
+    if (totalPhotos >= 2000) {
+        readyEl.innerHTML = '<span class="src-readiness good">Great coverage — ready to scan</span>';
+    } else if (totalPhotos >= 500) {
+        readyEl.innerHTML = '<span class="src-readiness good">Good coverage</span>';
+    } else if (totalPhotos > 0 && totalPhotos < 500) {
+        readyEl.innerHTML = '<span class="src-readiness okay">Consider adding more sources for better results</span>';
+    } else if (sources.length > 0 && totalPhotos === 0) {
+        readyEl.innerHTML = '<span class="src-readiness low">No photos found yet — check your paths</span>';
+    } else {
+        readyEl.innerHTML = '';
+    }
+}
+
+function _folderLabel(path) {
+    var parts = (path || '').replace(/[/\\\\]+$/, '').split(/[/\\\\]/);
+    return parts[parts.length - 1] || path;
+}
+
+var _pickerOpen = false;
+async function nativePick(initialdir) {
+    if (_pickerOpen) return [];
+    _pickerOpen = true;
+    try {
+        // Launch the dialog (non-blocking server-side)
+        await fetch('/api/browse/native', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ initialdir: initialdir || '' })
+        });
+        // Poll until dialog closes
+        while (true) {
+            await new Promise(function(r) { setTimeout(r, 300); });
+            var res = await fetch('/api/browse/native', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ poll: true })
+            });
+            var data = await res.json();
+            if (data.status === 'done') return data.paths || [];
+        }
+    } catch(e) {
+        return [];
+    } finally {
+        _pickerOpen = false;
+    }
+}
+
+async function addSource() {
     if (!config) config = { sources: [] };
     if (!config.sources) config.sources = [];
-    config.sources.push({ path: '', label: 'Source ' + (config.sources.length + 1) });
+    var paths = await nativePick('');
+    if (!paths.length) return;
+    paths.forEach(function(p) {
+        config.sources.push({ path: p, label: _folderLabel(p) });
+    });
+    fpAddRecent(paths);
     renderSources();
     saveSourcesConfig();
 }
@@ -5282,14 +6792,12 @@ function updateSource(i, field, value) {
 
 var _sourcesSaveTimer = null;
 function saveSourcesConfig() {
-    // Debounce: save 500ms after last change to avoid spamming during typing
     if (_sourcesSaveTimer) clearTimeout(_sourcesSaveTimer);
     _sourcesSaveTimer = setTimeout(function() {
         if (!config || !config.sources) return;
         config.sources.forEach(function(s, i) {
             if (!s.label || !s.label.trim()) s.label = 'Source ' + (i + 1);
         });
-        // Use PATCH-style: merge sources into existing config on server
         fetch('/api/config/sources', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ sources: config.sources }) });
     }, 500);
 }
@@ -6031,26 +7539,34 @@ async function checkExistingScan() {
     const res = await fetch('/api/stats');
     const st = await res.json();
     var scanBtn = document.getElementById('btn-start-scan');
+    var summaryEl = document.getElementById('scan-summary-stats');
     if (st.has_scan && st.total_media > 0 && st.has_sources) {
         document.getElementById('btn-next-4').disabled = false;
+
+        // Render stat cards
+        summaryEl.style.display = 'block';
+        summaryEl.innerHTML = '<div class="stat-row">' +
+            '<div class="stat-card"><div class="stat-value">' + st.total_media + '</div><div class="stat-label">Images found</div></div>' +
+            '<div class="stat-card green"><div class="stat-value">' + (st.qualified || 0) + '</div><div class="stat-label">Qualified</div></div>' +
+            '<div class="stat-card"><div class="stat-value">' + (st.sources?.length || 0) + '</div><div class="stat-label">Sources</div></div>' +
+            '</div>';
+
         document.getElementById('scan-progress').style.display = 'block';
         if (st.partial) {
             document.getElementById('scan-progress').innerHTML =
                 '<div class="line" style="color:#dd6b20;">' +
-                '<strong>Partial scan saved:</strong> ' + st.total_scanned + ' files scanned, ' +
-                st.total_media + ' images saved (' + st.qualified + ' qualified). ' +
-                'Click <strong>Continue Scanning</strong> to resume from where you left off.</div>';
+                '<strong>Partial scan saved.</strong> Click <strong>Continue Scanning</strong> to resume from where you left off.</div>';
             scanBtn.textContent = 'Continue Scanning';
             scanBtn.onclick = function() { startScan(false); };
         } else {
             document.getElementById('scan-progress').innerHTML =
                 '<div class="line" style="color:#38a169;">' +
-                '<strong>Scan complete:</strong> ' + st.total_media + ' images from ' +
-                (st.sources?.length || 0) + ' sources (' + st.qualified + ' qualified). You can proceed or rescan.</div>';
+                '<strong>Scan complete.</strong> You can proceed to analysis or rescan.</div>';
             scanBtn.textContent = 'Continue Scanning';
             scanBtn.onclick = function() { startScan(false); };
         }
     } else {
+        summaryEl.style.display = 'none';
         scanBtn.textContent = 'Start Scan';
         scanBtn.onclick = function() { startScan(false); };
     }
@@ -6181,18 +7697,18 @@ function renderCategoryBars(container, cats, showSelected) {
     const overallFull = overallCount >= totalTarget;
 
     container.innerHTML = `
-        <div style="display:flex; gap:16px; margin-bottom:16px; flex-wrap:wrap;">
-            <div style="flex:1; min-width:100px; text-align:center; background:#ebf8ff; border:1px solid #bee3f8; border-radius:8px; padding:12px;">
-                <div style="font-size:1.8em; font-weight:bold; color:#2b6cb0;">${totalAvail}</div>
-                <div style="font-size:.8em; color:#4a5568;">Available</div>
+        <div class="stat-row">
+            <div class="stat-card">
+                <div class="stat-value">${totalAvail}</div>
+                <div class="stat-label">Available</div>
             </div>
-            ${showSelected ? `<div style="flex:1; min-width:100px; text-align:center; background:#f0fff4; border:1px solid #c6f6d5; border-radius:8px; padding:12px;">
-                <div style="font-size:1.8em; font-weight:bold; color:#38a169;">${totalSel}</div>
-                <div style="font-size:.8em; color:#4a5568;">Selected</div>
+            ${showSelected ? `<div class="stat-card green">
+                <div class="stat-value">${totalSel}</div>
+                <div class="stat-label">Selected</div>
             </div>` : ''}
-            <div style="flex:1; min-width:100px; text-align:center; background:#fff5f5; border:1px solid #fed7d7; border-radius:8px; padding:12px;">
-                <div style="font-size:1.8em; font-weight:bold; color:#e53e3e;">${totalTarget}</div>
-                <div style="font-size:.8em; color:#4a5568;">Target</div>
+            <div class="stat-card red">
+                <div class="stat-value">${totalTarget}</div>
+                <div class="stat-label">Target</div>
             </div>
         </div>
         <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
@@ -6202,7 +7718,7 @@ function renderCategoryBars(container, cats, showSelected) {
             </div>
             <div style="font-weight:600; color:${overallFull ? '#38a169' : '#2d3748'}; min-width:110px; text-align:right;">${overallCount} / ${totalTarget} (${overallPct}%)</div>
         </div>
-        <h3 style="color:#2d3748; margin:0 0 8px; font-size:1em;">Category Fill Status</h3>
+        <div class="section-title">Category Fill Status</div>
         ${rows}`;
 }
 
@@ -6211,9 +7727,24 @@ async function runAnalysis() {
     showLoader(el, 'Loading category stats...');
     const res = await fetch('/api/categories/summary');
     const cats = await res.json();
-    if (!cats.length) { el.innerHTML = '<div style="color:#e53e3e;">No scan data found. Run a scan first.</div>'; return; }
+    if (!cats.length) { el.innerHTML = '<div class="notice notice-error"><strong>No scan data found.</strong> Go back and run a scan first.</div>'; return; }
     renderCategoryBars(el, cats, true);
     document.querySelectorAll('.step-dot')[5].classList.add('done');
+
+    // Show contextual hint
+    var hintEl = document.getElementById('a-next-hint');
+    if (hintEl) {
+        var totalSel = 0, totalTarget = 0;
+        cats.forEach(function(c) { totalSel += (c.selected || 0); totalTarget += (c.target || 75); });
+        if (totalSel >= totalTarget) {
+            hintEl.innerHTML = '<div class="notice notice-tip" style="margin-top:12px;"><strong>All targets met!</strong> Proceed to Select to review your choices, or continue to Export.</div>';
+        } else if (totalSel > 0) {
+            hintEl.innerHTML = '<div class="notice notice-info" style="margin-top:12px;"><strong>' + totalSel + ' of ' + totalTarget + ' selected.</strong> Go to Select to pick more images or use Auto-fill.</div>';
+        } else {
+            hintEl.innerHTML = '<div class="notice notice-info" style="margin-top:12px;"><strong>Ready to select images.</strong> Proceed to the next step to start picking photos for each category.</div>';
+        }
+        hintEl.style.display = 'block';
+    }
 }
 
 async function runFullAnalysis() {
@@ -6265,30 +7796,37 @@ async function loadSelCategories() {
 
 function renderSelCatList() {
     const el = document.getElementById('sel-cat-list');
-    el.innerHTML = '<div style="font-weight:600; margin-bottom:8px; color:#2d3748;">Categories</div>';
+    el.innerHTML = '<div class="section-title">Categories</div>';
     let totalSel = 0, totalTarget = 0;
     selCats.forEach(c => {
         totalSel += c.selected;
         totalTarget += c.target;
         const pct = c.target > 0 ? Math.min(100, Math.round(c.selected / c.target * 100)) : 0;
         const full = c.selected >= c.target;
+        const empty = c.selected === 0;
         const active = selActiveCat === c.id;
         el.innerHTML += `
-            <div onclick="selectCategory('${c.id}')" style="padding:8px 10px; cursor:pointer; border-radius:6px; margin-bottom:4px;
-                background:${active ? '#ebf4ff' : '#fff'}; border:1px solid ${active ? '#3182ce' : '#e2e8f0'};
-                ${full ? 'border-left:3px solid #38a169;' : ''}">
-                <div style="font-size:.9em; font-weight:${active ? '600' : '500'}; color:#2d3748;">${esc(c.display)}</div>
-                <div style="font-size:.8em; color:#718096; margin-top:2px;">
-                    ${c.selected}/${c.target} selected
-                    <span style="color:${full ? '#38a169' : '#e53e3e'};">(${pct}%)</span>
+            <div onclick="selectCategory('${c.id}')" style="padding:8px 10px; cursor:pointer; border-radius:8px; margin-bottom:4px;
+                background:${active ? '#eff6ff' : '#fff'}; border:1px solid ${active ? '#3b82f6' : '#e2e8f0'};
+                ${full ? 'border-left:3px solid #22c55e;' : ''} transition:all .15s;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-size:.88em; font-weight:${active ? '600' : '500'}; color:#1e293b;">${esc(c.display)}</span>
+                    <span style="font-size:.72em; font-weight:600; color:${full ? '#22c55e' : empty ? '#94a3b8' : '#f59e0b'};">${full ? 'FULL' : empty ? 'EMPTY' : pct + '%'}</span>
                 </div>
+                <div style="font-size:.78em; color:#64748b; margin-top:2px;">${c.selected} / ${c.target} selected</div>
                 <div style="height:3px; background:#e2e8f0; border-radius:2px; margin-top:4px;">
-                    <div style="height:100%; width:${pct}%; background:${full ? '#38a169' : '#3182ce'}; border-radius:2px;"></div>
+                    <div style="height:100%; width:${pct}%; background:${full ? '#22c55e' : '#3b82f6'}; border-radius:2px; transition:width .3s;"></div>
                 </div>
             </div>`;
     });
-    el.innerHTML += `<div style="margin-top:8px; padding:8px 10px; font-size:.85em; font-weight:600; color:#4a5568; border-top:1px solid #e2e8f0;">
-        Total: ${totalSel}/${totalTarget}</div>`;
+    // Overall progress bar
+    var overallPct = totalTarget > 0 ? Math.min(100, Math.round(totalSel / totalTarget * 100)) : 0;
+    var lbl = document.getElementById('sel-overall-label');
+    var fill = document.getElementById('sel-overall-fill');
+    var pctEl = document.getElementById('sel-overall-pct');
+    if (lbl) lbl.textContent = totalSel + ' / ' + totalTarget + ' selected';
+    if (fill) fill.style.width = overallPct + '%';
+    if (pctEl) pctEl.textContent = overallPct + '%';
 }
 
 async function selectCategory(catId) {
@@ -6298,6 +7836,10 @@ async function selectCategory(catId) {
     renderSelCatList();
     const cat = selCats.find(c => c.id === catId);
     document.getElementById('sel-cat-title').textContent = cat ? cat.display : catId;
+    if (cat) {
+        var ctr = document.getElementById('sel-cat-counter');
+        ctr.textContent = (cat.selected || 0) + ' / ' + cat.target + ' selected';
+    }
     document.getElementById('sel-target-edit').style.display = 'flex';
     document.getElementById('sel-target-input').value = cat ? cat.target : 75;
     document.getElementById('sel-filter-bar').style.display = 'flex';
@@ -6331,8 +7873,10 @@ function updateSelCounter() {
     const cat = selCats.find(c => c.id === selActiveCat);
     const nSel = selImages.filter(i => i._sel).length;
     const target = cat ? cat.target : 0;
-    document.getElementById('sel-cat-counter').textContent =
-        `${nSel} selected / ${target} target / ${selImages.length} available`;
+    var ctr = document.getElementById('sel-cat-counter');
+    ctr.textContent = nSel + ' / ' + target + ' selected';
+    ctr.style.background = nSel >= target ? '#dcfce7' : '#f1f5f9';
+    ctr.style.color = nSel >= target ? '#16a34a' : '#64748b';
 }
 
 // ── Preference Predictor (learns from user likes/dislikes) ──
@@ -7007,6 +8551,74 @@ async function runAutoSelect() {
 }
 
 // ── Step 7: Review ──
+async function loadReviewStats() {
+    const el = document.getElementById('review-stats');
+    const readyEl = document.getElementById('review-readiness');
+    const breakdownEl = document.getElementById('review-cat-breakdown');
+    if (!el) return;
+    try {
+        const res = await fetch('/api/categories/summary');
+        const cats = await res.json();
+        if (!cats.length) { el.innerHTML = ''; readyEl.innerHTML = ''; breakdownEl.style.display = 'none'; return; }
+        let totalSel = 0, totalTarget = 0, filledCats = 0, emptyCats = 0;
+        var underCats = [];
+        cats.forEach(c => {
+            const sel = c.selected || 0;
+            const tgt = c.target || 75;
+            totalSel += sel;
+            totalTarget += tgt;
+            if (sel >= tgt) filledCats++;
+            if (sel === 0) emptyCats++;
+            if (sel > 0 && sel < tgt) underCats.push(c);
+        });
+        var overallPct = Math.min(100, Math.round(totalSel / (totalTarget || 1) * 100));
+        var ready = filledCats === cats.length;
+
+        // Stat cards
+        el.innerHTML =
+            '<div class="stat-row">' +
+                '<div class="stat-card green"><div class="stat-value">' + totalSel + '</div><div class="stat-label">Images selected</div></div>' +
+                '<div class="stat-card"><div class="stat-value">' + cats.length + '</div><div class="stat-label">Categories</div></div>' +
+                '<div class="stat-card' + (ready ? ' green' : '') + '"><div class="stat-value">' + filledCats + ' / ' + cats.length + '</div><div class="stat-label">Categories filled</div></div>' +
+                '<div class="stat-card' + (ready ? ' green' : '') + '"><div class="stat-value">' + overallPct + '%</div><div class="stat-label">Overall fill</div></div>' +
+            '</div>';
+
+        // Readiness notice
+        if (ready) {
+            readyEl.innerHTML = '<div class="notice notice-tip"><strong>Ready to export!</strong> All categories are filled to target. Open the gallery if you want to fine-tune, or proceed to export.</div>';
+        } else if (totalSel === 0) {
+            readyEl.innerHTML = '<div class="notice notice-error"><strong>No images selected yet.</strong> Go back to the Select step to pick images or run Auto-fill.</div>';
+        } else {
+            var msg = '<strong>' + (cats.length - filledCats) + ' categories still need more images.</strong>';
+            if (emptyCats > 0) msg += ' ' + emptyCats + ' are completely empty.';
+            if (underCats.length > 0 && underCats.length <= 4) {
+                msg += ' Under-filled: ' + underCats.map(function(c) { return c.display + ' (' + (c.selected||0) + '/' + (c.target||75) + ')'; }).join(', ') + '.';
+            }
+            readyEl.innerHTML = '<div class="notice notice-warn">' + msg + '</div>';
+        }
+
+        // Per-category breakdown bars
+        breakdownEl.style.display = 'block';
+        var rows = cats.map(function(c) {
+            var sel = c.selected || 0;
+            var tgt = c.target || 75;
+            var pct = Math.min(100, Math.round(sel / tgt * 100));
+            var full = sel >= tgt;
+            var barColor = full ? '#22c55e' : (sel === 0 ? '#e2e8f0' : '#3b82f6');
+            var statusText = full ? 'FULL' : (sel === 0 ? 'EMPTY' : sel + '/' + tgt);
+            var statusColor = full ? '#22c55e' : (sel === 0 ? '#94a3b8' : '#f59e0b');
+            return '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid #f1f5f9;">' +
+                '<div style="min-width:130px;font-size:.85em;font-weight:500;color:#334155;">' + esc(c.display) + '</div>' +
+                '<div style="flex:1;height:6px;background:#e2e8f0;border-radius:3px;overflow:hidden;">' +
+                    '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';border-radius:3px;transition:width .4s;"></div>' +
+                '</div>' +
+                '<div style="min-width:55px;font-size:.78em;font-weight:600;color:' + statusColor + ';text-align:right;">' + statusText + '</div>' +
+            '</div>';
+        }).join('');
+        breakdownEl.innerHTML = '<div class="section-title">Category breakdown</div>' + rows;
+
+    } catch(e) { el.innerHTML = ''; }
+}
 function openGallery() {
     window.open('/api/report', '_blank');
 }
@@ -7023,12 +8635,22 @@ async function loadExportStats() {
         const selected = st.selected || 0;
         const qualified = st.qualified || 0;
         el.innerHTML = `
-            <div class="export-summary">
-                <div class="big-num">${selected}</div>
-                <div>images selected for export</div>
-                ${selected === 0 ? '<div style="color:#e53e3e; font-size:.9em; margin-top:8px;">No images selected yet. Go back to the Select step to pick images.</div>' : ''}
-                <div style="color:#718096; font-size:.85em; margin-top:5px;">${qualified} qualified | ${st.total_images} total scanned | ${st.sources?.length || 0} sources</div>
+            <div class="stat-row">
+                <div class="stat-card${selected > 0 ? ' green' : ' red'}">
+                    <div class="stat-value">${selected}</div>
+                    <div class="stat-label">Selected for export</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${qualified}</div>
+                    <div class="stat-label">Qualified</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${st.total_images}</div>
+                    <div class="stat-label">Total scanned</div>
+                </div>
             </div>
+            ${selected === 0 ? '<div class="notice notice-error"><strong>No images selected.</strong> Go back to the Select step to pick images.</div>' :
+              '<div class="notice notice-tip"><strong>Ready to export!</strong> Choose PowerPoint for a presentation or export to a folder for organizing by category.</div>'}
         `;
     }
 }
@@ -7049,6 +8671,38 @@ async function runExport() {
                 clearInterval(check);
                 if (!st.error && !st.cancelled) {
                     document.querySelectorAll('.step-dot')[8].classList.add('done');
+                }
+            }
+        } catch(e) {}
+    }, 2000);
+}
+
+async function runPptxExport() {
+    document.getElementById('btn-export-pptx').disabled = true;
+    document.getElementById('btn-export-pptx').textContent = 'Creating...';
+    document.getElementById('pptx-download').style.display = 'none';
+
+    var opts = {
+        captions: document.getElementById('pptx-captions').checked,
+        dividers: document.getElementById('pptx-dividers').checked,
+        sort: document.getElementById('pptx-sort').value
+    };
+    await fetch('/api/export/pptx', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(opts)
+    });
+    showTaskOverlay('pptx_export');
+    var check = setInterval(async function() {
+        try {
+            var res = await fetch('/api/scan/status');
+            var st = await res.json();
+            if (st.done || st.error || st.cancelled) {
+                clearInterval(check);
+                document.getElementById('btn-export-pptx').disabled = false;
+                document.getElementById('btn-export-pptx').textContent = 'Create Presentation';
+                if (!st.error && !st.cancelled) {
+                    document.querySelectorAll('.step-dot')[8].classList.add('done');
+                    document.getElementById('pptx-download').style.display = 'block';
                 }
             }
         } catch(e) {}
@@ -8217,8 +9871,292 @@ loadTemplates().then(function() {
         });
     }
 });
+// ── Folder Picker ──
+var _fpCallback = null;   // function(selectedPath) called on confirm
+var _fpCurrent = '';       // path currently being browsed
+var _fpSelected = '';      // path user has clicked to highlight
+var _fpChecked = {};       // multi-select: { path: true }
+
+function fpOpen(callback, startPath) {
+    _fpCallback = callback;
+    _fpSelected = '';
+    _fpChecked = {};
+    document.getElementById('fp-selected-path').textContent = '';
+    document.getElementById('fp-select-btn').disabled = true;
+    document.getElementById('fp-checked-count').textContent = '';
+    document.getElementById('fp-overlay').classList.add('active');
+    fpNavigate(startPath || '');
+}
+
+// Close on Escape key
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.getElementById('fp-overlay').classList.contains('active')) {
+        fpClose();
+    }
+});
+
+function fpClose() {
+    document.getElementById('fp-overlay').classList.remove('active');
+    _fpCallback = null;
+}
+
+function fpConfirm() {
+    var checked = Object.keys(_fpChecked);
+    if (checked.length > 0 && _fpCallback) {
+        _fpCallback(checked);
+    } else if (_fpSelected && _fpCallback) {
+        _fpCallback([_fpSelected]);
+    }
+    fpClose();
+}
+
+function fpUpdateCheckedCount() {
+    var n = Object.keys(_fpChecked).length;
+    var el = document.getElementById('fp-checked-count');
+    el.textContent = n > 0 ? n + ' folder' + (n > 1 ? 's' : '') + ' selected' : '';
+    // Enable select button if anything is checked
+    var btn = document.getElementById('fp-select-btn');
+    if (n > 0) btn.disabled = false;
+    else if (!_fpSelected) btn.disabled = true;
+}
+
+// --- Recent folders (localStorage) ---
+var _fpRecentKey = 'fp_recent_folders';
+
+function fpAddRecent(paths) {
+    if (!paths || paths.length === 0) return;
+    try {
+        var recent = fpGetRecent();
+        paths.forEach(function(p) {
+            // Remove if already present, then prepend
+            recent = recent.filter(function(r) { return r !== p; });
+            recent.unshift(p);
+        });
+        // Keep max 10
+        recent = recent.slice(0, 10);
+        localStorage.setItem(_fpRecentKey, JSON.stringify(recent));
+    } catch(e) { /* localStorage unavailable */ }
+}
+
+function fpGetRecent() {
+    try {
+        var raw = localStorage.getItem(_fpRecentKey);
+        if (raw) return JSON.parse(raw);
+    } catch(e) {}
+    return [];
+}
+
+async function fpNavigate(path) {
+    _fpCurrent = path;
+    _fpSelected = '';
+    document.getElementById('fp-selected-path').textContent = '';
+    // Keep select enabled if multi-select has items
+    if (Object.keys(_fpChecked).length === 0) {
+        document.getElementById('fp-select-btn').disabled = true;
+    }
+    var list = document.getElementById('fp-list');
+    list.innerHTML = '<div class="fp-empty">Loading...</div>';
+
+    // Show/hide "Use this folder" bar
+    var useCurrent = document.getElementById('fp-use-current');
+    if (path) {
+        useCurrent.style.display = 'block';
+        document.getElementById('fp-use-current-path').textContent = path;
+    } else {
+        useCurrent.style.display = 'none';
+    }
+
+    try {
+        var url = '/api/browse';
+        if (path) url += '?path=' + encodeURIComponent(path);
+        var res = await fetch(url);
+        var data = await res.json();
+        if (data.error && !data.folders) {
+            list.innerHTML = '<div class="fp-empty">' + data.error + '</div>';
+            return;
+        }
+        fpRenderBreadcrumb(data.path, data.parent);
+        fpRenderList(data.folders, data.path, data.error);
+        // Show recent folders at drives root
+        if (!path) fpRenderRecent(list);
+    } catch (e) {
+        list.innerHTML = '<div class="fp-empty">Failed to load folders</div>';
+    }
+}
+
+function fpRenderRecent(listEl) {
+    var recent = fpGetRecent();
+    if (recent.length === 0) return;
+    var section = document.createElement('div');
+    section.className = 'fp-recent';
+    var hdr = document.createElement('div');
+    hdr.className = 'fp-recent-title';
+    hdr.textContent = 'Recent Folders';
+    section.appendChild(hdr);
+    recent.forEach(function(p) {
+        var row = document.createElement('div');
+        row.className = 'fp-recent-item';
+        var icon = document.createElement('span');
+        icon.className = 'fp-icon';
+        icon.textContent = String.fromCodePoint(0x1F552);
+        row.appendChild(icon);
+        var name = document.createElement('span');
+        name.textContent = p;
+        name.style.flex = '1';
+        name.style.overflow = 'hidden';
+        name.style.textOverflow = 'ellipsis';
+        name.style.whiteSpace = 'nowrap';
+        name.style.fontSize = '.85em';
+        row.appendChild(name);
+        row.onclick = function() { fpNavigate(p); };
+        section.appendChild(row);
+    });
+    // Insert before the folder list content
+    listEl.insertBefore(section, listEl.firstChild);
+}
+
+function fpRenderBreadcrumb(currentPath, parentPath) {
+    var bc = document.getElementById('fp-breadcrumb');
+    bc.innerHTML = '';
+    if (!currentPath) {
+        bc.textContent = 'My Computer';
+        return;
+    }
+    // Root link
+    var root = document.createElement('span');
+    root.textContent = 'Drives';
+    root.onclick = function() { fpNavigate(''); };
+    bc.appendChild(root);
+    // Split path into segments
+    var sep = currentPath.indexOf('/') >= 0 && currentPath.indexOf('\\\\') < 0 ? '/' : '\\\\';
+    var parts = currentPath.split(/[/\\\\]/).filter(Boolean);
+    var built = '';
+    parts.forEach(function(part, idx) {
+        var s = document.createElement('span');
+        s.className = 'sep';
+        s.textContent = ' > ';
+        bc.appendChild(s);
+        built += part + sep;
+        var link = document.createElement('span');
+        link.textContent = part;
+        if (idx < parts.length - 1) {
+            (function(p) { link.onclick = function() { fpNavigate(p); }; })(built);
+        } else {
+            link.style.color = '#2d3748';
+            link.style.cursor = 'default';
+        }
+        bc.appendChild(link);
+    });
+}
+
+function fpRenderList(folders, currentPath, errMsg) {
+    var list = document.getElementById('fp-list');
+    list.innerHTML = '';
+    if (errMsg) {
+        var warn = document.createElement('div');
+        warn.className = 'fp-empty';
+        warn.textContent = errMsg;
+        list.appendChild(warn);
+    }
+    if (!folders || folders.length === 0) {
+        if (!errMsg) {
+            var empty = document.createElement('div');
+            empty.className = 'fp-empty';
+            empty.textContent = currentPath ? 'No subfolders' : 'No drives found';
+            list.appendChild(empty);
+        }
+        return;
+    }
+    folders.forEach(function(f) {
+        var row = document.createElement('div');
+        row.className = 'fp-item';
+        row.setAttribute('data-path', f.path);
+        // Checkbox for multi-select
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!_fpChecked[f.path];
+        cb.onclick = function(e) { e.stopPropagation(); };
+        cb.onchange = function(e) {
+            e.stopPropagation();
+            if (this.checked) { _fpChecked[f.path] = true; }
+            else { delete _fpChecked[f.path]; }
+            fpUpdateCheckedCount();
+        };
+        row.appendChild(cb);
+        var icon = document.createElement('span');
+        icon.className = 'fp-icon';
+        icon.textContent = String.fromCodePoint(0x1F4C1);
+        row.appendChild(icon);
+        var name = document.createElement('span');
+        name.textContent = f.name;
+        name.style.flex = '1';
+        name.style.overflow = 'hidden';
+        name.style.textOverflow = 'ellipsis';
+        name.style.whiteSpace = 'nowrap';
+        row.appendChild(name);
+        if (f.has_children) {
+            var arrow = document.createElement('span');
+            arrow.className = 'fp-arrow';
+            arrow.textContent = '>';
+            row.appendChild(arrow);
+        }
+        // Single click: select this folder (highlight)
+        row.onclick = function(e) {
+            e.stopPropagation();
+            list.querySelectorAll('.fp-item').forEach(function(el) { el.classList.remove('selected'); });
+            row.classList.add('selected');
+            _fpSelected = f.path;
+            document.getElementById('fp-selected-path').textContent = f.path;
+            document.getElementById('fp-select-btn').disabled = false;
+        };
+        // Double click: navigate into
+        row.ondblclick = function(e) {
+            e.stopPropagation();
+            fpNavigate(f.path);
+        };
+        list.appendChild(row);
+    });
+}
+
+// Also allow selecting the current directory itself (the one we browsed into)
+// by clicking "Select" without clicking a subfolder — means "use this folder"
+// This is handled by making the breadcrumb's current folder selectable:
+function fpSelectCurrent() {
+    if (_fpCurrent) {
+        _fpSelected = _fpCurrent;
+        document.getElementById('fp-selected-path').textContent = _fpCurrent;
+        document.getElementById('fp-select-btn').disabled = false;
+        document.getElementById('fp-list').querySelectorAll('.fp-item').forEach(function(el) {
+            el.classList.remove('selected');
+        });
+    }
+}
+
 loadGreeting();
 </script>
+
+<!-- Folder Picker Modal -->
+<div class="fp-overlay" id="fp-overlay">
+  <div class="fp-modal">
+    <div class="fp-header">
+      <h3>Select Folder</h3>
+      <span style="cursor:pointer;font-size:1.3em;color:#a0aec0;" onclick="fpClose()">&times;</span>
+    </div>
+    <div class="fp-breadcrumb" id="fp-breadcrumb"></div>
+    <div id="fp-use-current" style="display:none; padding:6px 18px; background:#ebf8ff; border-bottom:1px solid #bee3f8; font-size:.82em;">
+      <span style="color:#2b6cb0; cursor:pointer; text-decoration:underline;" onclick="fpSelectCurrent()">Use this folder</span>
+      <span id="fp-use-current-path" style="color:#718096; margin-left:6px;"></span>
+    </div>
+    <div class="fp-list" id="fp-list"></div>
+    <div class="fp-footer">
+      <div class="fp-path" id="fp-selected-path"></div>
+      <span class="fp-checked-count" id="fp-checked-count"></span>
+      <button class="fp-cancel" onclick="fpClose()">Cancel</button>
+      <button class="fp-select" id="fp-select-btn" disabled onclick="fpConfirm()">Select</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>"""
 
@@ -8237,4 +10175,4 @@ if __name__ == "__main__":
     if not args.no_open:
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
-    app.run(host="127.0.0.1", port=args.port, debug=False)
+    app.run(host="127.0.0.1", port=args.port, debug=False, threaded=True)

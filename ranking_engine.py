@@ -19,8 +19,24 @@ Design principles:
 """
 
 import math
+import os
+import re
 import numpy as np
 from collections import defaultdict
+
+# Burst detection: matches filenames like IMG_4411.JPG → prefix="IMG_", seq=4411
+_BURST_RE = re.compile(r'^(.*?)(\d{3,})\.[a-zA-Z]+$')
+
+def _parse_burst_key(path):
+    """Extract (folder, prefix, seq_number) from image path for burst detection."""
+    if not path:
+        return None
+    folder = path.rsplit("\\", 1)[0] if "\\" in path else path.rsplit("/", 1)[0]
+    fname = path.rsplit("\\", 1)[-1] if "\\" in path else path.rsplit("/", 1)[-1]
+    m = _BURST_RE.match(fname)
+    if m:
+        return folder, m.group(1), int(m.group(2))
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,6 +93,7 @@ class RankingEngine:
 
         # Duplicate state
         self._selected_dhashes = []
+        self._selected_burst_keys = []  # (folder, prefix, seq) for burst detection
 
         # Debug log
         self._score_log = []
@@ -186,7 +203,7 @@ class RankingEngine:
         breakdown["exploration"] = expl
 
         # ── Duplicate Penalty (0-100) ──
-        dup = self._compute_duplicate_penalty(vector, dhash)
+        dup = self._compute_duplicate_penalty(vector, dhash, path=img.get("path"))
         breakdown["duplicate_penalty"] = dup
 
         # ── No-face penalty for manual templates ──
@@ -226,6 +243,10 @@ class RankingEngine:
         loc = img.get("location")
         if loc:
             self._selected_locations.append(loc)
+        # Track burst key for filename-based dedup
+        bk = _parse_burst_key(img.get("path", ""))
+        if bk:
+            self._selected_burst_keys.append(bk)
 
     # ──────────────────────────────────────────────────────────────────────
     #  COMPONENT SCORERS
@@ -414,17 +435,28 @@ class RankingEngine:
 
         return min(100.0, score)
 
-    def _compute_duplicate_penalty(self, vector=None, dhash=None):
+    def _compute_duplicate_penalty(self, vector=None, dhash=None, path=None):
         """
         Duplicate penalty on 0-100 scale.
         Hard penalty for true duplicates, soft penalty for near-similar.
         """
-        if not self._selected_dhashes and not self._selected_vectors:
+        if (not self._selected_dhashes and not self._selected_vectors
+                and not self._selected_burst_keys):
             return 0.0
 
         penalty = 0.0
 
-        # ── dHash: catches burst photos ──
+        # ── Burst detection: consecutive camera filenames ──
+        if path and self._selected_burst_keys:
+            bk = _parse_burst_key(path)
+            if bk:
+                folder, prefix, seq = bk
+                for sf, sp, ss in self._selected_burst_keys:
+                    if sf == folder and sp == prefix and abs(seq - ss) <= 3:
+                        penalty = 100.0  # burst shot — keep only one
+                        break
+
+        # ── dHash: catches pixel-identical duplicates ──
         if dhash is not None and self._selected_dhashes:
             min_dist = min(_hamming_distance(dhash, sdh) for sdh in self._selected_dhashes)
             if min_dist <= 5:

@@ -815,8 +815,26 @@ def auto_select(db, strategy="balanced", sim_threshold=0.85, dry_run=False):
     return db, report
 
 
+_image_vectors_cache = None
+
 def _get_or_compute_vector(img):
-    """Get image vector, using pre-computed from scan if available."""
+    """Get image vector from npz sidecar, entry, or compute from file."""
+    global _image_vectors_cache
+    h = img.get("hash")
+    # Try npz sidecar first
+    if _image_vectors_cache is None:
+        npz_path = os.path.join(PROJECT_DIR, "image_vectors.npz")
+        if os.path.isfile(npz_path):
+            try:
+                _image_vectors_cache = dict(np.load(npz_path, allow_pickle=False))
+            except Exception as e:
+                print(f"[WARN] Could not load {npz_path} (corrupt?): {e}", flush=True)
+                _image_vectors_cache = {}
+        else:
+            _image_vectors_cache = {}
+    if h and h in _image_vectors_cache:
+        return np.array(_image_vectors_cache[h], dtype=np.float32)
+    # Legacy: try entry-embedded vector
     cached = img.get("image_vector")
     if cached is not None:
         return np.array(cached, dtype=np.float32)

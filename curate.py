@@ -3419,7 +3419,7 @@ def hamming_distance(hash1, hash2):
 
 # Default thresholds
 CLUSTER_DHASH_THRESHOLD = 5        # dHash Hamming distance ≤ 5 = exact duplicate
-CLUSTER_VECTOR_THRESHOLD = 0.92    # Cosine similarity ≥ 0.92 = near-duplicate
+CLUSTER_VECTOR_THRESHOLD = 0.985   # Cosine similarity ≥ 0.985 = near-duplicate (burst shots)
 CLUSTER_CLIP_THRESHOLD = 0.93      # CLIP cosine ≥ 0.93 = semantically near-identical
 
 
@@ -3427,6 +3427,7 @@ def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
                            dhash_threshold=CLUSTER_DHASH_THRESHOLD,
                            clip_threshold=CLUSTER_CLIP_THRESHOLD,
                            clip_vectors=None,
+                           image_vectors=None,
                            progress_cb=None):
     """
     Group similar images into clusters. For each cluster, pick the best-quality
@@ -3453,11 +3454,13 @@ def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
     t0 = _time.monotonic()
 
     # ── Collect eligible images (non-rejected, with at least one signal) ──
+    _iv = image_vectors or {}  # hash → np.array from npz sidecar
     eligible = []
     for img in images:
         if img.get("status") == "rejected":
             continue
-        has_vector = img.get("image_vector") is not None
+        h = img.get("hash")
+        has_vector = img.get("image_vector") is not None or (h and h in _iv)
         has_dhash = img.get("dhash") is not None
         if has_vector or has_dhash:
             eligible.append(img)
@@ -3495,11 +3498,18 @@ def cluster_similar_images(images, vector_threshold=CLUSTER_VECTOR_THRESHOLD,
         if rank[ra] == rank[rb]:
             rank[ra] += 1
 
+    # NOTE: Burst detection (consecutive filenames) is handled in ranking_engine.py
+    # during selection, NOT in clustering. Union-find causes transitive chaining
+    # where consecutive camera numbers merge unrelated clusters into mega-clusters.
+
     # ── Build vectors matrix for batch cosine similarity ──
     vectors = []
     vec_idx_map = {}  # maps eligible index → vectors array index
     for i, img in enumerate(eligible):
+        h = img.get("hash")
         v = img.get("image_vector")
+        if v is None and h and h in _iv:
+            v = _iv[h]
         if v is not None:
             vec_idx_map[i] = len(vectors)
             if isinstance(v, list):
